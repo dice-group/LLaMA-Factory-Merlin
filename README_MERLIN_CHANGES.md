@@ -193,6 +193,12 @@ support language routing metadata and extra loss terms used by those tuners.
 - `src/llamafactory/extras/constants.py`
   - Extends `METHODS` and `PEFT_METHODS` to include all custom tuners.
 
+**Accelerate configs**
+
+- `examples/accelerate/fsdp_2gpu_config.yaml`
+- `examples/accelerate/fsdp_4gpu_config.yaml`
+  - Added custom FSDP configs used by `HTYLLM-PG/approaches/CoLA/scripts/comparison/run_multilingual_ablation.sh`.
+
 ### Requirements / dependency changes
 
 - `requirements.txt`
