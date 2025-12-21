@@ -185,6 +185,14 @@ support language routing metadata and extra loss terms used by those tuners.
 - `src/llamafactory/train/sft/workflow.py`
   - Sets up MoELPR stage-2 language IDs using `data_args.language_map`.
 
+- `src/llamafactory/train/trainer_utils.py`
+  - Treats all PEFT-style finetuning types as "no ref model" for PPO/DPO ref model creation.
+
+**Constants**
+
+- `src/llamafactory/extras/constants.py`
+  - Extends `METHODS` and `PEFT_METHODS` to include all custom tuners.
+
 ### Requirements / dependency changes
 
 - `requirements.txt`
@@ -210,4 +218,3 @@ support language routing metadata and extra loss terms used by those tuners.
 
 - CoLA / HydraLoRA code: derived from `HTYLLM-PG` extensions.
 - AdaMole / MoLA / MoELPR code: derived from `moe-study` extensions.
-

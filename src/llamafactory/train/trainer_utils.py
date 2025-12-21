@@ -33,7 +33,7 @@ from transformers.trainer_pt_utils import get_parameter_names
 from typing_extensions import override
 
 from ..extras import logging
-from ..extras.constants import IGNORE_INDEX, SWANLAB_CONFIG
+from ..extras.constants import IGNORE_INDEX, PEFT_METHODS, SWANLAB_CONFIG
 from ..extras.packages import is_apollo_available, is_galore_available, is_ray_available
 from ..hparams import FinetuningArguments, ModelArguments
 from ..model import find_all_linear_modules, load_model, load_tokenizer, load_valuehead_params
@@ -132,7 +132,7 @@ def create_ref_model(
         )
         logger.info_rank0(f"Created reference model from {finetuning_args.ref_model}")
     else:
-        if finetuning_args.finetuning_type == "lora":
+        if finetuning_args.finetuning_type in PEFT_METHODS:
             ref_model = None
         else:
             ref_model_args = ModelArguments.copyfrom(model_args)
