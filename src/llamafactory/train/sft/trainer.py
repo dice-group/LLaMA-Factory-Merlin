@@ -18,10 +18,11 @@
 import json
 import os
 from types import MethodType
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -113,8 +114,47 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+    def compute_loss(
+        self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"], return_outputs: bool = False, **kwargs
+    ) -> Union["torch.Tensor", Tuple["torch.Tensor", Any]]:
+        if (
+            self.finetuning_args.finetuning_type == "moelpr"
+            and self.finetuning_args.moelpr_stage == 2
+            and "lang_mask" not in inputs
+        ):
+            mask = self._maybe_build_moelpr_mask(inputs)
+            if mask is not None:
+                inputs["lang_mask"] = mask
+
+        base = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        extra_losses = []
+
+        language_loss = self._compute_language_prior_loss()
+        if language_loss is not None:
+            extra_losses.append(language_loss)
+
+        adamole_loss = self._compute_adamole_aux_loss(model)
+        if adamole_loss is not None:
+            extra_losses.append(adamole_loss)
+
+        mola_loss = self._compute_mola_aux_loss(model)
+        if mola_loss is not None:
+            extra_losses.append(mola_loss)
+
+        moelpr_loss = self._compute_moelpr_aux_loss(model)
+        if moelpr_loss is not None:
+            extra_losses.append(moelpr_loss)
+
+        if not extra_losses:
+            return base
+
+        added = sum(extra_losses)
+        if return_outputs:
+            loss, outputs = base
+            loss = loss + added
+            return loss, outputs
+
+        return base + added
 
     @override
     def prediction_step(
@@ -177,3 +217,105 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         with open(output_prediction_file, "w", encoding="utf-8") as f:
             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+
+    def _compute_language_prior_loss(self) -> Optional[torch.Tensor]:
+        weight = getattr(self.finetuning_args, "language_prior_weight", 0.0) or 0.0
+        if weight <= 0:
+            self._flush_language_router_cache()
+            return None
+
+        states = self._flush_language_router_cache()
+        if not states:
+            return None
+
+        losses = []
+        for _, logits, targets in states:
+            if logits is None or targets is None:
+                continue
+            if logits.dim() > 2:
+                logits = logits.mean(dim=1)
+            valid = targets >= 0
+            if not valid.any():
+                continue
+            losses.append(F.cross_entropy(logits[valid], targets[valid], reduction="mean"))
+
+        if not losses:
+            return None
+
+        aux = weight * sum(losses) / len(losses)
+        self.log({"language_prior_loss": aux.detach()})
+        return aux
+
+    def _compute_adamole_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
+        coef = getattr(self.finetuning_args, "adamole_aux_loss_coef", 0.0) or 0.0
+        if self.finetuning_args.finetuning_type != "adamole" or coef <= 0:
+            return None
+
+        module = getattr(model, "module", model)
+        aux_fn = getattr(module, "get_aux_loss", None)
+        if not callable(aux_fn):
+            return None
+
+        aux = aux_fn()
+        if aux is None:
+            return None
+
+        scaled = coef * aux
+        self.log({"adamole_aux_loss": scaled.detach()})
+        return scaled
+
+    def _compute_mola_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
+        if self.finetuning_args.finetuning_type != "mola":
+            return None
+
+        module = getattr(model, "module", model)
+        aux_fn = getattr(module, "get_aux_loss", None)
+        if not callable(aux_fn):
+            return None
+
+        aux = aux_fn()
+        if aux is None:
+            return None
+
+        self.log({"mola_aux_loss": aux.detach()})
+        return aux
+
+    def _compute_moelpr_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
+        if self.finetuning_args.finetuning_type != "moelpr":
+            return None
+
+        module = getattr(model, "module", model)
+        aux_fn = getattr(module, "get_aux_loss", None)
+        if not callable(aux_fn):
+            return None
+
+        aux = aux_fn()
+        if aux is None:
+            return None
+
+        self.log({"moelpr_aux_loss": aux.detach()})
+        return aux
+
+    def _maybe_build_moelpr_mask(self, inputs: Dict[str, "torch.Tensor"]) -> Optional["torch.Tensor"]:
+        target_id = getattr(self.finetuning_args, "moelpr_target_language_id", None)
+        if target_id is None:
+            return None
+        lang_ids = inputs.get("language_ids")
+        input_ids = inputs.get("input_ids")
+        if lang_ids is None or input_ids is None:
+            return None
+        if lang_ids.dim() == 1:
+            lang_ids = lang_ids.unsqueeze(1)
+        seq_len = input_ids.size(1)
+        mask = (lang_ids == target_id).to(dtype=torch.bool)
+        if mask.size(1) == 1:
+            mask = mask.expand(-1, seq_len)
+        return mask
+
+    def _flush_language_router_cache(self) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+        caches: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        for module in self.model.modules():
+            pop_fn = getattr(module, "pop_language_router_cache", None)
+            if callable(pop_fn):
+                caches.extend(pop_fn())
+        return caches

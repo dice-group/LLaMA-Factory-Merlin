@@ -55,6 +55,18 @@ def run_sft(
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
 
+    if finetuning_args.finetuning_type == "moelpr" and finetuning_args.moelpr_stage == 2:
+        language_meta = data_args.get_language_metadata()
+        if language_meta is None:
+            raise ValueError("MoE-LPR Stage 2 requires `language_column`/`language_map` to be set.")
+        _, language_vocab, _ = language_meta
+        target_lang = finetuning_args.moelpr_original_language
+        if not target_lang:
+            raise ValueError("MoE-LPR Stage 2 requires `moelpr_original_language` to be set.")
+        if target_lang not in language_vocab:
+            raise ValueError(f"Language '{target_lang}' not found in provided `language_map`.")
+        finetuning_args.moelpr_target_language_id = language_vocab[target_lang]
+
     data_collator = SFTDataCollatorWith4DAttentionMask(
         template=template,
         model=model if not training_args.predict_with_generate else None,

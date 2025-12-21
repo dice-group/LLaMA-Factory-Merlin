@@ -114,13 +114,37 @@ def _set_env_vars() -> None:
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
+def _sync_language_metadata(data_args: "DataArguments", finetuning_args: "FinetuningArguments") -> None:
+    if data_args.language_map is None:
+        data_args.language_map = finetuning_args.language_map
+    elif finetuning_args.language_map is None:
+        finetuning_args.language_map = data_args.language_map
+    elif data_args.language_map != finetuning_args.language_map:
+        raise ValueError("`language_map` mismatch between data and finetuning arguments.")
+
+    if data_args.language_column is None:
+        data_args.language_column = finetuning_args.language_column
+    elif finetuning_args.language_column is None:
+        finetuning_args.language_column = data_args.language_column
+    elif data_args.language_column != finetuning_args.language_column:
+        raise ValueError("`language_column` mismatch between data and finetuning arguments.")
+
+
 def _verify_model_args(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     finetuning_args: "FinetuningArguments",
 ) -> None:
-    if model_args.adapter_name_or_path is not None and finetuning_args.finetuning_type != "lora":
-        raise ValueError("Adapter is only valid for the LoRA method.")
+    if model_args.adapter_name_or_path is not None and finetuning_args.finetuning_type not in [
+        "lora",
+        "oft",
+        "cola",
+        "hydralora",
+        "adamole",
+        "mola",
+        "moelpr",
+    ]:
+        raise ValueError("Adapter is only valid for PEFT tuning methods.")
 
     if model_args.quantization_bit is not None:
         if finetuning_args.finetuning_type not in ["lora", "oft"]:
@@ -256,6 +280,8 @@ def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
     else:
         model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_args(args)
         finetuning_args.use_mca = False
+
+    _sync_language_metadata(data_args, finetuning_args)
 
     # Setup logging
     if training_args.should_log:
@@ -482,6 +508,8 @@ def get_infer_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
     # Setup logging
     _set_transformers_logging()
 
+    _sync_language_metadata(data_args, finetuning_args)
+
     # Check arguments
     if model_args.infer_backend == "vllm":
         if finetuning_args.stage != "sft":
@@ -516,6 +544,8 @@ def get_eval_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _E
 
     # Setup logging
     _set_transformers_logging()
+
+    _sync_language_metadata(data_args, finetuning_args)
 
     # Check arguments
     if model_args.infer_backend != EngineName.HF:

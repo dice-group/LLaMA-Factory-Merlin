@@ -75,6 +75,12 @@ class DatasetConverter:
 
         return medias
 
+    def _extract_language(self, example: dict[str, Any]) -> Optional[str]:
+        column = self.dataset_attr.language or self.data_args.language_column
+        if column and column in example and example[column] is not None:
+            return str(example[column])
+        return None
+
     @abstractmethod
     def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
         r"""Convert a single example in the dataset to the standard format."""
@@ -127,6 +133,7 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_language": self._extract_language(example),
         }
         return output
 
@@ -223,6 +230,7 @@ class SharegptDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_language": self._extract_language(example),
         }
         return output
 
@@ -363,6 +371,7 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_language": self._extract_language(example),
         }
         return output
 

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
+from ...extras.language import LANGUAGE_PAD_ID, language_to_ids
 from .processor_utils import DatasetProcessor, greedy_knapsack, infer_seqlen
 
 
@@ -89,6 +90,8 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         # build inputs with format `<bos> X Y <eos>` and labels with format `<ignore> ... <ignore> Y <eos>`
         # for multiturn examples, we only mask the prompt part in each prompt-response pair.
         model_inputs = defaultdict(list)
+        language_meta = self.data_args.get_language_metadata()
+        languages = examples.get("_language")
         for i in range(len(examples["_prompt"])):
             if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
                 logger.warning_rank0(
@@ -111,6 +114,12 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["images"].append(examples["_images"][i])
             model_inputs["videos"].append(examples["_videos"][i])
             model_inputs["audios"].append(examples["_audios"][i])
+            if language_meta and languages is not None:
+                language_map, language_vocab, family_vocab = language_meta
+                lang_id, _ = language_to_ids(languages[i], language_map, language_vocab, family_vocab)
+            else:
+                lang_id = LANGUAGE_PAD_ID
+            model_inputs["language_ids"].append(lang_id)
 
         return model_inputs
 
@@ -199,5 +208,6 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
             model_inputs["images"].append(packed_images or None)
             model_inputs["videos"].append(packed_videos or None)
             model_inputs["audios"].append(packed_audios or None)
+            model_inputs["language_ids"].append(LANGUAGE_PAD_ID)
 
         return model_inputs

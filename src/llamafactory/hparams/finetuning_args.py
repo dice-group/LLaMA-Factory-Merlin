@@ -432,11 +432,11 @@ class SwanLabArguments:
     )
     swanlab_lark_webhook_url: Optional[str] = field(
         default=None,
-        metadata={"help": "The Lark(飞书) webhook URL for SwanLab."},
+        metadata={"help": "The Lark (Feishu) webhook URL for SwanLab."},
     )
     swanlab_lark_secret: Optional[str] = field(
         default=None,
-        metadata={"help": "The Lark(飞书) secret for SwanLab."},
+        metadata={"help": "The Lark (Feishu) secret for SwanLab."},
     )
 
 
@@ -461,7 +461,7 @@ class FinetuningArguments(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
-    finetuning_type: Literal["lora", "oft", "freeze", "full"] = field(
+    finetuning_type: Literal["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mola", "moelpr"] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
     )
@@ -522,6 +522,171 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
+    lora_num: int = field(default=1, metadata={"help": "Lora number"})
+    num_A: int = field(default=1, metadata={"help": "Matrix A number"})
+    num_B: int = field(default=1, metadata={"help": "Matrix B number"})
+    cola_expert_num_A: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional comma-separated list overriding `num_A` per CoLA expert when using MoE."},
+    )
+    cola_expert_num_B: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional comma-separated list overriding `num_B` per CoLA expert when using MoE."},
+    )
+    use_cola_experts: bool = field(
+        default=False,
+        metadata={"help": "Enable mixture-of-experts routing for CoLA adapters."},
+    )
+    cola_num_experts: int = field(
+        default=1,
+        metadata={"help": "Number of experts per CoLA layer when mixture-of-experts is enabled."},
+    )
+    cola_top_k: int = field(
+        default=1,
+        metadata={"help": "Top-k experts to select per token when mixture-of-experts is enabled."},
+    )
+    cola_debug: bool = field(default=False, metadata={"help": "Enable verbose CoLA debugging output."})
+    use_cola_pissa_init: bool = field(
+        default=True,
+        metadata={"help": "When True, PiSSA init is applied to CoLA adapters unless overridden."},
+    )
+    cola_init_lora_weights: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Override the initialization method for CoLA adapters. "
+                "Accepts values like 'pissa', 'pissa_niter_16', 'gaussian', 'true', etc. "
+                "If unset, `use_cola_pissa_init` decides whether PiSSA or default LoRA init is used."
+            )
+        },
+    )
+    cola_strategy: Literal["fully", "random", "random_ab", "random_ba", "heuristic"] = field(
+        default="fully",
+        metadata={
+            "help": (
+                "CoLA collaboration strategy: 'fully'=CoLA+, "
+                "'random'=random A/B pairing, 'random_ab'/'random_ba' directional, 'heuristic'=CoLA*."
+            )
+        },
+    )
+    use_hydralora_experts: bool = field(
+        default=False,
+        metadata={"help": "Enable mixture-of-experts routing for HydraLoRA adapters."},
+    )
+    hydralora_num_experts: int = field(
+        default=1,
+        metadata={"help": "Number of experts per HydraLoRA layer when mixture-of-experts is enabled."},
+    )
+    hydralora_top_k: int = field(
+        default=1,
+        metadata={"help": "Top-k experts to select per token when mixture-of-experts is enabled."},
+    )
+    hydralora_debug: bool = field(default=False, metadata={"help": "Enable verbose HydraLoRA debugging output."})
+    hydralora_expert_lora_nums: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional comma-separated list overriding `lora_num` per HydraLoRA expert when MoE is enabled."},
+    )
+    mola_num_experts: int = field(default=4, metadata={"help": "Number of experts used by MoLA."})
+    mola_top_k: int = field(default=2, metadata={"help": "Top-k experts routed to for each token in MoLA."})
+    mola_use_null_expert: bool = field(default=False, metadata={"help": "Enable a null expert in MoLA routing."})
+    mola_router_aux_loss_coef: float = field(default=0.01, metadata={"help": "Router auxiliary loss weight for MoLA."})
+    mola_null_expert_penalty: float = field(
+        default=0.1,
+        metadata={"help": "Penalty applied to null-expert usage in MoLA."},
+    )
+    mola_aux_loss_annealing: bool = field(default=False, metadata={"help": "Anneal the MoLA auxiliary loss during training."})
+    mola_debug_mode: bool = field(default=False, metadata={"help": "Verbose logging inside MoLA routers."})
+    moelpr_stage: int = field(
+        default=1,
+        metadata={"help": "MoE-LPR training stage (1=train experts, 2=router refinement)."},
+    )
+    moelpr_num_experts: int = field(
+        default=4,
+        metadata={"help": "Total number of experts for MoE-LPR (including the frozen base expert)."},
+    )
+    moelpr_top_k: int = field(default=1, metadata={"help": "Top-k experts to route each token to in MoE-LPR."})
+    moelpr_layers_to_transform: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated decoder layer ids to convert into MoE layers (use 'all' for every layer)."},
+    )
+    moelpr_aux_loss_coef: float = field(
+        default=0.01,
+        metadata={"help": "Load-balancing auxiliary loss weight for Stage 1."},
+    )
+    moelpr_lpr_loss_coef: float = field(
+        default=0.1,
+        metadata={"help": "LPR loss weight for Stage 2 router refinement."},
+    )
+    moelpr_original_language: Optional[str] = field(
+        default=None,
+        metadata={"help": "Language identifier that should route to the frozen base expert during Stage 2."},
+    )
+    moelpr_debug_mode: bool = field(default=False, metadata={"help": "Enable verbose MoE-LPR router diagnostics."})
+    moelpr_target_language_id: Optional[int] = field(default=None, init=False, repr=False)
+    adamole_num_experts: int = field(
+        default=4,
+        metadata={"help": "Number of LoRA experts to instantiate per adapted module for AdaMoLE."},
+    )
+    adamole_max_threshold: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Upper bound for the adaptive gating threshold tau. Defaults to 1 / num_experts when unset."
+        },
+    )
+    adamole_aux_loss_coef: float = field(
+        default=0.0,
+        metadata={"help": "Coefficient for the AdaMoLE load-balancing auxiliary loss."},
+    )
+    adamole_debug_mode: bool = field(
+        default=False,
+        metadata={"help": "Enable verbose AdaMoLE routing diagnostics."},
+    )
+    language_column: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={"help": "Dataset column containing language identifiers; if unset, language-aware routing is disabled."},
+    )
+    language_map: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={"help": "JSON string/path mapping languages to families for language-prior routing."},
+    )
+    language_router_mode: Literal["learned", "bias", "hard"] = field(
+        default="learned",
+        metadata={"help": "Language routing mode: 'learned'=no intervention, 'bias'=logit bonus, 'hard'=one-hot."},
+    )
+    language_head_router_mode: Optional[Literal["learned", "bias", "hard"]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional override for language routing at the head/B stage. "
+                "If unset, falls back to `language_router_mode`."
+            )
+        },
+    )
+    language_guidance_scope: Literal["all", "expert_only", "none"] = field(
+        default="all",
+        metadata={
+            "help": "Which routing stages receive language guidance: 'all'=experts+heads, 'expert_only', or 'none'."
+        },
+    )
+    language_prior_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for the language-prior auxiliary loss (0 disables)."},
+    )
+    language_bias_value: float = field(
+        default=5.0,
+        metadata={"help": "Logit bias value applied in 'bias' routing mode."},
+    )
+    language_head_bias_value: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional override for the logit bias value at the head/B stage when "
+                "`language_head_router_mode='bias'`. If unset, falls back to `language_bias_value`."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):
@@ -538,15 +703,38 @@ class FinetuningArguments(
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
+        if isinstance(self.cola_init_lora_weights, str):
+            self.cola_init_lora_weights = self.cola_init_lora_weights.strip()
+            if len(self.cola_init_lora_weights) == 0:
+                self.cola_init_lora_weights = None
+        if isinstance(self.cola_expert_num_A, str):
+            self.cola_expert_num_A = self.cola_expert_num_A.strip() or None
+        if isinstance(self.cola_expert_num_B, str):
+            self.cola_expert_num_B = self.cola_expert_num_B.strip() or None
+        if isinstance(self.hydralora_expert_lora_nums, str):
+            self.hydralora_expert_lora_nums = self.hydralora_expert_lora_nums.strip() or None
+        if self.cola_strategy == "random":
+            self.cola_strategy = "random_ab"
 
-        assert self.finetuning_type in ["lora", "oft", "freeze", "full"], "Invalid fine-tuning method."
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mola", "moelpr"]
+        assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
+
+        if self.finetuning_type == "moelpr":
+            if self.moelpr_stage not in (1, 2):
+                raise ValueError("`moelpr_stage` must be 1 or 2.")
+            if self.moelpr_top_k <= 0 or self.moelpr_top_k > self.moelpr_num_experts:
+                raise ValueError("`moelpr_top_k` must be in range [1, moelpr_num_experts].")
+            if self.moelpr_stage == 2 and not self.moelpr_original_language:
+                raise ValueError("`moelpr_original_language` is required for Stage 2 training.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
 
-        if self.stage == "ppo" and self.reward_model_type == "lora" and self.finetuning_type != "lora":
+        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "mola", "moelpr"]
+
+        if self.stage == "ppo" and self.reward_model_type == "lora" and not lora_like:
             raise ValueError("`reward_model_type` cannot be lora for Freeze/Full PPO training.")
 
         if self.stage == "ppo" and self.reward_model_type == "oft" and self.finetuning_type != "oft":
@@ -558,7 +746,7 @@ class FinetuningArguments(
         if self.use_llama_pro and self.finetuning_type == "full":
             raise ValueError("`use_llama_pro` is only valid for Freeze or LoRA training.")
 
-        if self.finetuning_type == "lora" and (self.use_galore or self.use_apollo or self.use_badam):
+        if lora_like and (self.use_galore or self.use_apollo or self.use_badam):
             raise ValueError("Cannot use LoRA with GaLore, APOLLO or BAdam together.")
 
         if int(self.use_galore) + int(self.use_apollo) + (self.use_badam) > 1:

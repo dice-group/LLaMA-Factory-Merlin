@@ -13,14 +13,27 @@
 # limitations under the License.
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
-from peft import LoraConfig, LoraModel, OFTConfig, PeftModel, TaskType, get_peft_model
+from peft import (
+    AdaMoleConfig,
+    ColaConfig,
+    HydraLoraConfig,
+    LoraConfig,
+    LoraModel,
+    MoelprConfig,
+    MolaConfig,
+    OFTConfig,
+    PeftModel,
+    TaskType,
+    get_peft_model,
+)
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from ..extras import logging
 from ..extras.constants import EngineName
+from ..extras.language import load_language_groupings, load_language_map
 from .model_utils.ktransformers import get_kt_peft_model, load_kt_peft_model
 from .model_utils.misc import find_all_linear_modules, find_expanded_modules
 from .model_utils.quantization import QuantizationMethod
@@ -35,6 +48,40 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _build_language_metadata(language_map_spec: Optional[str]):
+    language_map, families, subgroup_sizes, language_to_subgroup = load_language_groupings(language_map_spec)
+    if not language_map:
+        return None, None, None, None, None
+
+    languages = sorted(language_map.keys())
+    if families is None:
+        families = sorted(set(language_map.values()))
+    family_to_idx = {family: idx for idx, family in enumerate(families)}
+    language_to_family_ids = [family_to_idx[language_map[lang]] for lang in languages]
+
+    if language_to_subgroup is None:
+        language_to_subgroup_ids = None
+    else:
+        language_to_subgroup_ids = [language_to_subgroup.get(lang, -1) for lang in languages]
+
+    return languages, families, language_to_family_ids, subgroup_sizes, language_to_subgroup_ids
+
+
+def _parse_optional_int_list(value: Optional[Union[str, Sequence[int]]]) -> Optional[list[int]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        items = list(value)
+    if not items:
+        return None
+    parsed = []
+    for item in items:
+        parsed.append(int(item))
+    return parsed
 
 
 def _setup_full_tuning(
@@ -318,6 +365,577 @@ def _setup_lora_tuning(
     return model
 
 
+def _setup_cola_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if model_args.use_kt or model_args.use_unsloth:
+        raise ValueError("CoLA is not compatible with KTransformers or Unsloth.")
+
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: COLA")
+
+    cola_debug = getattr(finetuning_args, "cola_debug", False)
+    if cola_debug:
+        logger.info_rank0("[COLA DEBUG] Enabled CoLA architecture + expert init verification.")
+
+    adapter_to_resume = None
+
+    if model_args.adapter_name_or_path is not None:
+        is_mergeable = True
+        if getattr(model, "quantization_method", None):  # merge lora in quantized model is unstable
+            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
+            is_mergeable = False
+
+        if is_deepspeed_zero3_enabled():
+            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
+            is_mergeable = False
+
+        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
+            adapter_to_merge = model_args.adapter_name_or_path[:-1]
+            adapter_to_resume = model_args.adapter_name_or_path[-1]
+        else:
+            adapter_to_merge = model_args.adapter_name_or_path
+
+        init_kwargs = {
+            "subfolder": model_args.adapter_folder,
+            "offload_folder": model_args.offload_folder,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+        for adapter in adapter_to_merge:
+            model: "LoraModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            model = model.merge_and_unload()
+
+        if len(adapter_to_merge) > 0:
+            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
+
+        if adapter_to_resume is not None:  # resume adapter training
+            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+
+        logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+
+    if is_trainable and adapter_to_resume is None:
+        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+        else:
+            target_modules = finetuning_args.lora_target
+
+        if finetuning_args.use_llama_pro:
+            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+
+        if model_args.resize_vocab and finetuning_args.additional_target is None:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            module_names = set()
+            for name, module in model.named_modules():
+                if module in [input_embeddings, output_embeddings]:
+                    module_names.add(name.split(".")[-1])
+
+            finetuning_args.additional_target = module_names
+            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        expert_num_A = _parse_optional_int_list(finetuning_args.cola_expert_num_A)
+        expert_num_B = _parse_optional_int_list(finetuning_args.cola_expert_num_B)
+
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "num_A": finetuning_args.num_A,
+            "num_B": finetuning_args.num_B,
+            "expert_num_A": expert_num_A,
+            "expert_num_B": expert_num_B,
+            "use_cola_experts": finetuning_args.use_cola_experts,
+            "cola_num_experts": finetuning_args.cola_num_experts,
+            "cola_top_k": finetuning_args.cola_top_k,
+            "cola_debug": finetuning_args.cola_debug,
+            "cola_strategy": finetuning_args.cola_strategy,
+            "modules_to_save": finetuning_args.additional_target,
+        }
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, _, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+        peft_kwargs.update(
+            {
+                "language_map": language_map,
+                "language_list": language_list,
+                "family_list": family_list,
+                "language_to_family_ids": language_to_family,
+                "language_to_subgroup_ids": language_to_subgroup_ids,
+                "language_column": finetuning_args.language_column,
+                "language_router_mode": finetuning_args.language_router_mode,
+                "language_head_router_mode": finetuning_args.language_head_router_mode,
+                "language_guidance_scope": finetuning_args.language_guidance_scope,
+                "language_prior_weight": finetuning_args.language_prior_weight,
+                "language_bias_value": finetuning_args.language_bias_value,
+                "language_head_bias_value": finetuning_args.language_head_bias_value,
+            }
+        )
+        init_lora_weights = finetuning_args.cola_init_lora_weights
+        if init_lora_weights is None:
+            if finetuning_args.use_cola_pissa_init:
+                init_lora_weights = (
+                    "pissa" if finetuning_args.pissa_iter == -1 else f"pissa_niter_{finetuning_args.pissa_iter}"
+                )
+            else:
+                init_lora_weights = True
+        else:
+            lowered = init_lora_weights.lower()
+            if lowered in {"true", "default", "lora"}:
+                init_lora_weights = True
+            elif lowered in {"false", "none", "random"}:
+                init_lora_weights = False
+            elif lowered == "pissa" and finetuning_args.pissa_iter != -1:
+                init_lora_weights = f"pissa_niter_{finetuning_args.pissa_iter}"
+        peft_kwargs["init_lora_weights"] = init_lora_weights
+        logger.info_rank0(f"CoLA adapter initialization method: {init_lora_weights}.")
+
+        cola_config = ColaConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            **peft_kwargs,
+        )
+        model = get_peft_model(model, cola_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    if cola_debug:
+        for _, module in model.named_modules():
+            if hasattr(module, "use_cola_experts"):
+                module.cola_debug = True
+        logger.info_rank0("[COLA DEBUG] Attached cola_debug=True to all CoLA layers.")
+
+    return model
+
+
+def _setup_hydralora_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if model_args.use_kt or model_args.use_unsloth:
+        raise ValueError("HydraLoRA is not compatible with KTransformers or Unsloth.")
+
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: HYDRALORA")
+
+    adapter_to_resume = None
+
+    if model_args.adapter_name_or_path is not None:
+        is_mergeable = True
+        if getattr(model, "quantization_method", None):
+            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
+            is_mergeable = False
+
+        if is_deepspeed_zero3_enabled():
+            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
+            is_mergeable = False
+
+        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
+            adapter_to_merge = model_args.adapter_name_or_path[:-1]
+            adapter_to_resume = model_args.adapter_name_or_path[-1]
+        else:
+            adapter_to_merge = model_args.adapter_name_or_path
+
+        init_kwargs = {
+            "subfolder": model_args.adapter_folder,
+            "offload_folder": model_args.offload_folder,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+        for adapter in adapter_to_merge:
+            model: "LoraModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            model = model.merge_and_unload()
+
+        if len(adapter_to_merge) > 0:
+            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
+
+        if adapter_to_resume is not None:
+            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+
+        logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+
+    if is_trainable and adapter_to_resume is None:
+        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+        else:
+            target_modules = finetuning_args.lora_target
+
+        if finetuning_args.use_llama_pro:
+            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+
+        if model_args.resize_vocab and finetuning_args.additional_target is None:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            module_names = set()
+            for name, module in model.named_modules():
+                if module in [input_embeddings, output_embeddings]:
+                    module_names.add(name.split(".")[-1])
+
+            finetuning_args.additional_target = module_names
+            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        expert_lora_nums = _parse_optional_int_list(finetuning_args.hydralora_expert_lora_nums)
+
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "lora_num": finetuning_args.lora_num,
+            "expert_lora_nums": expert_lora_nums,
+            "use_hydralora_experts": finetuning_args.use_hydralora_experts,
+            "num_experts": finetuning_args.hydralora_num_experts,
+            "top_k": finetuning_args.hydralora_top_k,
+            "hydralora_debug": finetuning_args.hydralora_debug,
+            "modules_to_save": finetuning_args.additional_target,
+        }
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, _, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+        peft_kwargs.update(
+            {
+                "language_map": language_map,
+                "language_list": language_list,
+                "family_list": family_list,
+                "language_to_family_ids": language_to_family,
+                "language_to_subgroup_ids": language_to_subgroup_ids,
+                "language_column": finetuning_args.language_column,
+                "language_router_mode": finetuning_args.language_router_mode,
+                "language_head_router_mode": finetuning_args.language_head_router_mode,
+                "language_guidance_scope": finetuning_args.language_guidance_scope,
+                "language_prior_weight": finetuning_args.language_prior_weight,
+                "language_bias_value": finetuning_args.language_bias_value,
+                "language_head_bias_value": finetuning_args.language_head_bias_value,
+            }
+        )
+
+        hydra_config = HydraLoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            **peft_kwargs,
+        )
+        model = get_peft_model(model, hydra_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _setup_adamole_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if finetuning_args.use_dora or finetuning_args.use_rslora:
+        raise ValueError("AdaMoLE currently does not support DoRA or rank-stabilized LoRA weights.")
+    if model_args.use_unsloth or model_args.use_kt:
+        raise ValueError("AdaMoLE is not compatible with KTransformers or Unsloth.")
+
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: AdaMoLE")
+
+    adapter_to_resume = None
+
+    if model_args.adapter_name_or_path is not None:
+        is_mergeable = True
+        if getattr(model, "quantization_method", None):
+            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
+            is_mergeable = False
+
+        if is_deepspeed_zero3_enabled():
+            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
+            is_mergeable = False
+
+        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
+            adapter_to_merge = model_args.adapter_name_or_path[:-1]
+            adapter_to_resume = model_args.adapter_name_or_path[-1]
+        else:
+            adapter_to_merge = model_args.adapter_name_or_path
+
+        init_kwargs = {
+            "subfolder": model_args.adapter_folder,
+            "offload_folder": model_args.offload_folder,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+        for adapter in adapter_to_merge:
+            model: "LoraModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            model = model.merge_and_unload()
+
+        if len(adapter_to_merge) > 0:
+            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
+
+        if adapter_to_resume is not None:  # resume adapter training
+            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+
+        logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+
+    if is_trainable and adapter_to_resume is None:
+        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+        else:
+            target_modules = finetuning_args.lora_target
+
+        if finetuning_args.use_llama_pro:
+            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+
+        if model_args.resize_vocab and finetuning_args.additional_target is None:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            module_names = set()
+            for name, module in model.named_modules():
+                if module in [input_embeddings, output_embeddings]:
+                    module_names.add(name.split(".")[-1])
+
+            finetuning_args.additional_target = module_names
+            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "modules_to_save": finetuning_args.additional_target,
+        }
+
+        if finetuning_args.pissa_init:
+            if finetuning_args.pissa_iter == -1:
+                logger.info_rank0("Using PiSSA initialization.")
+                peft_kwargs["init_lora_weights"] = "pissa"
+            else:
+                logger.info_rank0(f"Using PiSSA initialization with FSVD steps {finetuning_args.pissa_iter}.")
+                peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
+
+        adamole_config = AdaMoleConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            num_experts=finetuning_args.adamole_num_experts,
+            max_threshold=finetuning_args.adamole_max_threshold,
+            debug_mode=finetuning_args.adamole_debug_mode,
+            **peft_kwargs,
+        )
+        model = get_peft_model(model, adamole_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _setup_mola_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if finetuning_args.use_dora or finetuning_args.use_rslora:
+        raise ValueError("MoLA currently does not support DoRA or rank-stabilized LoRA weights.")
+    if model_args.use_unsloth or model_args.use_kt:
+        raise ValueError("MoLA is not compatible with KTransformers or Unsloth.")
+
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: MoLA")
+
+    adapter_to_resume = None
+
+    if model_args.adapter_name_or_path is not None:
+        is_mergeable = True
+        if getattr(model, "quantization_method", None):
+            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
+            is_mergeable = False
+
+        if is_deepspeed_zero3_enabled():
+            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
+            is_mergeable = False
+
+        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
+            adapter_to_merge = model_args.adapter_name_or_path[:-1]
+            adapter_to_resume = model_args.adapter_name_or_path[-1]
+        else:
+            adapter_to_merge = model_args.adapter_name_or_path
+
+        init_kwargs = {
+            "subfolder": model_args.adapter_folder,
+            "offload_folder": model_args.offload_folder,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+        for adapter in adapter_to_merge:
+            model: "LoraModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            model = model.merge_and_unload()
+
+        if len(adapter_to_merge) > 0:
+            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
+
+        if adapter_to_resume is not None:
+            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+
+        logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+
+    if is_trainable and adapter_to_resume is None:
+        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+        else:
+            target_modules = finetuning_args.lora_target
+
+        if finetuning_args.use_llama_pro:
+            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+
+        if model_args.resize_vocab and finetuning_args.additional_target is None:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            module_names = set()
+            for name, module in model.named_modules():
+                if module in [input_embeddings, output_embeddings]:
+                    module_names.add(name.split(".")[-1])
+
+            finetuning_args.additional_target = module_names
+            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "modules_to_save": finetuning_args.additional_target,
+        }
+
+        if finetuning_args.pissa_init:
+            if finetuning_args.pissa_iter == -1:
+                logger.info_rank0("Using PiSSA initialization.")
+                peft_kwargs["init_lora_weights"] = "pissa"
+            else:
+                logger.info_rank0(f"Using PiSSA initialization with FSVD steps {finetuning_args.pissa_iter}.")
+                peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
+
+        mola_config = MolaConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            mola_num_experts=finetuning_args.mola_num_experts,
+            mola_top_k=finetuning_args.mola_top_k,
+            mola_use_null_expert=finetuning_args.mola_use_null_expert,
+            mola_router_aux_loss_coef=finetuning_args.mola_router_aux_loss_coef,
+            mola_null_expert_penalty=finetuning_args.mola_null_expert_penalty,
+            mola_aux_loss_annealing=finetuning_args.mola_aux_loss_annealing,
+            mola_debug_mode=finetuning_args.mola_debug_mode,
+            **peft_kwargs,
+        )
+        model = get_peft_model(model, mola_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _setup_moelpr_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if model_args.use_unsloth or model_args.use_kt:
+        raise ValueError("MoE-LPR is not compatible with KTransformers or Unsloth.")
+
+    if is_trainable:
+        logger.info_rank0(f"Fine-tuning method: MoE-LPR (Stage {finetuning_args.moelpr_stage})")
+
+    if hasattr(config, "text_config"):
+        text_config = config.text_config
+    else:
+        text_config = config
+
+    num_layers = (
+        getattr(text_config, "num_hidden_layers", None)
+        or getattr(text_config, "num_layers", None)
+        or getattr(text_config, "n_layer", None)
+    )
+    if num_layers is None or num_layers <= 0:
+        raise ValueError("Current model does not expose a valid `num_hidden_layers` for MoE-LPR.")
+
+    if finetuning_args.moelpr_layers_to_transform is None:
+        layer_ids = list(range(num_layers))
+    elif isinstance(finetuning_args.moelpr_layers_to_transform, str):
+        if finetuning_args.moelpr_layers_to_transform.strip().lower() == "all":
+            layer_ids = list(range(num_layers))
+        else:
+            layer_ids = [int(x) for x in finetuning_args.moelpr_layers_to_transform.split(",") if x.strip()]
+    else:
+        layer_ids = list(finetuning_args.moelpr_layers_to_transform)
+
+    moelpr_config = MoelprConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        num_experts=finetuning_args.moelpr_num_experts,
+        topk=finetuning_args.moelpr_top_k,
+        layers_to_transform=layer_ids,
+        aux_loss_coef=finetuning_args.moelpr_aux_loss_coef,
+        lpr_loss_coef=finetuning_args.moelpr_lpr_loss_coef,
+        stage=finetuning_args.moelpr_stage,
+        moelpr_debug_mode=finetuning_args.moelpr_debug_mode,
+    )
+    model = get_peft_model(model, moelpr_config)
+
+    if is_trainable and finetuning_args.moelpr_stage == 2:
+        trainable_params = 0
+        frozen_params = 0
+        for name, param in model.named_parameters():
+            if "moe_router_embedding" in name:
+                param.requires_grad_(True)
+                trainable_params += param.numel()
+            else:
+                param.requires_grad_(False)
+                frozen_params += param.numel()
+        logger.info_rank0(
+            "[MoE-LPR] Stage 2 router-only training enabled: %d params trainable, %d params frozen.",
+            trainable_params,
+            frozen_params,
+        )
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
 def init_adapter(
     config: "PretrainedConfig",
     model: "PreTrainedModel",
@@ -358,6 +976,26 @@ def init_adapter(
         _setup_freeze_tuning(model, finetuning_args, is_trainable, cast_trainable_params_to_fp32)
     elif finetuning_args.finetuning_type in ["lora", "oft"]:
         model = _setup_lora_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "cola":
+        model = _setup_cola_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "hydralora":
+        model = _setup_hydralora_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "adamole":
+        model = _setup_adamole_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "mola":
+        model = _setup_mola_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "moelpr":
+        model = _setup_moelpr_tuning(
             config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
         )
     else:
