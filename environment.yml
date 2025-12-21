@@ -9,7 +9,7 @@ dependencies:
   - pytorch
   - torchvision
   - torchaudio
-  - pytorch-cuda=12.6
+  - pytorch-cuda=12.1
   - pip:
       - -r requirements.txt
       - flash-attn
