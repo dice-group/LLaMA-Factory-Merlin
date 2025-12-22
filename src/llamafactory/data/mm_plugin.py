@@ -55,11 +55,15 @@ if is_pyav_available():
     import av
 
 
-if is_transformers_version_greater_than("4.52.0"):
+try:
     from transformers.image_utils import make_flat_list_of_images
     from transformers.video_utils import make_batched_videos
-else:
-    from transformers.image_utils import make_batched_videos, make_flat_list_of_images
+except ImportError:
+    try:
+        from transformers.image_utils import make_batched_videos, make_flat_list_of_images
+    except ImportError:
+        make_flat_list_of_images = None
+        make_batched_videos = None
 
 
 if TYPE_CHECKING:
@@ -634,6 +638,11 @@ class InternVLPlugin(BasePlugin):
             )["videos"]
 
         if len(images) != 0:
+            if make_flat_list_of_images is None:
+                raise ImportError(
+                    "make_flat_list_of_images is unavailable in this transformers version; "
+                    "upgrade transformers or disable image inputs."
+                )
             images = make_flat_list_of_images(images)
             image_inputs = image_processor(images=images, return_tensors="pt", **image_processor_kwargs)
             image_num_patches = image_inputs.pop("num_patches")
@@ -641,6 +650,11 @@ class InternVLPlugin(BasePlugin):
             image_num_patches_indices = np.cumsum(image_num_patches)
 
         if len(videos) != 0:
+            if make_batched_videos is None:
+                raise ImportError(
+                    "make_batched_videos is unavailable in this transformers version; "
+                    "upgrade transformers or disable video inputs."
+                )
             videos = make_batched_videos(videos)
             num_frames_per_video = [len(video) for video in videos]
             patch_indices = np.cumsum(num_frames_per_video)
