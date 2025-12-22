@@ -5,4 +5,4 @@ from .model import MoeModel
 
 __all__ = ["MoeConfig", "MoeModel"]
 
-register_peft_method(name="moelpr", config_cls=MoeConfig, model_cls=MoeModel, prefix="lora_")
+register_peft_method(name="moelpr", config_cls=MoeConfig, model_cls=MoeModel, prefix="moe_")
