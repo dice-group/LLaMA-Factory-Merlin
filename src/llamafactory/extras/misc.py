@@ -18,6 +18,7 @@
 import gc
 import os
 import socket
+import importlib
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import torch
@@ -78,6 +79,28 @@ def check_version(requirement: str, mandatory: bool = False) -> None:
     if is_env_enabled("DISABLE_VERSION_CHECK") and not mandatory:
         logger.warning_rank0_once("Version checking has been disabled, may lead to unexpected behaviors.")
         return
+
+    # Allow vendored PEFT (no installed distribution metadata) to satisfy version checks.
+    try:
+        from packaging.requirements import Requirement
+        from packaging.version import Version
+    except Exception:
+        Requirement = None
+        Version = None
+
+    if Requirement is not None and Version is not None:
+        try:
+            req = Requirement(requirement)
+        except Exception:
+            req = None
+        if req and req.name == "peft":
+            try:
+                peft_module = importlib.import_module("peft")
+                peft_version = getattr(peft_module, "__version__", None)
+                if peft_version and Version(peft_version) in req.specifier:
+                    return
+            except Exception:
+                pass
 
     if "gptmodel" in requirement or "autoawq" in requirement:
         pip_command = f"pip install {requirement} --no-build-isolation"

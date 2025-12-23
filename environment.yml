@@ -5,13 +5,10 @@ channels:
   - conda-forge
 dependencies:
   - python=3.10
-  - pip
   - omegaconf
   - pytorch
   - torchvision
   - torchaudio
   - pytorch-cuda=12.1
   - cuda-toolkit=12.1
-  - pip:
-      - -r requirements.txt
-      - -e .
+  - pip
