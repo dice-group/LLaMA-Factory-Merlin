@@ -208,6 +208,8 @@ def _setup_lora_tuning(
             logger.info_rank0("Fine-tuning method: {}".format("DoRA" if finetuning_args.use_dora else "LoRA"))
 
     adapter_to_resume = None
+    language_map = None
+    target_modules: list[str] = []
 
     if model_args.adapter_name_or_path is not None:
         is_mergeable = True
@@ -397,6 +399,8 @@ def _setup_cola_tuning(
         logger.info_rank0("Fine-tuning method: COLA")
 
     cola_debug = getattr(finetuning_args, "cola_debug", False)
+    language_map = None
+    target_modules: list[str] = []
     if cola_debug:
         logger.info_rank0("[COLA DEBUG] Enabled CoLA architecture + expert init verification.")
 
@@ -533,6 +537,26 @@ def _setup_cola_tuning(
             if hasattr(module, "use_cola_experts"):
                 module.cola_debug = True
         logger.info_rank0("[COLA DEBUG] Attached cola_debug=True to all CoLA layers.")
+        if language_map is not None:
+            if isinstance(language_map, dict):
+                language_count = len(language_map)
+            elif isinstance(language_map, list):
+                language_count = len(language_map)
+            else:
+                language_count = None
+        else:
+            language_count = None
+        cola_layers = sum(1 for _, module in model.named_modules() if hasattr(module, "use_cola_experts"))
+        logger.info_rank0(
+            "[COLA DEBUG] Summary: layers=%d target_modules=%d languages=%s num_experts=%s top_k=%s num_A=%s num_B=%s",
+            cola_layers,
+            len(target_modules),
+            "unknown" if language_count is None else str(language_count),
+            finetuning_args.cola_num_experts,
+            finetuning_args.cola_top_k,
+            finetuning_args.num_A,
+            finetuning_args.num_B,
+        )
 
     return model
 
@@ -656,6 +680,27 @@ def _setup_hydralora_tuning(
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):
             param.data = param.data.to(torch.float32)
+
+    if getattr(finetuning_args, "hydralora_debug", False):
+        if language_map is not None:
+            if isinstance(language_map, dict):
+                language_count = len(language_map)
+            elif isinstance(language_map, list):
+                language_count = len(language_map)
+            else:
+                language_count = None
+        else:
+            language_count = None
+        hydra_layers = sum(1 for _, module in model.named_modules() if hasattr(module, "use_hydralora_experts"))
+        logger.info_rank0(
+            "[HYDRA DEBUG] Summary: layers=%d target_modules=%d languages=%s num_experts=%s top_k=%s lora_num=%s",
+            hydra_layers,
+            len(target_modules),
+            "unknown" if language_count is None else str(language_count),
+            finetuning_args.hydralora_num_experts,
+            finetuning_args.hydralora_top_k,
+            finetuning_args.lora_num,
+        )
 
     return model
 
