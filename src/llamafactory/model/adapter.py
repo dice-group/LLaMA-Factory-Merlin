@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
+from distutils.util import strtobool
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
@@ -48,6 +50,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _accelerate_wants_fsdp() -> bool:
+    return strtobool(os.environ.get("ACCELERATE_USE_FSDP", "False")) == 1
 
 
 def _build_language_metadata(language_map_spec: Optional[str]):
@@ -362,6 +368,17 @@ def _setup_lora_tuning(
         for param in filter(lambda p: p.requires_grad, model.parameters()):
             param.data = param.data.to(torch.float32)
 
+    if (
+        is_trainable
+        and (is_deepspeed_zero3_enabled() or _accelerate_wants_fsdp())
+        and getattr(model_args, "compute_dtype", None) in (torch.float16, torch.bfloat16)
+    ):
+        target_dtype = model_args.compute_dtype
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            if param.dtype != target_dtype:
+                param.data = param.data.to(target_dtype)
+        logger.info_rank0(f"FSDP/ZeRO-3 detected, casting trainable params to {target_dtype}.")
+
     return model
 
 
@@ -429,7 +446,7 @@ def _setup_cola_tuning(
         if finetuning_args.use_llama_pro:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+        target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
@@ -580,7 +597,7 @@ def _setup_hydralora_tuning(
         if finetuning_args.use_llama_pro:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+        target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
@@ -705,7 +722,7 @@ def _setup_adamole_tuning(
         if finetuning_args.use_llama_pro:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+        target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
@@ -813,7 +830,7 @@ def _setup_mola_tuning(
         if finetuning_args.use_llama_pro:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+        target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
@@ -964,8 +981,8 @@ def init_adapter(
         pass
     elif finetuning_args.pure_bf16 or finetuning_args.use_badam:
         logger.info_rank0("Pure bf16 / BAdam detected, remaining trainable params in half precision.")
-    elif model_args.quantization_bit is None and is_deepspeed_zero3_enabled():
-        logger.info_rank0("DeepSpeed ZeRO3 detected, remaining trainable params in float32.")
+    elif model_args.quantization_bit is None and (is_deepspeed_zero3_enabled() or _accelerate_wants_fsdp()):
+        logger.info_rank0("DeepSpeed ZeRO3 / FSDP detected, remaining trainable params in float32.")
     else:
         logger.info_rank0("Upcasting trainable params to float32.")
         cast_trainable_params_to_fp32 = True
@@ -1000,5 +1017,16 @@ def init_adapter(
         )
     else:
         raise NotImplementedError(f"Unknown finetuning type: {finetuning_args.finetuning_type}.")
+
+    if (
+        is_trainable
+        and (is_deepspeed_zero3_enabled() or _accelerate_wants_fsdp())
+        and getattr(model_args, "compute_dtype", None) in (torch.float16, torch.bfloat16)
+    ):
+        target_dtype = model_args.compute_dtype
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            if param.dtype != target_dtype:
+                param.data = param.data.to(target_dtype)
+        logger.info_rank0(f"FSDP/ZeRO-3 detected, casting trainable params to {target_dtype}.")
 
     return model
