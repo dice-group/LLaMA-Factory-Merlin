@@ -289,6 +289,37 @@ def get_dataset(
             logger.warning_rank0("Loading dataset from disk will ignore other data arguments.")
             tokenized_data = load_from_disk(data_args.tokenized_path)
             dataset_module = get_dataset_module(tokenized_data)
+            if "train_dataset" in dataset_module and dataset_module["train_dataset"] is not None:
+                tokenized_train = dataset_module["train_dataset"]
+                if "split" in tokenized_train.column_names:
+                    logger.info_rank0(
+                        "Found split column in tokenized dataset, building train/validation splits."
+                    )
+                    batch_size = max(10000, data_args.preprocessing_batch_size or 0)
+                    num_proc = data_args.preprocessing_num_workers
+                    cache_ok = not data_args.overwrite_cache
+                    filter_kwargs = dict(
+                        input_columns="split",
+                        batched=True,
+                        batch_size=batch_size,
+                        num_proc=num_proc,
+                        load_from_cache_file=cache_ok,
+                    )
+                    val_ds = tokenized_train.filter(
+                        lambda splits: [s == "validation" for s in splits],
+                        desc="build validation split",
+                        **filter_kwargs,
+                    )
+                    train_ds = tokenized_train.filter(
+                        lambda splits: [s != "validation" for s in splits],
+                        desc="build train split",
+                        **filter_kwargs,
+                    )
+                    for name, ds in [("train", train_ds), ("validation", val_ds)]:
+                        cols = [c for c in ("language", "split") if c in ds.column_names]
+                        if cols:
+                            ds = ds.remove_columns(cols)
+                        dataset_module[f"{'eval' if name == 'validation' else 'train'}_dataset"] = ds
             if data_args.streaming:
                 dataset_module["train_dataset"] = dataset_module["train_dataset"].to_iterable_dataset()
 
