@@ -243,7 +243,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return None
 
         aux = weight * sum(losses) / len(losses)
-        self.log({"language_prior_loss": aux.detach()})
+        self.log({"language_prior_loss": float(aux.detach().mean().cpu())})
         return aux
 
     def _compute_adamole_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
@@ -261,7 +261,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return None
 
         scaled = coef * aux
-        self.log({"adamole_aux_loss": scaled.detach()})
+        self.log({"adamole_aux_loss": float(scaled.detach().mean().cpu())})
         return scaled
 
     def _compute_mola_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
@@ -277,7 +277,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if aux is None:
             return None
 
-        self.log({"mola_aux_loss": aux.detach()})
+        self.log({"mola_aux_loss": float(aux.detach().mean().cpu())})
         return aux
 
     def _compute_moelpr_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
@@ -293,7 +293,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if aux is None:
             return None
 
-        self.log({"moelpr_aux_loss": aux.detach()})
+        self.log({"moelpr_aux_loss": float(aux.detach().mean().cpu())})
         return aux
 
     def _maybe_build_moelpr_mask(self, inputs: Dict[str, "torch.Tensor"]) -> Optional["torch.Tensor"]:
