@@ -11,12 +11,17 @@ pip install -r requirements.txt \
   --no-cache-dir
 ```
 
-3) Install the project in editable mode without deps:
+3) insatlll flash attention seperately
+```
+pip install flash-attn --no-build-isolation
+```
+
+4) Install the project in editable mode without deps:
 ```bash
 pip install -e . --no-deps
 ```
 
-4) Do not install PEFT separately. It is vendored under `src/peft` and is
+5) Do not install PEFT separately. It is vendored under `src/peft` and is
 picked up by the editable install. `pip install -e src/peft` will fail because
 there is no `setup.py` there.
 

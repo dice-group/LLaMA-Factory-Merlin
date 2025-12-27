@@ -11,4 +11,5 @@ dependencies:
   - torchaudio
   - pytorch-cuda=12.1
   - cuda-toolkit=12.1
+  - pytest
   - pip
