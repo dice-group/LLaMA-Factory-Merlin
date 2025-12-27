@@ -158,7 +158,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return base + added
 
     @override
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         is_train_log = any(key in logs for key in ("loss", "learning_rate")) or any(
             key.startswith("train/") for key in logs
         )
@@ -170,7 +170,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         continue
                     scoped = key if key.startswith("train/") else f"train/{key}"
                     logs[scoped] = value
-        super().log(logs)
+        super().log(logs, *args, **kwargs)
 
     @override
     def prediction_step(
