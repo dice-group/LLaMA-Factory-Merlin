@@ -401,6 +401,8 @@ def _setup_cola_tuning(
     cola_debug = getattr(finetuning_args, "cola_debug", False)
     language_map = None
     target_modules: list[str] = []
+    expected_experts: Optional[int] = None
+    expected_heads: Optional[list[int]] = None
     if cola_debug:
         logger.info_rank0("[COLA DEBUG] Enabled CoLA architecture + expert init verification.")
 
@@ -483,9 +485,31 @@ def _setup_cola_tuning(
             "modules_to_save": finetuning_args.additional_target,
         }
         language_map = load_language_map(finetuning_args.language_map)
-        language_list, family_list, language_to_family, _, language_to_subgroup_ids = _build_language_metadata(
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
         )
+        if family_list:
+            expected_experts = len(family_list)
+        if finetuning_args.use_cola_experts and expected_experts:
+            if finetuning_args.cola_num_experts != expected_experts:
+                raise ValueError(
+                    "CoLA expert config mismatch: "
+                    f"cola_num_experts={finetuning_args.cola_num_experts} "
+                    f"but language_map defines {expected_experts} groups."
+                )
+        if expert_num_B is None and subgroup_sizes and any(size > 0 for size in subgroup_sizes):
+            expert_num_B = subgroup_sizes
+        if expert_num_B is None and finetuning_args.use_cola_experts and expected_experts:
+            expert_num_B = [finetuning_args.num_B] * expected_experts
+        if finetuning_args.use_cola_experts and expert_num_B is not None and expected_experts:
+            if len(expert_num_B) != expected_experts:
+                raise ValueError(
+                    "CoLA expert head config mismatch: "
+                    f"expected {expected_experts} entries but got {len(expert_num_B)}."
+                )
+            if any(count <= 0 for count in expert_num_B):
+                raise ValueError("CoLA expert head config contains non-positive counts.")
+            expected_heads = list(expert_num_B)
         peft_kwargs.update(
             {
                 "language_map": language_map,
@@ -527,6 +551,35 @@ def _setup_cola_tuning(
             **peft_kwargs,
         )
         model = get_peft_model(model, cola_config)
+
+    if finetuning_args.use_cola_experts:
+        sample_layer = next((m for _, m in model.named_modules() if hasattr(m, "use_cola_experts")), None)
+        if sample_layer is not None:
+            actual_experts = int(getattr(sample_layer, "num_experts", 0) or 0)
+            actual_heads = []
+            for idx in range(actual_experts):
+                key = f"expert_{idx}"
+                count = 0
+                if hasattr(sample_layer, "num_B") and key in sample_layer.num_B:
+                    count = int(sample_layer.num_B.get(key, 0) or 0)
+                actual_heads.append(count)
+            logger.info_rank0(
+                "[COLA SETUP] experts=%s heads_per_expert=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s",
+                actual_experts,
+                actual_heads,
+                finetuning_args.language_router_mode,
+                finetuning_args.language_head_router_mode,
+                finetuning_args.language_guidance_scope,
+                finetuning_args.cola_top_k,
+            )
+            if expected_experts is not None and actual_experts != expected_experts:
+                raise ValueError(
+                    f"CoLA runtime experts mismatch: expected {expected_experts}, got {actual_experts}."
+                )
+            if expected_heads is not None and actual_heads != expected_heads:
+                raise ValueError(
+                    f"CoLA runtime head mismatch: expected {expected_heads}, got {actual_heads}."
+                )
 
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):
@@ -576,6 +629,8 @@ def _setup_hydralora_tuning(
         logger.info_rank0("Fine-tuning method: HYDRALORA")
 
     adapter_to_resume = None
+    expected_experts: Optional[int] = None
+    expected_heads: Optional[list[int]] = None
 
     if model_args.adapter_name_or_path is not None:
         is_mergeable = True
@@ -650,9 +705,31 @@ def _setup_hydralora_tuning(
             "modules_to_save": finetuning_args.additional_target,
         }
         language_map = load_language_map(finetuning_args.language_map)
-        language_list, family_list, language_to_family, _, language_to_subgroup_ids = _build_language_metadata(
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
         )
+        if family_list:
+            expected_experts = len(family_list)
+        if finetuning_args.use_hydralora_experts and expected_experts:
+            if finetuning_args.hydralora_num_experts != expected_experts:
+                raise ValueError(
+                    "Hydra expert config mismatch: "
+                    f"hydralora_num_experts={finetuning_args.hydralora_num_experts} "
+                    f"but language_map defines {expected_experts} groups."
+                )
+        if expert_lora_nums is None and subgroup_sizes and any(size > 0 for size in subgroup_sizes):
+            expert_lora_nums = subgroup_sizes
+        if expert_lora_nums is None and finetuning_args.use_hydralora_experts and expected_experts:
+            expert_lora_nums = [finetuning_args.lora_num] * expected_experts
+        if finetuning_args.use_hydralora_experts and expert_lora_nums is not None and expected_experts:
+            if len(expert_lora_nums) != expected_experts:
+                raise ValueError(
+                    "Hydra expert head config mismatch: "
+                    f"expected {expected_experts} entries but got {len(expert_lora_nums)}."
+                )
+            if any(count <= 0 for count in expert_lora_nums):
+                raise ValueError("Hydra expert head config contains non-positive counts.")
+            expected_heads = list(expert_lora_nums)
         peft_kwargs.update(
             {
                 "language_map": language_map,
@@ -676,6 +753,35 @@ def _setup_hydralora_tuning(
             **peft_kwargs,
         )
         model = get_peft_model(model, hydra_config)
+
+    if finetuning_args.use_hydralora_experts:
+        sample_layer = next((m for _, m in model.named_modules() if hasattr(m, "use_hydralora_experts")), None)
+        if sample_layer is not None:
+            actual_experts = int(getattr(sample_layer, "num_experts", 0) or 0)
+            actual_heads = []
+            for idx in range(actual_experts):
+                key = f"expert_{idx}"
+                count = 0
+                if hasattr(sample_layer, "lora_num") and key in sample_layer.lora_num:
+                    count = int(sample_layer.lora_num.get(key, 0) or 0)
+                actual_heads.append(count)
+            logger.info_rank0(
+                "[HYDRA SETUP] experts=%s heads_per_expert=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s",
+                actual_experts,
+                actual_heads,
+                finetuning_args.language_router_mode,
+                finetuning_args.language_head_router_mode,
+                finetuning_args.language_guidance_scope,
+                finetuning_args.hydralora_top_k,
+            )
+            if expected_experts is not None and actual_experts != expected_experts:
+                raise ValueError(
+                    f"Hydra runtime experts mismatch: expected {expected_experts}, got {actual_experts}."
+                )
+            if expected_heads is not None and actual_heads != expected_heads:
+                raise ValueError(
+                    f"Hydra runtime head mismatch: expected {expected_heads}, got {actual_heads}."
+                )
 
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):

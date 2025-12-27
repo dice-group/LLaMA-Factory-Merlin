@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
+from peft.metrics import pop_tracked_metrics
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
@@ -155,6 +156,21 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return loss, outputs
 
         return base + added
+
+    @override
+    def log(self, logs: Dict[str, float]) -> None:
+        is_train_log = any(key in logs for key in ("loss", "learning_rate")) or any(
+            key.startswith("train/") for key in logs
+        )
+        if is_train_log:
+            extra = pop_tracked_metrics()
+            if extra:
+                for key, value in extra.items():
+                    if value is None:
+                        continue
+                    scoped = key if key.startswith("train/") else f"train/{key}"
+                    logs[scoped] = value
+        super().log(logs)
 
     @override
     def prediction_step(

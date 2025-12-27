@@ -829,7 +829,7 @@ class Linear(nn.Module, HydraLoraLayer):
                         )
                         if tgt_ex >= 0:
                             ex_name = f"expert_{tgt_ex}"
-                            head_router = self.lora_route.get(ex_name)
+        head_router = self.lora_route[ex_name] if ex_name in self.lora_route else None
                             head_count = int(self.lora_num.get(ex_name, 0) or 0)
                             if head_router is not None and head_count > 1:
                                 head_logits = head_router(x.to(torch.float32)).to(x.dtype)

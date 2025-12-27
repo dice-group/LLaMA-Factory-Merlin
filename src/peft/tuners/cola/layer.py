@@ -667,8 +667,8 @@ class ColaLayer(BaseTunerLayer):
         debug(f"[COLA DEBUG] Setup: experts={self.num_experts}, top_k={self.top_k}", enabled=self.cola_debug)
         for e in range(self.num_experts):
             name = f"expert_{e}"
-            a_cnt = len(self.lora_A.get(name, []))
-            b_cnt = len(self.lora_B.get(name, []))
+            a_cnt = len(self.lora_A[name]) if name in self.lora_A else 0
+            b_cnt = len(self.lora_B[name]) if name in self.lora_B else 0
             langs: list[str] = []
             if self.language_list:
                 if self.family_list and self.language_to_family_ids is not None:
