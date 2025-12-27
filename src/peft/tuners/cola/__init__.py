@@ -16,13 +16,12 @@
 from peft.utils import register_peft_method
 
 from .config import ColaConfig
-from .layer import ColaLayer, Conv2d, Embedding, Linear
+from .layer import ColaLayer, Embedding, Linear
 from .model import ColaModel
 
 
 __all__ = [
     "ColaConfig",
-    "Conv2d",
     "Embedding",
     "ColaLayer",
     "Linear",

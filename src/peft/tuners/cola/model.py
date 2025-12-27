@@ -47,7 +47,7 @@ from peft.utils import (
 from peft.utils.merge_utils import dare_linear, dare_ties, magnitude_prune, task_arithmetic, ties
 
 from .config import ColaConfig
-from .layer import Conv2d, ColaLayer, dispatch_default
+from .layer import ColaLayer, dispatch_default
 
 
 def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
@@ -341,7 +341,7 @@ class ColaModel(BaseTuner):
             # no module could be matched
             raise ValueError(
                 f"Target module {target} is not supported. Currently, only the following modules are supported: "
-                "`torch.nn.Linear`, `torch.nn.Embedding`, `torch.nn.Conv2d`, `transformers.pytorch_utils.Conv1D`."
+                "`torch.nn.Linear`, `torch.nn.Embedding`, `transformers.pytorch_utils.Conv1D`."
             )
 
         return new_module
@@ -749,13 +749,6 @@ class ColaModel(BaseTuner):
         else:
             raise ValueError(f"Invalid value passed to combination type: {combination_type}")
 
-        conv2d = isinstance(target, Conv2d)
-        if conv2d:
-            conv2d_1x1 = target.weight.size()[2:4] == (1, 1)
-            if not conv2d_1x1:
-                delta_weight = delta_weight.flatten(start_dim=1)
-            else:
-                delta_weight = delta_weight.squeeze()
         if (hasattr(target, "fan_in_fan_out") and target.fan_in_fan_out) or is_embedding:
             delta_weight = delta_weight.T
 
@@ -771,9 +764,6 @@ class ColaModel(BaseTuner):
             low_val = -hi_val
             U = U.clamp(low_val, hi_val)
             Vh = Vh.clamp(low_val, hi_val)
-        if conv2d:
-            U = U.reshape(target_lora_B.data.shape)
-            Vh = Vh.reshape(target_lora_A.data.shape)
         return Vh, U
 
     def _generalized_task_arithmetic_weighted_adapter(

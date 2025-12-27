@@ -17,13 +17,12 @@ from peft.import_utils import is_bnb_4bit_available, is_bnb_available, is_eetq_a
 from peft.utils import register_peft_method
 
 from .config import HydraLoraConfig
-from .layer import Conv2d, Embedding, HydraLoraLayer, Linear
+from .layer import Embedding, HydraLoraLayer, Linear
 from .model import HydraLoraModel
 
 
 __all__ = [
     "HydraLoraConfig",
-    "Conv2d",
     "Embedding",
     "HydraLoraLayer",
     "Linear",

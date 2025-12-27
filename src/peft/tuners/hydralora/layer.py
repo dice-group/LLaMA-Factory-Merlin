@@ -1,16 +1,3 @@
-# Copyright 2023-present the HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from __future__ import annotations
 
 import math
@@ -25,17 +12,25 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import svd_lowrank
 from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
-from peft.utils.integrations import dequantize_module_weight, gather_params_ctx
 from peft.utils.other import transpose
-from peft.metrics import record_hydralora_metrics
+from peft.tuners.utils.language_routing import (
+    apply_language_bias,
+    append_router_target_metrics,
+    enforce_language_expert_routing,
+    enforce_language_head_weights,
+    language_expert_targets,
+    language_head_targets,
+)
 
+from .forward import forward_flat as hydra_forward_flat
+from .forward import forward_expert as hydra_forward_expert
 from .config import HydraLoraConfig
 
 import sys
+from dataclasses import dataclass, fields
 
 
 def debug(msg: str):
@@ -45,6 +40,45 @@ _GLOBAL_DEBUG_ROUTING_EVERY = int(os.environ.get("HYDRA_DEBUG_ROUTING_EVERY", "0
 
 
 LANGUAGE_PAD_ID = -1
+
+
+@dataclass
+class HydraLayerConfig:
+    use_hydralora_experts: bool = False
+    hydralora_num_experts: int = 1
+    hydralora_top_k: int = 1
+    hydralora_debug: bool = False
+    language_list: Optional[list[str]] = None
+    family_list: Optional[list[str]] = None
+    language_to_family_ids: Optional[list[int]] = None
+    language_to_subgroup_ids: Optional[list[int]] = None
+    language_router_mode: str = "learned"
+    language_bias_value: float = 0.0
+    language_head_router_mode: Optional[str] = None
+    language_head_bias_value: Optional[float] = None
+    language_column: Optional[str] = None
+    language_guidance_scope: str = "all"
+    language_prior_weight: float = 0.0
+    track_router_metrics: Optional[bool] = None
+    hydralora_expert_lora_nums: Optional[list[int]] = None
+
+    @classmethod
+    def from_kwargs(cls, kwargs: dict[str, Any]) -> tuple["HydraLayerConfig", dict[str, Any]]:
+        data = {}
+        for field in fields(cls):
+            if field.name in kwargs:
+                data[field.name] = kwargs.pop(field.name)
+        return cls(**data), kwargs
+
+    def __post_init__(self) -> None:
+        if self.language_guidance_scope not in {"all", "expert_only", "none"}:
+            raise ValueError(f"Unknown language_guidance_scope '{self.language_guidance_scope}'.")
+        if self.language_head_router_mode is None:
+            self.language_head_router_mode = self.language_router_mode
+        if self.language_head_bias_value is None:
+            self.language_head_bias_value = self.language_bias_value
+        if self.track_router_metrics is None:
+            self.track_router_metrics = self.language_prior_weight > 0
 
 
 class HydraLoraLayer(BaseTunerLayer):
@@ -77,8 +111,8 @@ class HydraLoraLayer(BaseTunerLayer):
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         setattr(self, "_active_adapters", [])
-        expert_lora_nums_override = kwargs.pop("hydralora_expert_lora_nums", None)
-        self.kwargs = kwargs
+        layer_cfg, kwargs = HydraLayerConfig.from_kwargs(kwargs)
+        expert_lora_nums_override = layer_cfg.hydralora_expert_lora_nums
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -113,24 +147,22 @@ class HydraLoraLayer(BaseTunerLayer):
         # self.Uh = None
 
         # hierarchical design addition
-        self.use_hydralora_experts = kwargs.pop("use_hydralora_experts", False)
-        self.num_experts = kwargs.pop("hydralora_num_experts", 1)
-        self.top_k = kwargs.pop("hydralora_top_k", 1)
-        self.hydralora_debug = kwargs.pop("hydralora_debug", False)
-        self.language_list = kwargs.pop("language_list", None)
-        self.family_list = kwargs.pop("family_list", None)
-        self.language_to_family_ids = kwargs.pop("language_to_family_ids", None)
-        self.language_to_subgroup_ids = kwargs.pop("language_to_subgroup_ids", None)
-        self.language_router_mode = kwargs.pop("language_router_mode", "learned")
-        self.language_bias_value = kwargs.pop("language_bias_value", 0.0)
-        self.language_head_router_mode = kwargs.pop("language_head_router_mode", None) or self.language_router_mode
-        self.language_head_bias_value = kwargs.pop("language_head_bias_value", None)
-        if self.language_head_bias_value is None:
-            self.language_head_bias_value = self.language_bias_value
-        self.language_column = kwargs.pop("language_column", None)
-        self.language_guidance_scope = kwargs.pop("language_guidance_scope", "all")
-        if self.language_guidance_scope not in {"all", "expert_only", "none"}:
-            raise ValueError(f"Unknown language_guidance_scope '{self.language_guidance_scope}'.")
+        self.use_hydralora_experts = layer_cfg.use_hydralora_experts
+        self.num_experts = layer_cfg.hydralora_num_experts
+        self.top_k = layer_cfg.hydralora_top_k
+        self.hydralora_debug = layer_cfg.hydralora_debug
+        self.language_list = layer_cfg.language_list
+        self.family_list = layer_cfg.family_list
+        self.language_to_family_ids = layer_cfg.language_to_family_ids
+        self.language_to_subgroup_ids = layer_cfg.language_to_subgroup_ids
+        self.language_router_mode = layer_cfg.language_router_mode
+        self.language_bias_value = layer_cfg.language_bias_value
+        self.language_head_router_mode = layer_cfg.language_head_router_mode
+        self.language_head_bias_value = layer_cfg.language_head_bias_value
+        self.language_prior_weight = layer_cfg.language_prior_weight
+        self.track_router_metrics = bool(layer_cfg.track_router_metrics)
+        self.language_column = layer_cfg.language_column
+        self.language_guidance_scope = layer_cfg.language_guidance_scope
         self._language_to_idx = {lang: idx for idx, lang in enumerate(self.language_list)} if self.language_list else {}
         if self.language_list:
             if self.language_to_family_ids is not None:
@@ -179,6 +211,50 @@ class HydraLoraLayer(BaseTunerLayer):
             return True
         self._debug_forward_calls += 1
         return (self._debug_forward_calls % every) == 0
+
+    def _debug_routing_sample(
+        self,
+        x: torch.Tensor,
+        language_ids: Optional[torch.Tensor],
+        expert_targets: Optional[torch.Tensor],
+        topi: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        with torch.no_grad():
+            debug(f"[HYDRA DEBUG] Router in {self.__class__.__name__}")
+            sample_b, sample_t = 0, 0
+            lang_id = int(language_ids[sample_b].item()) if language_ids is not None else LANGUAGE_PAD_ID
+            tgt_ex = (
+                int(expert_targets[sample_b].item())
+                if expert_targets is not None and torch.is_tensor(expert_targets)
+                else LANGUAGE_PAD_ID
+            )
+            sample_w = weights[sample_b, sample_t].detach().cpu().tolist()
+            sample_i = topi[sample_b, sample_t].detach().cpu().tolist()
+            debug(
+                f"[HYDRA DEBUG] Sample(b={sample_b},t={sample_t}) lang_id={lang_id} "
+                f"expert_target={tgt_ex} top_experts={sample_i}, weights={sample_w}"
+            )
+            if tgt_ex >= 0:
+                ex_name = f"expert_{tgt_ex}"
+                head_router = self.lora_route[ex_name] if ex_name in self.lora_route else None
+                head_count = int(self.lora_num.get(ex_name, 0) or 0)
+                if head_router is not None and head_count > 1:
+                    head_logits = head_router(x.to(torch.float32)).to(x.dtype)
+                    head_targets = (
+                        self._language_head_targets(language_ids, ex_name)
+                        if self.language_guidance_scope == "all"
+                        else None
+                    )
+                    head_logits = self._apply_language_bias_heads(head_logits, head_targets)
+                    head_probs = torch.softmax(head_logits.to(torch.float32), dim=-1)
+                    head_probs_tok = head_probs[sample_b, sample_t].detach().cpu()
+                    top_h = torch.topk(head_probs_tok, k=min(3, head_count), dim=-1)
+                    debug(
+                        f"[HYDRA DEBUG]   head_target="
+                        f"{int(head_targets[sample_b].item()) if head_targets is not None else LANGUAGE_PAD_ID} "
+                        f"top_heads={top_h.indices.tolist()} probs={top_h.values.tolist()}"
+                    )
 
     def _debug_print_hydra_setup(self, parent: str) -> None:
         if not getattr(self, "hydralora_debug", False):
@@ -242,7 +318,6 @@ class HydraLoraLayer(BaseTunerLayer):
                     f"(r={r}, lora_num={lora_num}, top_k={self.top_k})"
                 )
                 self._debug_print_hydra_setup(adapter_name)
-                self._verify_hydralora_expert_init()
 
             # Use the *parent* name for external API; children are stored in _hydra_parent_children
             self.set_adapter(adapter_name)
@@ -373,96 +448,6 @@ class HydraLoraLayer(BaseTunerLayer):
             else:
                 self.scaling[active_adapter] /= scale
 
-    def _check_forward_args(self, x, *args, **kwargs):
-        """Check if the arguments are compatible with the configs and state of the model"""
-        adapter_names = kwargs.get("adapter_names", None)
-        if adapter_names is None:
-            return
-
-        if len(x) != len(adapter_names):
-            msg = (
-                "Length of `adapter_names` should be the same as the number of inputs, but got "
-                f"{len(adapter_names)} and {len(x)} respectively."
-            )
-            raise ValueError(msg)
-
-        if self.merged:
-            # It is unclear what would be the right thing to do if users pass adapter_names and there are merged
-            # adapters. Therefore, it is better to raise an error in this case.
-            msg = "Cannot pass `adapter_names` when there are merged adapters, please call `unmerge_adapter` first."
-            raise ValueError(msg)
-
-    def _mixed_batch_forward(
-            self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
-    ) -> torch.Tensor:
-        # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
-        # extra argument that allows mixing different adapters in the same batch at inference time.
-        result = self.base_layer(x, *args, **kwargs)
-        torch_result_dtype = result.dtype
-
-        unique_adapters = set(adapter_names)
-        sub_batch_indices_list = []
-        for adapter in unique_adapters:
-            sub_batch_indices_list.append([index for index, item in enumerate(adapter_names) if item == adapter])
-
-        for i, active_adapter in enumerate(unique_adapters):
-            if active_adapter == "__base__":
-                continue
-            if active_adapter not in self.lora_A.keys():
-                continue
-
-            lora_A = self.lora_A[active_adapter]
-            lora_B = self.lora_B[active_adapter]
-            dropout = self.lora_dropout[active_adapter]
-            scaling = self.scaling[active_adapter]
-
-            # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
-            # layer output
-            sub_batch = x[sub_batch_indices_list[i]].to(lora_A.weight.dtype)
-            lora_output = lora_B(lora_A(dropout(sub_batch))) * scaling
-            result[sub_batch_indices_list[i]] += lora_output.to(torch_result_dtype)
-
-        return result
-
-    def _verify_hydralora_expert_init(self) -> None:
-        """Debug helper similar to CoLA's _verify_cola_expert_init, but for HydraLoRA."""
-        if not getattr(self, "hydralora_debug", False):
-            return
-
-        debug(f"[HYDRA DEBUG] Verifying HydraLoRA experts in {self.__class__.__name__} ({self.num_experts} experts)")
-        for e in range(self.num_experts):
-            name = f"expert_{e}"
-            if name not in self.lora_A:
-                debug(f"  Expert {e} not found in lora_A; skipping")
-                continue
-            A = self.lora_A[name]
-            Bs = self.lora_B[name]
-            route = self.lora_route[name]
-            scale = self.scaling[name]
-
-            with torch.no_grad():
-                a_mean = A.weight.mean().item()
-                a_std = A.weight.std().item()
-                b_mean = torch.stack([b.weight.mean() for b in Bs]).mean().item()
-                b_std = torch.stack([b.weight.std() for b in Bs]).mean().item()
-                route_mean = route.weight.mean().item()
-                route_std = route.weight.std().item()
-
-            debug(
-                f"  Expert {e}: "
-                f"A.shape={tuple(A.weight.shape)}, "
-                f"num_B={len(Bs)}, "
-                f"B[0].shape={tuple(Bs[0].weight.shape)}, "
-                f"route.shape={tuple(route.weight.shape)}, "
-                f"scale={scale:.4f}"
-            )
-        debug(
-            f"    stats: A(mean={a_mean:.4e}, std={a_std:.4e}), "
-            f"B(mean={b_mean:.4e}, std={b_std:.4e}), "
-            f"route(mean={route_mean:.4e}, std={route_std:.4e})"
-        )
-        debug("[HYDRA DEBUG] Expert verification complete\n" + "=" * 60)
-
     def _normalize_expert_counts(self, counts: Optional[list[int]]) -> Optional[list[int]]:
         if not self.use_hydralora_experts or counts is None:
             return None
@@ -478,38 +463,22 @@ class HydraLoraLayer(BaseTunerLayer):
     def _language_head_targets(
             self, language_ids: Optional[torch.Tensor], adapter_name: str
     ) -> Optional[torch.Tensor]:
-        if (language_ids is None or self.language_list is None or self.language_guidance_scope != "all"):
-            return None
-        head_count = self.lora_num.get(adapter_name)
-        if not head_count:
-            return None
-        mapping = getattr(self, "language_id_to_subgroup", None)
-        if mapping is not None and torch.is_tensor(mapping) and mapping.numel() > 0:
-            mapping = mapping.to(language_ids.device)
-            head_ids = torch.full_like(language_ids, LANGUAGE_PAD_ID)
-            valid = (language_ids >= 0) & (language_ids < mapping.numel())
-            if valid.any():
-                candidate = mapping[language_ids[valid]]
-                # Guard against malformed mappings that exceed available heads
-                candidate = torch.where(candidate < head_count, candidate, torch.full_like(candidate, LANGUAGE_PAD_ID))
-                head_ids[valid] = candidate
-            return head_ids
-        # Fallback: simple modulo by head count
-        head_ids = torch.full_like(language_ids, LANGUAGE_PAD_ID)
-        valid = (language_ids >= 0) & (language_ids < len(self.language_list))
-        if valid.any():
-            head_ids[valid] = language_ids[valid] % head_count
-        return head_ids
+        return language_head_targets(
+            language_ids,
+            self.language_list,
+            getattr(self, "language_id_to_subgroup", None),
+            self.lora_num.get(adapter_name),
+            self.language_guidance_scope,
+            pad_id=LANGUAGE_PAD_ID,
+        )
 
     def _language_expert_targets(self, language_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if (language_ids is None or self.language_id_to_expert.numel() == 0 or self.language_guidance_scope == "none"):
-            return None
-        mapping = self.language_id_to_expert.to(language_ids.device)
-        expert_ids = torch.full_like(language_ids, LANGUAGE_PAD_ID)
-        valid = (language_ids >= 0) & (language_ids < mapping.numel())
-        if valid.any():
-            expert_ids[valid] = mapping[language_ids[valid]]
-        return expert_ids
+        return language_expert_targets(
+            language_ids,
+            self.language_id_to_expert,
+            self.language_guidance_scope,
+            pad_id=LANGUAGE_PAD_ID,
+        )
 
     def _log_missing_language_targets(self, prefix: str, reason: str) -> None:
         key = f"{prefix}:{reason}"
@@ -536,114 +505,39 @@ class HydraLoraLayer(BaseTunerLayer):
         language_ids: Optional[torch.Tensor],
         expect_targets: bool,
     ) -> float:
-        if target_tensor is not None and torch.is_tensor(target_tensor):
-            valid_batch = target_tensor >= 0
-            seq_len = probs.size(1)
-            if valid_batch.any():
-                expanded_targets = target_tensor[valid_batch].view(-1, 1).expand(-1, seq_len)
-                top1 = selection[valid_batch]
-                target_hits = (top1 == expanded_targets).float()
-                target_probs = probs[valid_batch].gather(
-                    -1,
-                    target_tensor[valid_batch].view(-1, 1, 1).expand(-1, seq_len, 1),
-                ).squeeze(-1)
-                valid_tokens = target_probs.numel()
-                target_entropy = float((-torch.log(target_probs + 1e-8)).mean().item())
-                metrics.update(
-                    {
-                        f"{prefix}_target_hit_rate": float(target_hits.mean().item()),
-                        f"{prefix}_target_prob_mean": float(target_probs.mean().item()),
-                        f"{prefix}_target_neglogp": target_entropy,
-                        f"{prefix}_target_token_frac": float(
-                            valid_tokens / max(seq_len * valid_batch.sum().item(), 1)
-                        ),
-                    }
-                )
-                return float(valid_tokens if valid_tokens > 0 else metrics_weight)
-
-            metrics.update(
-                {
-                    f"{prefix}_target_hit_rate": 0.0,
-                    f"{prefix}_target_prob_mean": 0.0,
-                    f"{prefix}_target_neglogp": 0.0,
-                    f"{prefix}_target_token_frac": 0.0,
-                }
-            )
-            if expect_targets:
-                self._log_missing_language_targets(prefix, "targets were all pad ids")
-            return metrics_weight
-
-        if expect_targets:
-            metrics.update(
-                {
-                    f"{prefix}_target_hit_rate": 0.0,
-                    f"{prefix}_target_prob_mean": 0.0,
-                    f"{prefix}_target_neglogp": 0.0,
-                    f"{prefix}_target_token_frac": 0.0,
-                }
-            )
-            if language_ids is None:
-                reason = "no language_ids tensor provided"
-            elif torch.is_tensor(language_ids) and (language_ids >= 0).any():
-                reason = "language_ids could not be mapped to targets"
-            else:
-                reason = "language_ids contained only pad ids"
-            self._log_missing_language_targets(prefix, reason)
-        return metrics_weight
+        return append_router_target_metrics(
+            metrics,
+            metrics_weight,
+            prefix=prefix,
+            target_tensor=target_tensor,
+            selection=selection,
+            probs=probs,
+            language_ids=language_ids,
+            expect_targets=expect_targets,
+            on_missing=lambda reason: self._log_missing_language_targets(prefix, reason),
+        )
 
     def _apply_language_bias_heads(
             self, logits: torch.Tensor, head_ids: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        if head_ids is None or self.language_head_router_mode != "bias":
-            return logits
-        valid = head_ids >= 0
-        if not valid.any():
-            return logits
-        bias = torch.zeros(logits.size(0), logits.size(-1), device=logits.device, dtype=logits.dtype)
-        bias[valid, head_ids[valid]] = self.language_head_bias_value
-        return logits + bias.unsqueeze(1)
+        return apply_language_bias(
+            logits, head_ids, self.language_head_router_mode, self.language_head_bias_value
+        )
 
     def _enforce_language_heads(
             self, weights: torch.Tensor, head_ids: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        if head_ids is None or self.language_head_router_mode != "hard":
-            return weights
-        valid = head_ids >= 0
-        if not valid.any():
-            return weights
-        weights = weights.clone()
-        weights[valid] = 0
-        weights[valid, :, head_ids[valid]] = 1
-        return weights
+        return enforce_language_head_weights(weights, head_ids, self.language_head_router_mode)
 
     def _apply_language_bias_experts(
             self, logits: torch.Tensor, expert_ids: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        if expert_ids is None or self.language_router_mode != "bias":
-            return logits
-        valid = expert_ids >= 0
-        if not valid.any():
-            return logits
-        bias = torch.zeros(logits.size(0), logits.size(-1), device=logits.device, dtype=logits.dtype)
-        bias[valid, expert_ids[valid]] = self.language_bias_value
-        return logits + bias.unsqueeze(1)
+        return apply_language_bias(logits, expert_ids, self.language_router_mode, self.language_bias_value)
 
     def _enforce_language_experts(
             self, topi: torch.Tensor, weights: torch.Tensor, expert_ids: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if expert_ids is None or self.language_router_mode != "hard":
-            return topi, weights
-        valid = expert_ids >= 0
-        if not valid.any():
-            return topi, weights
-        seq_len = topi.size(1)
-        replacement = expert_ids[valid].view(-1, 1, 1).expand(-1, seq_len, self.top_k)
-        topi = topi.clone()
-        weights = weights.clone()
-        topi[valid] = replacement
-        weights[valid] = 0
-        weights[valid, :, 0] = 1
-        return topi, weights
+        return enforce_language_expert_routing(topi, weights, expert_ids, self.language_router_mode, self.top_k)
 
     def _cache_router_state(
             self, logits: torch.Tensor, language_ids: Optional[torch.Tensor], prefix: str,
@@ -654,16 +548,6 @@ class HydraLoraLayer(BaseTunerLayer):
             self._cache_store(f"{prefix}_router_language_ids", language_ids)
         if targets is not None and torch.is_tensor(targets):
             self._cache_store(f"{prefix}_router_targets", targets)
-
-
-# Below code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
-# and modified to work with PyTorch FSDP
-
-
-#  ------------------------------------------------------------------------------------------
-#  Copyright (c) Microsoft Corporation. All rights reserved.
-#  Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
-#  ------------------------------------------------------------------------------------------
 
 
 class Linear(nn.Module, HydraLoraLayer):
@@ -697,8 +581,6 @@ class Linear(nn.Module, HydraLoraLayer):
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-        self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
         language_ids = kwargs.pop("language_ids", None)
         if isinstance(language_ids, torch.Tensor):
             language_ids = language_ids.to(x.device).long()
@@ -709,205 +591,12 @@ class Linear(nn.Module, HydraLoraLayer):
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
-            result = self.base_layer(x, *args, **kwargs)
-        elif adapter_names is not None:
-            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
-        elif self.merged:
-            result = self.base_layer(x, *args, **kwargs)
-        else:
-            result = self.base_layer(x, *args, **kwargs)
-            torch_result_dtype = result.dtype
-
-            if not getattr(self, "use_hydralora_experts", False):
-                for active_adapter in self._active_adapters:
-                    if active_adapter not in self.lora_A.keys():
-                        continue
-                    lora_A = self.lora_A[active_adapter]
-                    lora_B = self.lora_B[active_adapter]
-                    lora_route = self.lora_route[active_adapter]
-
-                    dropout = self.lora_dropout[active_adapter]
-                    scaling = self.scaling[active_adapter]
-
-                    x = x.to(lora_A.weight.dtype)
-                    route_logits = lora_route(x.to(torch.float32)).to(result.dtype)
-                    use_head_guidance = self.language_guidance_scope == "all"
-                    head_targets = (self._language_head_targets(language_ids, active_adapter) if use_head_guidance else None)
-                    if use_head_guidance:
-                        self._cache_router_state(route_logits, language_ids, f"hydra_head_{active_adapter}", head_targets)
-                    route_logits = self._apply_language_bias_heads(route_logits, head_targets)
-                    route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(result.dtype)
-                    route_weight = self._enforce_language_heads(route_weight, head_targets)
-                    head_assign = torch.argmax(route_weight, dim=-1, keepdim=True)
-                    with torch.no_grad():
-                        token_count = route_weight.numel() // route_weight.size(-1)
-                        if token_count > 0:
-                            flat_assign = head_assign.reshape(-1)
-                            head_counts = torch.bincount(
-                                flat_assign,
-                                minlength=self.lora_num[active_adapter],
-                            ).to(torch.float32)
-                            mean_head = head_counts.mean().item()
-                            if mean_head > 0:
-                                head_cv = float(
-                                    (head_counts.std(unbiased=False) / (mean_head + 1e-6)).item()
-                                )
-                            else:
-                                head_cv = 0.0
-                            head_active = float((head_counts > 0).float().mean().item())
-                            head_entropy = float(
-                                (-route_weight * torch.log(route_weight + 1e-8)).sum(dim=-1).mean().item()
-                            )
-                            total_head_assign = head_counts.sum()
-                            if total_head_assign > 0:
-                                head_frac = head_counts / total_head_assign
-                                head_max = float(head_frac.max().item())
-                                head_min = float(head_frac.min().item())
-                            else:
-                                head_max = 0.0
-                                head_min = 0.0
-                            metrics = {
-                                "head_load_cv": head_cv,
-                                "head_active_frac": head_active,
-                                "head_router_entropy": head_entropy,
-                                "head_load_max_frac": head_max,
-                                "head_load_min_frac": head_min,
-                            }
-                            metrics_weight = float(token_count)
-                            metrics_weight = self._append_target_metrics(
-                                metrics=metrics,
-                                metrics_weight=metrics_weight,
-                                prefix="head",
-                                target_tensor=head_targets,
-                                selection=head_assign.squeeze(-1),
-                                probs=route_weight,
-                                language_ids=language_ids,
-                                expect_targets=use_head_guidance and self.language_list is not None,
-                            )
-                            record_hydralora_metrics(metrics, weight=metrics_weight)
-
-                    for i in range(self.lora_num[active_adapter]):
-                        result = result + torch.unsqueeze(route_weight[:, :, i], -1) * lora_B[i](
-                            (lora_A(dropout(x)))) * scaling
-
-                result = result.to(torch_result_dtype)
-            else:
-                router_dtype = getattr(self.router.weight, "dtype", torch.float32)
-                logits = self.router(x.to(router_dtype)).to(x.dtype)
-                
-                use_expert_guidance = self.language_guidance_scope in {"all", "expert_only"}
-                expert_targets = (self._language_expert_targets(language_ids) if use_expert_guidance else None)
-                if use_expert_guidance:
-                    self._cache_router_state(logits, language_ids, "hydra_expert", expert_targets)
-                logits = self._apply_language_bias_experts(logits, expert_targets)
-                
-                topv, topi = torch.topk(logits, self.top_k, dim=-1)
-                weights = torch.softmax(topv.to(torch.float32), dim=-1).to(x.dtype)
-                topi, weights = self._enforce_language_experts(topi, weights, expert_targets)
-
-                if self._should_debug_routing():
-                    with torch.no_grad():
-                        debug(
-                            f"[HYDRA DEBUG] Router in {self.__class__.__name__}: "
-                            f"logits_mean={logits.mean().item():.4e}, "
-                            f"logits_std={logits.std().item():.4e}"
-                        )
-                        sample_b, sample_t = 0, 0
-                        lang_id = int(language_ids[sample_b].item()) if language_ids is not None else LANGUAGE_PAD_ID
-                        tgt_ex = (
-                            int(expert_targets[sample_b].item())
-                            if expert_targets is not None and torch.is_tensor(expert_targets)
-                            else LANGUAGE_PAD_ID
-                        )
-                        sample_w = weights[sample_b, sample_t].detach().cpu().tolist()
-                        sample_i = topi[sample_b, sample_t].detach().cpu().tolist()
-                        debug(
-                            f"[HYDRA DEBUG] Sample(b={sample_b},t={sample_t}) lang_id={lang_id} "
-                            f"expert_target={tgt_ex} top_experts={sample_i}, weights={sample_w}"
-                        )
-                        if tgt_ex >= 0:
-                            ex_name = f"expert_{tgt_ex}"
-                            head_router = self.lora_route[ex_name] if ex_name in self.lora_route else None
-                            head_count = int(self.lora_num.get(ex_name, 0) or 0)
-                            if head_router is not None and head_count > 1:
-                                head_logits = head_router(x.to(torch.float32)).to(x.dtype)
-                                head_targets = (
-                                    self._language_head_targets(language_ids, ex_name)
-                                    if self.language_guidance_scope == "all"
-                                    else None
-                                )
-                                head_logits = self._apply_language_bias_heads(head_logits, head_targets)
-                                head_probs = torch.softmax(head_logits.to(torch.float32), dim=-1)
-                                head_probs_tok = head_probs[sample_b, sample_t].detach().cpu()
-                                top_h = torch.topk(head_probs_tok, k=min(3, head_count), dim=-1)
-                                debug(
-                                    f"[HYDRA DEBUG]   head_target="
-                                    f"{int(head_targets[sample_b].item()) if head_targets is not None else LANGUAGE_PAD_ID} "
-                                    f"top_heads={top_h.indices.tolist()} probs={top_h.values.tolist()}"
-                                )
-
-                with torch.no_grad():
-                    token_count = topi.numel()
-                    if token_count > 0:
-                        flat_indices = topi.reshape(-1)
-                        counts = torch.bincount(flat_indices, minlength=self.num_experts).to(torch.float32)
-                        active_frac = float((counts > 0).float().mean().item())
-                        mean_load = counts.mean().item()
-                        if mean_load > 0:
-                            load_cv = float((counts.std(unbiased=False) / (mean_load + 1e-6)).item())
-                        else:
-                            load_cv = 0.0
-                        router_probs = torch.softmax(logits.to(torch.float32), dim=-1)
-                        entropy = float((-router_probs * torch.log(router_probs + 1e-8)).sum(dim=-1).mean().item())
-                        weight_mean = float(weights.mean().item())
-                        metrics = {
-                            "expert_load_cv": load_cv,
-                            "expert_active_frac": active_frac,
-                            "expert_router_entropy": entropy,
-                            "expert_topk_weight_mean": weight_mean,
-                        }
-                        total_assign = counts.sum()
-                        if total_assign > 0:
-                            frac = counts / total_assign
-                            metrics["expert_load_max_frac"] = float(frac.max().item())
-                            metrics["expert_load_min_frac"] = float(frac.min().item())
-                        else:
-                            metrics["expert_load_max_frac"] = 0.0
-                            metrics["expert_load_min_frac"] = 0.0
-                        metrics_weight = float(token_count)
-                        metrics_weight = self._append_target_metrics(
-                            metrics=metrics,
-                            metrics_weight=metrics_weight,
-                            prefix="expert",
-                            target_tensor=expert_targets,
-                            selection=topi[:, :, 0],
-                            probs=router_probs,
-                            language_ids=language_ids,
-                            expect_targets=use_expert_guidance and self.language_list is not None,
-                        )
-                        record_hydralora_metrics(metrics, weight=metrics_weight)
-
-                # Memory-friendly mixing: avoid materializing [B, S, D_out, E] for all experts.
-                # We compute each expert delta once and only keep the final mixed output.
-                moe_out = torch.zeros_like(result, dtype=result.dtype)
-                for e in range(self.num_experts):
-                    expert_delta = self._adapter_delta(
-                        x,
-                        f"expert_{e}",
-                        language_ids=language_ids,
-                        expert_id=e,
-                        expert_targets=expert_targets,
-                    ).to(moe_out.dtype)
-                    for k in range(self.top_k):
-                        mask = topi[:, :, k].eq(e)
-                        if not mask.any():
-                            continue
-                        moe_out = moe_out + expert_delta * (weights[:, :, k] * mask.to(weights.dtype)).unsqueeze(-1)
-
-                result = result + moe_out
-                result = result.to(torch_result_dtype)
-
-        return result
+            return self.base_layer(x, *args, **kwargs)
+        if self.merged:
+            return self.base_layer(x, *args, **kwargs)
+        if getattr(self, "use_hydralora_experts", False):
+            return hydra_forward_expert(self, x, *args, language_ids=language_ids, **kwargs)
+        return hydra_forward_flat(self, x, *args, language_ids=language_ids, **kwargs)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -1216,36 +905,6 @@ class Embedding(nn.Module, HydraLoraLayer):
 
         return output_tensor
 
-    def _mixed_batch_forward(
-            self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
-    ) -> torch.Tensor:
-        # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
-        # extra argument that allows mixing different adapters in the same batch at inference time.
-        result = self.base_layer(x, *args, **kwargs)
-
-        unique_adapters = set(adapter_names)
-        sub_batch_indices_list = []
-        for adapter in unique_adapters:
-            sub_batch_indices_list.append([index for index, item in enumerate(adapter_names) if item == adapter])
-
-        for i, active_adapter in enumerate(unique_adapters):
-            if active_adapter == "__base__":
-                continue
-            if active_adapter not in self.lora_embedding_A.keys():
-                continue
-
-            embedding_A = self.lora_embedding_A[active_adapter].T
-            embedding_B = self.lora_embedding_B[active_adapter].T
-            scaling = self.scaling[active_adapter]
-
-            # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
-            # layer output
-            sub_batch = x[sub_batch_indices_list[i]]
-            after_A = self._embed(sub_batch, embedding_A)
-            result[sub_batch_indices_list[i]] += (after_A @ embedding_B) * scaling
-
-        return result
-
     def _embed(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         base_layer = self.get_base_layer()
         return F.embedding(
@@ -1260,16 +919,12 @@ class Embedding(nn.Module, HydraLoraLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         # TODO: no dtype conversion here, unlike in Linear, is that correct?
-        self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
         kwargs.pop("language_ids", None)
 
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
             result = self.base_layer(x, *args, **kwargs)
-        elif adapter_names is not None:
-            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
@@ -1300,36 +955,7 @@ def dispatch_default(
         lora_config: HydraLoraConfig,
         **kwargs,
 ) -> Optional[torch.nn.Module]:
-    """
-    target: Linear(in_features=3072, out_features=3072, bias=False)
-    adapter_name: default
-    lora_config: HydraLoraConfig(peft_type=<PeftType.HYDRALORA: 'HYDRALORA'>,
-      auto_mapping=None, 
-      base_model_name_or_path='/data/develop/smallz/Llama-3.2-3B', 
-      revision=None, 
-      task_type=<TaskType.CAUSAL_LM: 'CAUSAL_LM'>, 
-      inference_mode=False, 
-      r=8, 
-      target_modules={'v_proj', 'o_proj', 'gate_proj', 'q_proj', 'down_proj', 'k_proj', 'up_proj'}, 
-      lora_alpha=16, 
-      lora_dropout=0.0, 
-      fan_in_fan_out=False, 
-      bias='none', 
-      use_rslora=False, 
-      modules_to_save=None, 
-      init_lora_weights=True, 
-      layers_to_transform=None, 
-      layers_pattern=None, 
-      rank_pattern={}, 
-      alpha_pattern={}, 
-      megatron_config=None, 
-      megatron_core='megatron.core', 
-      loftq_config={}, 
-      use_dora=False, 
-      layer_replication=None, 
-      runtime_config=LoraRuntimeConfig(ephemeral_gpu_offload=False))
-    kwargs: {'r': 8, 'lora_alpha': 16, 'lora_dropout': 0.0, 'fan_in_fan_out': False, 'init_lora_weights': True, 'use_rslora': False, 'use_dora': False, 'ephemeral_gpu_offload': False, 'loaded_in_8bit': False, 'loaded_in_4bit': False}
-    """
+    """Create a HydraLoRA adapter module for supported layer types."""
     new_module = None
     if isinstance(target, BaseTunerLayer):
         target_base_layer = target.get_base_layer()

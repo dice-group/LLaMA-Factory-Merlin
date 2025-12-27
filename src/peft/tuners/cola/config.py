@@ -118,8 +118,7 @@ class ColaConfig(PeftConfig):
         metadata={
             "help": (
                 "Collaboration strategy between A/B matrices. "
-                "'fully' corresponds to CoLA⊺, 'random' approximates CoLA† (random A-B pairing), "
-                "and 'heuristic' follows CoLA‡ (mix of one-to-one plus shared A)."
+                "Use 'fully' for CoLA⊺ (full A/B collaboration)."
             )
         },
     )
@@ -197,6 +196,15 @@ class ColaConfig(PeftConfig):
             "help": (
                 "Optional override for the additive logit bias applied at the CoLA head/B weighting stage when "
                 "`language_head_router_mode='bias'`. If unset, falls back to `language_bias_value`."
+            )
+        },
+    )
+    track_router_metrics: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to record router load/entropy/target metrics. Defaults to true when "
+                "`language_prior_weight > 0`, otherwise disabled for faster base training."
             )
         },
     )

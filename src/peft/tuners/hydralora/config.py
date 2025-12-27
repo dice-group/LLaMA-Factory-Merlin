@@ -194,6 +194,15 @@ class HydraLoraConfig(PeftConfig):
             )
         },
     )
+    track_router_metrics: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to record router load/entropy/target metrics. Defaults to true when "
+                "`language_prior_weight > 0`, otherwise disabled for faster base training."
+            )
+        },
+    )
     language_guidance_scope: Literal["all", "expert_only", "none"] = field(
         default="all",
         metadata={
