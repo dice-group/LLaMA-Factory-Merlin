@@ -1,6 +1,7 @@
 from typing import Any, Optional
 import torch
 from peft.metrics import record_hydralora_metrics
+from ..utils.language_routing import LANGUAGE_PAD_ID
 
 
 def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
@@ -144,20 +145,90 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                 )
                 record_hydralora_metrics(metrics, weight=metrics_weight)
 
-    moe_out = torch.zeros_like(result, dtype=result.dtype)
-    for e in range(layer.num_experts):
-        expert_delta = layer._adapter_delta(
-            x,
-            f"expert_{e}",
-            language_ids=language_ids,
-            expert_id=e,
-            expert_targets=expert_targets,
-        ).to(moe_out.dtype)
-        for k in range(layer.top_k):
-            mask = topi[:, :, k].eq(e)
+    use_sparse = layer.top_k < layer.num_experts
+    if use_sparse:
+        batch, seq_len, _ = x.size()
+        x_flat = x.reshape(-1, x.size(-1))
+        topi_flat = topi.reshape(-1, topi.size(-1))
+        weights_flat = weights.reshape(-1, weights.size(-1))
+
+        moe_out_flat = torch.zeros(
+            (x_flat.size(0), result.size(-1)),
+            device=result.device,
+            dtype=result.dtype,
+        )
+
+        for e in range(layer.num_experts):
+            name = f"expert_{e}"
+            B_list = layer.lora_B[name]
+            if not B_list:
+                continue
+
+            route_weight_flat = None
+            lora_route = layer.lora_route[name] if name in layer.lora_route else None
+            use_head_router = lora_route is not None and len(B_list) > 1
+            if use_head_router:
+                route_logits = lora_route(x.to(torch.float32)).to(x.dtype)
+                head_targets: Optional[torch.Tensor] = None
+                use_head_guidance = layer.language_guidance_scope == "all"
+                if use_head_guidance and language_ids is not None:
+                    head_targets = layer._language_head_targets(language_ids, name)
+                    if (
+                        head_targets is not None
+                        and expert_targets is not None
+                        and torch.is_tensor(expert_targets)
+                    ):
+                        mismatch = expert_targets != int(e)
+                        if mismatch.any():
+                            head_targets = head_targets.clone()
+                            head_targets[mismatch] = LANGUAGE_PAD_ID
+                    layer._cache_router_state(route_logits, language_ids, f"hydra_head_{name}", head_targets)
+                route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
+                route_weight = torch.softmax(route_logits, dim=-1, dtype=torch.float32).to(x.dtype)
+                route_weight = layer._enforce_language_heads(route_weight, head_targets)
+                route_weight_flat = route_weight.view(-1, route_weight.size(-1))
+
+            mask = topi_flat == e
             if not mask.any():
                 continue
-            moe_out = moe_out + expert_delta * (weights[:, :, k] * mask.to(weights.dtype)).unsqueeze(-1)
+            token_idx, kth = torch.where(mask)
+            x_sel = x_flat[token_idx]
+
+            A = layer.lora_A[name]
+            drop = layer.lora_dropout[name]
+            scale = layer.scaling[name]
+            a_dot_x = A(drop(x_sel.to(A.weight.dtype)))
+
+            if route_weight_flat is None or len(B_list) == 1:
+                out = sum(B(a_dot_x) for B in B_list)
+            else:
+                route_sel = route_weight_flat[token_idx].to(a_dot_x.dtype)
+                out = 0
+                for i, B in enumerate(B_list):
+                    out = out + B(a_dot_x) * route_sel[:, i].unsqueeze(-1)
+
+            out = out * scale
+            target_dtype = moe_out_flat.dtype
+            out = out.to(target_dtype)
+            weight_sel = weights_flat[token_idx, kth].to(target_dtype).unsqueeze(-1)
+            moe_out_flat.index_add_(0, token_idx, out * weight_sel)
+
+        moe_out = moe_out_flat.view(batch, seq_len, -1)
+    else:
+        moe_out = torch.zeros_like(result, dtype=result.dtype)
+        for e in range(layer.num_experts):
+            expert_delta = layer._adapter_delta(
+                x,
+                f"expert_{e}",
+                language_ids=language_ids,
+                expert_id=e,
+                expert_targets=expert_targets,
+            ).to(moe_out.dtype)
+            for k in range(layer.top_k):
+                mask = topi[:, :, k].eq(e)
+                if not mask.any():
+                    continue
+                moe_out = moe_out + expert_delta * (weights[:, :, k] * mask.to(weights.dtype)).unsqueeze(-1)
 
     result = result + moe_out
     return result.to(torch_result_dtype)

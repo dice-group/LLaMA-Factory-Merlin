@@ -76,22 +76,67 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                 )
                 record_cola_metrics(metrics, weight=metrics_weight)
 
-    expert_outs = [
-        layer._adapter_delta(
-            x,
-            f"expert_{e}",
-            language_ids=language_ids,
-            expert_id=e,
-            expert_targets=language_targets,
-        )
-        for e in range(layer.num_experts)
-    ]
-    expert_outs = torch.stack(expert_outs, dim=-1)  # [B, S, D_out, E]
+    use_sparse = layer.top_k < layer.num_experts
+    if use_sparse:
+        batch, seq_len, _ = x.size()
+        x_flat = x.reshape(-1, x.size(-1))
+        topi_flat = topi.reshape(-1, topi.size(-1))
+        weights_flat = weights.reshape(-1, weights.size(-1))
 
-    topi_expanded = topi.unsqueeze(2).expand(-1, -1, expert_outs.size(2), -1)
-    gathered = torch.gather(expert_outs, dim=3, index=topi_expanded)
-    weights_expanded = weights.unsqueeze(2)
-    moe_out = (gathered * weights_expanded).sum(dim=-1)
+        language_ids_flat = None
+        expert_targets_flat = None
+        if language_ids is not None and torch.is_tensor(language_ids):
+            if language_ids.dim() == 1:
+                language_ids_flat = language_ids.view(-1, 1).expand(-1, seq_len).reshape(-1)
+            else:
+                language_ids_flat = language_ids.reshape(-1)
+        if language_targets is not None and torch.is_tensor(language_targets):
+            if language_targets.dim() == 1:
+                expert_targets_flat = language_targets.view(-1, 1).expand(-1, seq_len).reshape(-1)
+            else:
+                expert_targets_flat = language_targets.reshape(-1)
+
+        moe_out_flat = torch.zeros(
+            (x_flat.size(0), result.size(-1)),
+            device=result.device,
+            dtype=result.dtype,
+        )
+        for e in range(layer.num_experts):
+            mask = topi_flat == e
+            if not mask.any():
+                continue
+            token_idx, kth = torch.where(mask)
+            x_sel = x_flat[token_idx]
+            lang_sel = language_ids_flat[token_idx] if language_ids_flat is not None else None
+            tgt_sel = expert_targets_flat[token_idx] if expert_targets_flat is not None else None
+            expert_delta = layer._adapter_delta(
+                x_sel,
+                f"expert_{e}",
+                language_ids=lang_sel,
+                expert_id=e,
+                expert_targets=tgt_sel,
+            ).to(result.dtype)
+            weight_sel = weights_flat[token_idx, kth].to(expert_delta.dtype).unsqueeze(-1)
+            moe_out_flat.index_add_(0, token_idx, expert_delta * weight_sel)
+
+        moe_out = moe_out_flat.view(batch, seq_len, -1)
+    else:
+        expert_outs = [
+            layer._adapter_delta(
+                x,
+                f"expert_{e}",
+                language_ids=language_ids,
+                expert_id=e,
+                expert_targets=language_targets,
+            )
+            for e in range(layer.num_experts)
+        ]
+        expert_outs = torch.stack(expert_outs, dim=-1)  # [B, S, D_out, E]
+
+        topi_expanded = topi.unsqueeze(2).expand(-1, -1, expert_outs.size(2), -1)
+        gathered = torch.gather(expert_outs, dim=3, index=topi_expanded)
+        weights_expanded = weights.unsqueeze(2)
+        moe_out = (gathered * weights_expanded).sum(dim=-1)
 
     result = result + moe_out
     return result.to(torch_result_dtype)

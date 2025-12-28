@@ -947,13 +947,20 @@ class Linear(nn.Module, ColaLayer):
         expert_id: Optional[int] = None,
         expert_targets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        squeeze_seq = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze_seq = True
         A_list = self.lora_A[name]
         B_list = self.lora_B[name]
         drop = self.lora_dropout[name]
         scale = self.scaling[name]
 
         if not A_list or not B_list:
-            return torch.zeros_like(x, dtype=self.get_base_layer().weight.dtype)
+            out = torch.zeros_like(x, dtype=self.get_base_layer().weight.dtype)
+            if squeeze_seq:
+                out = out.squeeze(1)
+            return out
 
         intermediate = drop(x.to(A_list[0].weight.dtype))
         a_outputs = [A(intermediate) for A in A_list]
@@ -984,7 +991,10 @@ class Linear(nn.Module, ColaLayer):
                     b_sum = b_sum + b_layer(a_out)
                 out = out + b_sum * head_weights[:, :, b_idx].to(b_sum.dtype).unsqueeze(-1)
 
-        return out * scale
+        out = out * scale
+        if squeeze_seq:
+            out = out.squeeze(1)
+        return out
 
     def __repr__(self) -> str:
         rep = super().__repr__()
