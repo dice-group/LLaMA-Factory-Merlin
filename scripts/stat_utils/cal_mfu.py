@@ -128,6 +128,7 @@ def calculate_mfu(
         "output_dir": os.path.join("saves", "test_mfu"),
         "logging_strategy": "no",
         "save_strategy": "no",
+        "save_safetensors": False,
         "save_only_model": True,
         "overwrite_output_dir": True,
         "per_device_train_batch_size": batch_size,

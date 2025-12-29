@@ -13,7 +13,7 @@ pip install -r requirements.txt \
 
 3) insatlll flash attention seperately
 ```
-pip install flash-attn --no-build-isolation
+pip install flash-attn --no-build-isolation --no-cache-dir
 ```
 
 4) Install the project in editable mode without deps:
