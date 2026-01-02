@@ -36,6 +36,13 @@ python -m llamafactory.launcher --help
 ## Eval environment
 I decided to create a separate lm eval conda environemnt to prevent confliclts, since i didnt wanted to chagne transformer version in main conda environment after everything was implemented to prevent unexpected behaviour.
 Thereofre use environment_eval.yml and install it. You may have to manually install the pip depdendecies like this for the cluster 
+
+on cluster i had issues and finally installed like this:
+```
+conda create -n lm_eval -c pytorch -c nvidia -c conda-forge   python=3.11 pytorch=2.6 omegaconf pip
+```
+and then
+
 ```
 pip install \
   --index-url https://pypi.org/simple \
@@ -46,4 +53,17 @@ pip install \
   accelerate \
   safetensors \
   wandb
+```
+
+check with 
+```
+python <<'PY'
+import torch
+import transformers
+import lm_eval
+
+print("torch", torch.__version__)
+print("transformers", transformers.__version__)
+print("lm_eval", lm_eval.__version__)
+PY
 ```
