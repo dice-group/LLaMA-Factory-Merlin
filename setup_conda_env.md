@@ -44,5 +44,6 @@ pip install \
   lm-eval \
   datasets \
   accelerate \
-  safetensors
+  safetensors \
+  wandb
 ```
