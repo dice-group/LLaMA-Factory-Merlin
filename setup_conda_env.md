@@ -31,3 +31,18 @@ python -c "import torch, transformers, peft"
 python -c "import llamafactory"
 python -m llamafactory.launcher --help
 ```
+
+
+## Eval environment
+I decided to create a separate lm eval conda environemnt to prevent confliclts, since i didnt wanted to chagne transformer version in main conda environment after everything was implemented to prevent unexpected behaviour.
+Thereofre use environment_eval.yml and install it. You may have to manually install the pip depdendecies like this for the cluster 
+```
+pip install \
+  --index-url https://pypi.org/simple \
+  --no-cache-dir \
+  transformers>=4.57.3 \
+  lm-eval \
+  datasets \
+  accelerate \
+  safetensors
+```
