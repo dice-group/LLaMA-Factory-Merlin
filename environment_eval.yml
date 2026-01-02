@@ -1,0 +1,20 @@
+name: lm_eval
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - omegaconf
+  - pytorch=2.6.*
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - cuda-toolkit=12.1
+  - pip
+  - pip:
+      - lm-eval
+      - transformers>=4.57.3
+      - datasets
+      - accelerate
+      - safetensors
