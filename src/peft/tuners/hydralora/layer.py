@@ -47,6 +47,7 @@ class HydraLayerConfig:
     use_hydralora_experts: bool = False
     hydralora_num_experts: int = 1
     hydralora_top_k: int = 1
+    hydralora_head_top_k: Optional[int] = None
     hydralora_debug: bool = False
     language_list: Optional[list[str]] = None
     family_list: Optional[list[str]] = None
@@ -77,6 +78,8 @@ class HydraLayerConfig:
             self.language_head_router_mode = self.language_router_mode
         if self.language_head_bias_value is None:
             self.language_head_bias_value = self.language_bias_value
+        if self.hydralora_head_top_k is not None and self.hydralora_head_top_k <= 0:
+            self.hydralora_head_top_k = None
         if self.track_router_metrics is None:
             self.track_router_metrics = self.language_prior_weight > 0
 
@@ -150,6 +153,7 @@ class HydraLoraLayer(BaseTunerLayer):
         self.use_hydralora_experts = layer_cfg.use_hydralora_experts
         self.num_experts = layer_cfg.hydralora_num_experts
         self.top_k = layer_cfg.hydralora_top_k
+        self.head_top_k = layer_cfg.hydralora_head_top_k
         self.hydralora_debug = layer_cfg.hydralora_debug
         self.language_list = layer_cfg.language_list
         self.family_list = layer_cfg.family_list
@@ -247,7 +251,7 @@ class HydraLoraLayer(BaseTunerLayer):
                         else None
                     )
                     head_logits = self._apply_language_bias_heads(head_logits, head_targets)
-                    head_probs = torch.softmax(head_logits.to(torch.float32), dim=-1)
+                    head_probs = self._head_router_weights(head_logits)
                     head_probs_tok = head_probs[sample_b, sample_t].detach().cpu()
                     top_h = torch.topk(head_probs_tok, k=min(3, head_count), dim=-1)
                     debug(
@@ -529,6 +533,17 @@ class HydraLoraLayer(BaseTunerLayer):
     ) -> torch.Tensor:
         return enforce_language_head_weights(weights, head_ids, self.language_head_router_mode)
 
+    def _head_router_weights(self, logits: torch.Tensor) -> torch.Tensor:
+        head_count = logits.size(-1)
+        head_top_k = self.head_top_k
+        if head_top_k is None or head_top_k <= 0 or head_top_k >= head_count:
+            return torch.softmax(logits, dim=-1, dtype=torch.float32).to(logits.dtype)
+        topv, topi = torch.topk(logits, head_top_k, dim=-1)
+        weights = torch.softmax(topv.to(torch.float32), dim=-1).to(logits.dtype)
+        sparse = torch.zeros_like(logits)
+        sparse.scatter_(-1, topi, weights)
+        return sparse
+
     def _apply_language_bias_experts(
             self, logits: torch.Tensor, expert_ids: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -739,7 +754,7 @@ class Linear(nn.Module, HydraLoraLayer):
             self._cache_router_state(route_logits, language_ids, f"hydra_head_{name}", head_targets)
 
         route_logits = self._apply_language_bias_heads(route_logits, head_targets)
-        route_weight = nn.functional.softmax(route_logits, dim=-1, dtype=torch.float32).to(x.dtype)  # [B, S, H]
+        route_weight = self._head_router_weights(route_logits)  # [B, S, H]
         route_weight = self._enforce_language_heads(route_weight, head_targets)
 
         out = 0

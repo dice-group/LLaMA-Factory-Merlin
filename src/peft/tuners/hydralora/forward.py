@@ -25,7 +25,7 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
         if use_head_guidance:
             layer._cache_router_state(route_logits, language_ids, f"hydra_head_{active_adapter}", head_targets)
         route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
-        route_weight = torch.softmax(route_logits, dim=-1, dtype=torch.float32).to(result.dtype)
+        route_weight = layer._head_router_weights(route_logits)
         route_weight = layer._enforce_language_heads(route_weight, head_targets)
         head_assign = torch.argmax(route_weight, dim=-1, keepdim=True)
 
@@ -184,7 +184,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                             head_targets[mismatch] = LANGUAGE_PAD_ID
                     layer._cache_router_state(route_logits, language_ids, f"hydra_head_{name}", head_targets)
                 route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
-                route_weight = torch.softmax(route_logits, dim=-1, dtype=torch.float32).to(x.dtype)
+                route_weight = layer._head_router_weights(route_logits)
                 route_weight = layer._enforce_language_heads(route_weight, head_targets)
                 route_weight_flat = route_weight.view(-1, route_weight.size(-1))
 

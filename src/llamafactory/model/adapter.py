@@ -701,6 +701,7 @@ def _setup_hydralora_tuning(
             "use_hydralora_experts": finetuning_args.use_hydralora_experts,
             "num_experts": finetuning_args.hydralora_num_experts,
             "top_k": finetuning_args.hydralora_top_k,
+            "head_top_k": finetuning_args.hydralora_head_top_k,
             "hydralora_debug": finetuning_args.hydralora_debug,
             "modules_to_save": finetuning_args.additional_target,
         }
@@ -766,13 +767,14 @@ def _setup_hydralora_tuning(
                     count = int(sample_layer.lora_num.get(key, 0) or 0)
                 actual_heads.append(count)
             logger.info_rank0(
-                "[HYDRA SETUP] experts=%s heads_per_expert=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s",
+                "[HYDRA SETUP] experts=%s heads_per_expert=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
                 actual_experts,
                 actual_heads,
                 finetuning_args.language_router_mode,
                 finetuning_args.language_head_router_mode,
                 finetuning_args.language_guidance_scope,
                 finetuning_args.hydralora_top_k,
+                finetuning_args.hydralora_head_top_k,
             )
             if expected_experts is not None and actual_experts != expected_experts:
                 raise ValueError(

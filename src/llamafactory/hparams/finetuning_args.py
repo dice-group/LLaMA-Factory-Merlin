@@ -581,6 +581,10 @@ class FinetuningArguments(
         default=1,
         metadata={"help": "Top-k experts to select per token when mixture-of-experts is enabled."},
     )
+    hydralora_head_top_k: Optional[int] = field(
+        default=None,
+        metadata={"help": "Top-k heads to select per expert in HydraLoRA (None or <=0 keeps dense mixing)."},
+    )
     hydralora_debug: bool = field(default=False, metadata={"help": "Enable verbose HydraLoRA debugging output."})
     hydralora_expert_lora_nums: Optional[str] = field(
         default=None,

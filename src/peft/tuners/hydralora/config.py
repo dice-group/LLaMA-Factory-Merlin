@@ -121,6 +121,15 @@ class HydraLoraConfig(PeftConfig):
         default=2,
         metadata={"help": "Number of experts selected per token (top-k router gating)."},
     )
+    head_top_k: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional top-k heads selected per expert during HydraLoRA head routing. "
+                "Use None or <=0 to keep dense mixing over all heads."
+            )
+        },
+    )
     hydralora_debug: bool = field(
         default=False,
         metadata={"help": "Enable additional HydraLoRA MoE debug diagnostics."},
