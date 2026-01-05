@@ -27,7 +27,7 @@ from ..extras.misc import infer_optim_dtype
 from ..extras.packages import is_mcore_adapter_available, is_ray_available
 from ..hparams import get_infer_args, get_ray_args, get_train_args, read_args
 from ..model import load_model, load_tokenizer
-from .callbacks import LogCallback, PissaConvertCallback, ReporterCallback
+from .callbacks import LogCallback, PissaConvertCallback, ReporterCallback, SaveAdapterCheckpointCallback
 from .dpo import run_dpo
 from .kto import run_kto
 from .ppo import run_ppo
@@ -57,6 +57,9 @@ def _training_function(config: dict[str, Any]) -> None:
     callbacks.append(LogCallback())
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())
+
+    if finetuning_args.finetuning_type in ["lora", "adalora", "pissa", "hydralora", "cola"]:
+        callbacks.append(SaveAdapterCheckpointCallback())
 
     if finetuning_args.use_swanlab:
         callbacks.append(get_swanlab_callback(finetuning_args))

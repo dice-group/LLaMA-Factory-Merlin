@@ -28,6 +28,8 @@ from transformers import PreTrainedModel, ProcessorMixin, TrainerCallback
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, has_length
 from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
 from typing_extensions import override
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
 from ..extras import logging
 from ..extras.constants import TRAINER_LOG, V_HEAD_SAFE_WEIGHTS_NAME, V_HEAD_WEIGHTS_NAME
@@ -123,6 +125,53 @@ class SaveProcessorCallback(TrainerCallback):
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         if args.should_save:
             self.processor.save_pretrained(args.output_dir)
+
+
+class SaveAdapterCheckpointCallback(TrainerCallback):
+    r"""A callback for saving PEFT adapters alongside FSDP checkpoints."""
+
+    def __init__(self, suffix: str = "_adapter") -> None:
+        self.suffix = suffix
+
+    def _save_adapter(self, model: torch.nn.Module, output_dir: str, safe_serialization: bool) -> None:
+        unwrapped = getattr(model, "module", model)
+        if not isinstance(unwrapped, PeftModel):
+            return
+
+        rank = 0
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        if rank != 0:
+            return
+
+        adapter_dir = f"{output_dir}{self.suffix}"
+        os.makedirs(adapter_dir, exist_ok=True)
+
+        if isinstance(model, FSDP):
+            full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
+                full_state = model.state_dict()
+
+            adapter_state = None
+            try:
+                from peft.utils.save_and_load import get_peft_model_state_dict
+
+                adapter_state = get_peft_model_state_dict(unwrapped, state_dict=full_state)
+            except Exception:
+                adapter_state = full_state
+
+            unwrapped.save_pretrained(adapter_dir, state_dict=adapter_state, safe_serialization=safe_serialization)
+            logger.info_rank0(f"Adapter checkpoint saved at: {adapter_dir}")
+            return
+
+        unwrapped.save_pretrained(adapter_dir, safe_serialization=safe_serialization)
+        logger.info_rank0(f"Adapter checkpoint saved at: {adapter_dir}")
+
+    @override
+    def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if args.should_save:
+            output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+            self._save_adapter(kwargs.pop("model"), output_dir, args.save_safetensors)
 
 
 class PissaConvertCallback(TrainerCallback):

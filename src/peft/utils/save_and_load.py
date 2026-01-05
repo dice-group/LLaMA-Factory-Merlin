@@ -110,6 +110,12 @@ def get_peft_model_state_dict(
         else:
             raise NotImplementedError
         to_return = {k: v for k, v in to_return.items() if (("lora_" in k and adapter_name in k) or ("bias" in k))}
+        if config.peft_type in (PeftType.COLA, PeftType.HYDRALORA):
+            # CoLA/Hydra expert routers live under `*.router.*` and are not prefixed with "lora_".
+            # Include them explicitly so adapter checkpoints contain expert routing weights.
+            for key, val in state_dict.items():
+                if ".router." in key:
+                    to_return[key] = val
         if config.peft_type == PeftType.ADALORA:
             rank_pattern = config.rank_pattern
             if rank_pattern is not None:
