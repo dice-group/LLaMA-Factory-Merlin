@@ -150,7 +150,8 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                 from peft.utils.save_and_load import get_peft_model_state_dict
 
                 shard_dir = f"{adapter_dir}_sharded"
-                opts = StateDictOptions(full_state_dict=False, cpu_offload=True, ignore_frozen_params=True)
+                # Keep frozen params so routers/aux modules aren't dropped if requires_grad is toggled.
+                opts = StateDictOptions(full_state_dict=False, cpu_offload=True, ignore_frozen_params=False)
                 shard_state = get_model_state_dict(model, options=opts)
                 if shard_state is not None and any(k.startswith("_fsdp_wrapped_module.") for k in shard_state):
                     shard_state = {
