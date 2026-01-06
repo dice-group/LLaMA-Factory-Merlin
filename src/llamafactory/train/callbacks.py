@@ -144,36 +144,69 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
             rank = 0
             if torch.distributed.is_initialized():
                 rank = torch.distributed.get_rank()
-            full_state = None
             try:
+                from torch.distributed.checkpoint import FileSystemWriter, save as dcp_save
                 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+                from peft.utils.save_and_load import get_peft_model_state_dict
 
-                opts = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
-                full_state = get_model_state_dict(model, options=opts)
+                shard_dir = f"{adapter_dir}_sharded"
+                opts = StateDictOptions(full_state_dict=False, cpu_offload=True, ignore_frozen_params=True)
+                shard_state = get_model_state_dict(model, options=opts)
+                if shard_state is not None and any(k.startswith("_fsdp_wrapped_module.") for k in shard_state):
+                    shard_state = {
+                        k.removeprefix("_fsdp_wrapped_module."): v for k, v in shard_state.items()
+                    }
+                adapter_state = get_peft_model_state_dict(unwrapped, state_dict=shard_state)
+                writer = FileSystemWriter(shard_dir)
+                dcp_save(adapter_state, storage_writer=writer)
+                if rank == 0:
+                    os.makedirs(shard_dir, exist_ok=True)
+                    unwrapped.peft_config["default"].save_pretrained(shard_dir)
+                    meta_path = os.path.join(shard_dir, "adapter_sharded.json")
+                    with open(meta_path, "w", encoding="utf-8") as meta_file:
+                        json.dump(
+                            {
+                                "format": "torch.distributed.checkpoint",
+                                "base_model_name_or_path": unwrapped.peft_config["default"].base_model_name_or_path,
+                            },
+                            meta_file,
+                            indent=2,
+                        )
+                    logger.info_rank0(f"Adapter shard checkpoint saved at: {shard_dir}")
+                return
             except Exception:
-                full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
-                    full_state = model.state_dict()
-            if full_state is not None and any(k.startswith("_fsdp_wrapped_module.") for k in full_state):
-                full_state = {
-                    k.removeprefix("_fsdp_wrapped_module."): v for k, v in full_state.items()
-                }
-
-            if rank == 0:
-                os.makedirs(adapter_dir, exist_ok=True)
-                adapter_state = None
+                full_state = None
                 try:
-                    from peft.utils.save_and_load import get_peft_model_state_dict
+                    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-                    adapter_state = get_peft_model_state_dict(unwrapped, state_dict=full_state)
+                    opts = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
+                    full_state = get_model_state_dict(model, options=opts)
                 except Exception:
-                    adapter_state = full_state
+                    full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
+                        full_state = model.state_dict()
+                if full_state is not None and any(k.startswith("_fsdp_wrapped_module.") for k in full_state):
+                    full_state = {
+                        k.removeprefix("_fsdp_wrapped_module."): v for k, v in full_state.items()
+                    }
 
-                unwrapped.save_pretrained(adapter_dir, state_dict=adapter_state, safe_serialization=safe_serialization)
-                logger.info_rank0(f"Adapter checkpoint saved at: {adapter_dir}")
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-            return
+                if rank == 0:
+                    os.makedirs(adapter_dir, exist_ok=True)
+                    adapter_state = None
+                    try:
+                        from peft.utils.save_and_load import get_peft_model_state_dict
+
+                        adapter_state = get_peft_model_state_dict(unwrapped, state_dict=full_state)
+                    except Exception:
+                        adapter_state = full_state
+
+                    unwrapped.save_pretrained(
+                        adapter_dir, state_dict=adapter_state, safe_serialization=safe_serialization
+                    )
+                    logger.info_rank0(f"Adapter checkpoint saved at: {adapter_dir}")
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                return
 
         rank = 0
         if torch.distributed.is_initialized():
