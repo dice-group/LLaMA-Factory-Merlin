@@ -173,6 +173,9 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                             meta_file,
                             indent=2,
                         )
+                    done_path = os.path.join(shard_dir, ".done")
+                    with open(done_path, "w", encoding="utf-8") as done_file:
+                        done_file.write("ok")
                     logger.info_rank0(f"Adapter shard checkpoint saved at: {shard_dir}")
                 return
             except Exception:
