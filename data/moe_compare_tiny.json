@@ -1,0 +1,38 @@
+[
+  {
+    "instruction": "Translate the greeting to English.",
+    "input": "Hola",
+    "output": "Hello.",
+    "language": "english"
+  },
+  {
+    "instruction": "Provide a short greeting.",
+    "input": "",
+    "output": "Hello there!",
+    "language": "english"
+  },
+  {
+    "instruction": "Answer the question in one sentence.",
+    "input": "What is the capital of France?",
+    "output": "The capital of France is Paris.",
+    "language": "english"
+  },
+  {
+    "instruction": "Translate the greeting to Russian.",
+    "input": "Hello",
+    "output": "Privet.",
+    "language": "rus_Cyrl"
+  },
+  {
+    "instruction": "Provide a short greeting.",
+    "input": "",
+    "output": "Privet!",
+    "language": "rus_Cyrl"
+  },
+  {
+    "instruction": "Answer the question in one sentence.",
+    "input": "Kakaya stolitsa Frantsii?",
+    "output": "Stolitsa Frantsii - Parizh.",
+    "language": "rus_Cyrl"
+  }
+]

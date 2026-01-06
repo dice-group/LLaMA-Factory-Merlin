@@ -730,5 +730,13 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "moe_compare_tiny": {
+    "file_name": "moe_compare_tiny.json",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
   }
 }
