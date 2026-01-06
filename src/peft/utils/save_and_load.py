@@ -94,6 +94,12 @@ def get_peft_model_state_dict(
         # to_return = lora_state_dict(model, bias=model.peft_config.bias)
         # adapted from `https://github.com/microsoft/LoRA/blob/main/loralib/utils.py`
         # to be used directly with the state dict which is necessary when using DeepSpeed or FSDP
+        include_expert_keys = False
+        if config.peft_type == PeftType.COLA and getattr(config, "use_cola_experts", False):
+            include_expert_keys = True
+        if config.peft_type == PeftType.HYDRALORA and getattr(config, "use_hydralora_experts", False):
+            include_expert_keys = True
+
         bias = config.bias
         if bias == "none":
             to_return = {k: state_dict[k] for k in state_dict if "lora_" in k}
@@ -109,7 +115,18 @@ def get_peft_model_state_dict(
                         to_return[bias_name] = state_dict[bias_name]
         else:
             raise NotImplementedError
-        to_return = {k: v for k, v in to_return.items() if (("lora_" in k and adapter_name in k) or ("bias" in k))}
+        if include_expert_keys:
+            to_return = {
+                k: v
+                for k, v in to_return.items()
+                if (("lora_" in k and (adapter_name in k or ".expert_" in k)) or ("bias" in k))
+            }
+        else:
+            to_return = {
+                k: v
+                for k, v in to_return.items()
+                if (("lora_" in k and adapter_name in k) or ("bias" in k))
+            }
         if config.peft_type in (PeftType.COLA, PeftType.HYDRALORA):
             # CoLA/Hydra expert routers live under `*.router.*` and are not prefixed with "lora_".
             # Include them explicitly so adapter checkpoints contain expert routing weights.
@@ -465,9 +482,19 @@ def set_peft_model_state_dict(
                     del state_dict[k]
                     del state_dict[k.replace("_topk_indices", "_topk_weights")]
 
-        peft_model_state_dict = _insert_adapter_name_into_state_dict(
-            state_dict, adapter_name=adapter_name, parameter_prefix=parameter_prefix
-        )
+        if config.peft_type in (PeftType.COLA, PeftType.HYDRALORA) and any(
+            ".expert_" in key for key in state_dict
+        ):
+            expert_state_dict = {k: v for k, v in state_dict.items() if ".expert_" in k}
+            base_state_dict = {k: v for k, v in state_dict.items() if ".expert_" not in k}
+            peft_model_state_dict = _insert_adapter_name_into_state_dict(
+                base_state_dict, adapter_name=adapter_name, parameter_prefix=parameter_prefix
+            )
+            peft_model_state_dict.update(expert_state_dict)
+        else:
+            peft_model_state_dict = _insert_adapter_name_into_state_dict(
+                state_dict, adapter_name=adapter_name, parameter_prefix=parameter_prefix
+            )
 
         if config.peft_type == PeftType.ADALORA:
             rank_pattern = config.rank_pattern
