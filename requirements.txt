@@ -23,6 +23,7 @@ hf-transfer
 safetensors<=0.5.3
 # python
 fire
+logger
 omegaconf
 packaging
 protobuf
