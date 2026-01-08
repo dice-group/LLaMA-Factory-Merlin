@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
-from peft.metrics import pop_tracked_metrics
+from peft.metrics import pop_tracked_metrics, record_cola_metrics
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
@@ -156,6 +156,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return loss, outputs
 
         return base + added
+
+    @override
+    def training_step(
+        self,
+        model: "torch.nn.Module",
+        inputs: Dict[str, "torch.Tensor"],
+        *args,
+        **kwargs,
+    ) -> "torch.Tensor":
+        loss = super().training_step(model, inputs, *args, **kwargs)
+
+        if os.environ.get("LPR_TRACK_ROUTER_GRADS", "").lower() in {"1", "true", "yes", "on"}:
+            module = getattr(model, "module", model)
+            total = 0
+            present = 0
+            for name, param in module.named_parameters():
+                if "router.weight" not in name:
+                    continue
+                total += 1
+                if param.grad is not None:
+                    present += 1
+            frac = float(present / total) if total > 0 else 0.0
+            record_cola_metrics({"router_grad_present_frac": frac}, weight=1.0)
+
+        return loss
 
     @override
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
