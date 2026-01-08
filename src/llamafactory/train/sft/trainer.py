@@ -167,18 +167,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ) -> "torch.Tensor":
         loss = super().training_step(model, inputs, *args, **kwargs)
 
-        if os.environ.get("LPR_TRACK_ROUTER_GRADS", "").lower() in {"1", "true", "yes", "on"}:
+        if not hasattr(self, "_cola_router_params"):
             module = getattr(model, "module", model)
-            total = 0
-            present = 0
-            for name, param in module.named_parameters():
-                if "router.weight" not in name:
-                    continue
-                total += 1
-                if param.grad is not None:
-                    present += 1
-            frac = float(present / total) if total > 0 else 0.0
-            record_cola_metrics({"router_grad_present_frac": frac}, weight=1.0)
+            self._cola_router_params = [
+                param for name, param in module.named_parameters() if "router.weight" in name
+            ]
+        total = len(self._cola_router_params)
+        present = sum(1 for param in self._cola_router_params if param.grad is not None)
+        frac = float(present / total) if total > 0 else 0.0
+        record_cola_metrics({"router_grad_present_frac": frac}, weight=1.0)
 
         return loss
 
@@ -284,7 +281,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return None
 
         aux = weight * sum(losses) / len(losses)
-        self.log({"language_prior_loss": float(aux.detach().mean().cpu())})
+        record_cola_metrics({"language_prior_loss": float(aux.detach().mean().cpu())}, weight=1.0)
         return aux
 
     def _compute_adamole_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
