@@ -139,11 +139,15 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
             return
 
         adapter_dir = f"{output_dir}{self.suffix}"
+        start_time = time.monotonic()
 
         if isinstance(model, FSDP):
             rank = 0
+            world_size = None
             if torch.distributed.is_initialized():
                 rank = torch.distributed.get_rank()
+                world_size = torch.distributed.get_world_size()
+            logger.info_rank0("Adapter save start (FSDP): output_dir=%s adapter_dir=%s world_size=%s", output_dir, adapter_dir, world_size if world_size is not None else "n/a")
             try:
                 from torch.distributed.checkpoint import FileSystemWriter, save as dcp_save
                 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
@@ -152,14 +156,21 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                 shard_dir = f"{adapter_dir}_sharded"
                 # Keep frozen params so routers/aux modules aren't dropped if requires_grad is toggled.
                 opts = StateDictOptions(full_state_dict=False, cpu_offload=True, ignore_frozen_params=False)
+                shard_start = time.monotonic()
                 shard_state = get_model_state_dict(model, options=opts)
+                shard_end = time.monotonic()
                 if shard_state is not None and any(k.startswith("_fsdp_wrapped_module.") for k in shard_state):
                     shard_state = {
                         k.removeprefix("_fsdp_wrapped_module."): v for k, v in shard_state.items()
                     }
+                filter_start = time.monotonic()
                 adapter_state = get_peft_model_state_dict(unwrapped, state_dict=shard_state)
+                filter_end = time.monotonic()
+                logger.info_rank0("Adapter shard state built: shard_keys=%s adapter_keys=%s get_state_s=%.2f filter_s=%.2f", len(shard_state or {}), len(adapter_state or {}), shard_end - shard_start, filter_end - filter_start)
                 writer = FileSystemWriter(shard_dir)
+                save_start = time.monotonic()
                 dcp_save(adapter_state, storage_writer=writer)
+                save_end = time.monotonic()
                 if rank == 0:
                     os.makedirs(shard_dir, exist_ok=True)
                     unwrapped.peft_config["default"].save_pretrained(shard_dir)
@@ -176,19 +187,29 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                     done_path = os.path.join(shard_dir, ".done")
                     with open(done_path, "w", encoding="utf-8") as done_file:
                         done_file.write("ok")
-                    logger.info_rank0(f"Adapter shard checkpoint saved at: {shard_dir}")
+                    logger.info_rank0("Adapter shard checkpoint saved at: %s (dcp_save_s=%.2f total_s=%.2f)", shard_dir, save_end - save_start, save_end - start_time,)
                 return
-            except Exception:
+            except Exception as exc:
+                exc_msg = str(exc).replace("\n", " ").replace("\r", " ")
+                logger.warning_rank0("Adapter shard save failed, falling back to full state dict: %s", exc_msg)
                 full_state = None
                 try:
                     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
                     opts = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
+                    gather_start = time.monotonic()
                     full_state = get_model_state_dict(model, options=opts)
-                except Exception:
+                    gather_end = time.monotonic()
+                    logger.info_rank0("Full state dict gathered via DCP: keys=%s time_s=%.2f", len(full_state or {}), gather_end - gather_start)
+                except Exception as inner_exc:
+                    inner_msg = str(inner_exc).replace("\n", " ").replace("\r", " ")
+                    logger.warning_rank0("Full state dict gather via DCP failed; using FSDP.full_state_dict: %s", inner_msg)
+                    gather_start = time.monotonic()
                     full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
                     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
                         full_state = model.state_dict()
+                    gather_end = time.monotonic()
+                    logger.info_rank0("Full state dict gathered via FSDP: keys=%s time_s=%.2f", len(full_state or {}), gather_end - gather_start)
                 if full_state is not None and any(k.startswith("_fsdp_wrapped_module.") for k in full_state):
                     full_state = {
                         k.removeprefix("_fsdp_wrapped_module."): v for k, v in full_state.items()
@@ -200,14 +221,18 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                     try:
                         from peft.utils.save_and_load import get_peft_model_state_dict
 
+                        filter_start = time.monotonic()
                         adapter_state = get_peft_model_state_dict(unwrapped, state_dict=full_state)
+                        filter_end = time.monotonic()
                     except Exception:
                         adapter_state = full_state
 
+                    save_start = time.monotonic()
                     unwrapped.save_pretrained(
                         adapter_dir, state_dict=adapter_state, safe_serialization=safe_serialization
                     )
-                    logger.info_rank0(f"Adapter checkpoint saved at: {adapter_dir}")
+                    save_end = time.monotonic()
+                    logger.info_rank0("Adapter checkpoint saved at: %s (filter_s=%.2f save_s=%.2f total_s=%.2f)", adapter_dir, filter_end - filter_start if "filter_end" in locals() else 0.0, save_end - save_start, save_end - start_time)
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
                 return
@@ -221,7 +246,7 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
             return
         os.makedirs(adapter_dir, exist_ok=True)
         unwrapped.save_pretrained(adapter_dir, safe_serialization=safe_serialization)
-        logger.info_rank0(f"Adapter checkpoint saved at: {adapter_dir}")
+        logger.info_rank0("Adapter checkpoint saved at: %s (non-FSDP total_s=%.2f)", adapter_dir, time.monotonic() - start_time)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 

@@ -278,7 +278,7 @@ class HydraLoraModel(BaseTuner):
 
     def _mark_only_adapters_as_trainable(self, model: nn.Module) -> None:
         for n, p in model.named_parameters():
-            if self.prefix not in n:
+            if self.prefix not in n and "router" not in n and "lora_route" not in n:
                 p.requires_grad = False
 
         for active_adapter in self.active_adapters:
