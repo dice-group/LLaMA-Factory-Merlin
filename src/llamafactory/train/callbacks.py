@@ -129,6 +129,9 @@ class SaveProcessorCallback(TrainerCallback):
 
 class SaveAdapterCheckpointCallback(TrainerCallback):
     r"""A callback for saving PEFT adapters alongside FSDP checkpoints."""
+    """ This got very messy, but problem was: lm eval needs hf adapter checkpoints, fsdp saves sharded checkpoints, which are incompatibale with lm eval """
+    """ i kept the old mechanims as fallback, thats why this is messy and used this solutions mainly, since otherwise it yielded timeouts when gathring all params over multiple ranks """
+    """ https://github.com/huggingface/transformers/pull/28297 """
 
     def __init__(self, suffix: str = "_adapter") -> None:
         self.suffix = suffix
