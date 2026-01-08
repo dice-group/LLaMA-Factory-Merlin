@@ -25,6 +25,7 @@ from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
+from ..callbacks import SaveAdapterCheckpointCallback
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
 
@@ -140,6 +141,9 @@ def run_sft(
             **tokenizer_module,
             **metric_module,
         )
+        for cb in trainer.callback_handler.callbacks:
+            if isinstance(cb, SaveAdapterCheckpointCallback):
+                cb.set_accelerator(trainer.accelerator)
 
     # Training
     if training_args.do_train:

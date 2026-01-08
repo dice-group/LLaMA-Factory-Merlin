@@ -132,6 +132,10 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
 
     def __init__(self, suffix: str = "_adapter") -> None:
         self.suffix = suffix
+        self.accelerator = None
+
+    def set_accelerator(self, accelerator: Any) -> None:
+        self.accelerator = accelerator
 
     def _save_adapter(self, model: torch.nn.Module, output_dir: str, safe_serialization: bool) -> None:
         unwrapped = getattr(model, "module", model)
@@ -148,6 +152,76 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                 rank = torch.distributed.get_rank()
                 world_size = torch.distributed.get_world_size()
             logger.info_rank0("Adapter save start (FSDP): output_dir=%s adapter_dir=%s world_size=%s", output_dir, adapter_dir, world_size if world_size is not None else "n/a")
+            fsdp_plugin = getattr(getattr(self.accelerator, "state", None), "fsdp_plugin", None)
+            if self.accelerator is not None and fsdp_plugin is not None:
+                try:
+                    import inspect
+                    from accelerate.utils.fsdp_utils import save_fsdp_model
+                    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+                    if "adapter_only" in inspect.signature(save_fsdp_model).parameters:
+                        os.makedirs(adapter_dir, exist_ok=True)
+                        orig_state_dict_type = fsdp_plugin.state_dict_type
+                        orig_state_dict_config = fsdp_plugin.state_dict_config
+                        orig_offload = getattr(fsdp_plugin.state_dict_config, "offload_to_cpu", None)
+                        orig_rank0 = getattr(fsdp_plugin.state_dict_config, "rank0_only", None)
+                        try:
+                            fsdp_plugin.state_dict_type = StateDictType.FULL_STATE_DICT
+                            is_multi = self.accelerator.num_processes > 1
+                            fsdp_plugin.state_dict_config = FullStateDictConfig(
+                                offload_to_cpu=is_multi, rank0_only=is_multi
+                            )
+                            save_start = time.monotonic()
+                            save_fsdp_model(
+                                fsdp_plugin,
+                                self.accelerator,
+                                model,
+                                adapter_dir,
+                                adapter_only=True,
+                            )
+                            save_end = time.monotonic()
+                        finally:
+                            fsdp_plugin.state_dict_type = orig_state_dict_type
+                            fsdp_plugin.state_dict_config = orig_state_dict_config
+                            if orig_offload is not None:
+                                fsdp_plugin.state_dict_config.offload_to_cpu = orig_offload
+                            if orig_rank0 is not None:
+                                fsdp_plugin.state_dict_config.rank0_only = orig_rank0
+
+                        if rank == 0:
+                            fsdp_path = os.path.join(adapter_dir, "pytorch_model_fsdp.bin")
+                            if os.path.exists(fsdp_path):
+                                load_start = time.monotonic()
+                                try:
+                                    adapter_state = torch.load(fsdp_path, map_location="cpu", weights_only=True)
+                                except TypeError:
+                                    adapter_state = torch.load(fsdp_path, map_location="cpu")
+                                load_end = time.monotonic()
+                                adapter_keys = len(adapter_state or {})
+                                logger.info_rank0(
+                                    "Adapter shard state built: shard_keys=%s adapter_keys=%s get_state_s=%.2f filter_s=%.2f",
+                                    adapter_keys,
+                                    adapter_keys,
+                                    save_end - save_start,
+                                    load_end - load_start,
+                                )
+                                unwrapped.save_pretrained(
+                                    adapter_dir,
+                                    state_dict=adapter_state,
+                                    safe_serialization=safe_serialization,
+                                )
+                                os.remove(fsdp_path)
+                                logger.info_rank0(
+                                    "Adapter checkpoint saved at: %s (adapter_only fsdp total_s=%.2f)",
+                                    adapter_dir,
+                                    time.monotonic() - start_time,
+                                )
+                        if torch.distributed.is_initialized():
+                            torch.distributed.barrier()
+                        return
+                except Exception as exc:
+                    exc_msg = str(exc).replace("\n", " ").replace("\r", " ")
+                    logger.warning_rank0("Adapter-only FSDP save failed; falling back to manual path: %s", exc_msg)
             try:
                 from torch.distributed.checkpoint import FileSystemWriter, save as dcp_save
                 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
