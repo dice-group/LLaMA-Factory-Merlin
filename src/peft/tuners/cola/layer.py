@@ -95,7 +95,7 @@ class ColaLayerConfig:
         if self.language_head_bias_value is None:
             self.language_head_bias_value = self.language_bias_value
         if self.track_router_metrics is None:
-            self.track_router_metrics = self.language_prior_weight > 0
+            self.track_router_metrics = self.language_prior_weight > 0 or self.language_router_mode == "hard"
 
 
 class ColaLayer(BaseTunerLayer):

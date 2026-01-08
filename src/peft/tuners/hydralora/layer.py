@@ -81,7 +81,7 @@ class HydraLayerConfig:
         if self.hydralora_head_top_k is not None and self.hydralora_head_top_k <= 0:
             self.hydralora_head_top_k = None
         if self.track_router_metrics is None:
-            self.track_router_metrics = self.language_prior_weight > 0
+            self.track_router_metrics = self.language_prior_weight > 0 or self.language_router_mode == "hard"
 
 
 class HydraLoraLayer(BaseTunerLayer):
