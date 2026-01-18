@@ -39,7 +39,14 @@ Thereofre use environment_eval.yml and install it. You may have to manually inst
 
 on cluster i had issues and finally installed like this:
 ```
-conda create -n lm_eval -c pytorch -c nvidia -c conda-forge   python=3.11 pytorch=2.6 omegaconf pip
+conda create -y -n lm_eval \
+  -c pytorch -c nvidia -c conda-forge \
+  python=3.10 \
+  pytorch=2.5.1 \
+  pytorch-cuda=12.1 \
+  cuda-toolkit=12.1 \
+  omegaconf \
+  pip
 ```
 and then
 
@@ -49,7 +56,7 @@ pip install \
   --no-cache-dir \
   transformers>=4.57.3 \
   lm-eval \
-  datasets \
+  "datasets<4" \
   accelerate \
   safetensors \
   wandb
@@ -62,7 +69,7 @@ import torch
 import transformers
 import lm_eval
 
-print("torch", torch.__version__)
+print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
 print("transformers", transformers.__version__)
 print("lm_eval", lm_eval.__version__)
 PY
