@@ -19,7 +19,8 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
         scaling = layer.scaling[active_adapter]
 
         x = x.to(lora_A.weight.dtype)
-        route_logits = lora_route(x.to(torch.float32)).to(result.dtype)
+        route_dtype = lora_route.weight.dtype
+        route_logits = lora_route(x.to(route_dtype)).to(result.dtype)
         use_head_guidance = layer.language_guidance_scope == "all"
         head_targets = layer._language_head_targets(language_ids, active_adapter) if use_head_guidance else None
         if use_head_guidance:
@@ -168,7 +169,8 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
             lora_route = layer.lora_route[name] if name in layer.lora_route else None
             use_head_router = lora_route is not None and len(B_list) > 1
             if use_head_router:
-                route_logits = lora_route(x.to(torch.float32)).to(x.dtype)
+                route_dtype = lora_route.weight.dtype
+                route_logits = lora_route(x.to(route_dtype)).to(x.dtype)
                 head_targets: Optional[torch.Tensor] = None
                 use_head_guidance = layer.language_guidance_scope == "all"
                 if use_head_guidance and language_ids is not None:

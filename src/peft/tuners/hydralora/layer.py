@@ -735,7 +735,8 @@ class Linear(nn.Module, HydraLoraLayer):
             out = sum(B(a_dot_x) for B in B_list)
             return out * scale
 
-        route_logits = lora_route(x.to(torch.float32)).to(x.dtype)  # [B, S, num_heads]
+        route_dtype = lora_route.weight.dtype
+        route_logits = lora_route(x.to(route_dtype)).to(x.dtype)  # [B, S, num_heads]
         head_targets: Optional[torch.Tensor] = None
         use_head_guidance = self.language_guidance_scope == "all"
         if use_head_guidance and language_ids is not None:
