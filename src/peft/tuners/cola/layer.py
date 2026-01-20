@@ -962,6 +962,7 @@ class Linear(nn.Module, ColaLayer):
                 out = out.squeeze(1)
             return out
 
+        # Note: we apply dropout once and reuse A outputs; the original CoLA implementation applies dropout per A/B pair.
         intermediate = drop(x.to(A_list[0].weight.dtype))
         a_outputs = [A(intermediate) for A in A_list]
         num_a = len(a_outputs)
