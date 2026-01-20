@@ -135,6 +135,10 @@ class TopKMoeLayer(nn.Module):
             if token_count > 0 and assign_count > 0:
                 entropy = (-gate_probs.float() * torch.log(gate_probs.float() + 1e-8)).sum(dim=-1).mean()
                 expert_counts = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
+                true_per_token = (selected_experts < self.num_true_experts).sum(dim=-1).float()
+                true_load = float(true_per_token.mean().item())
+                bypass_pct = float((true_per_token == 0).float().mean().item())
+                null_per_token = float((float(self.top_k) - true_per_token).mean().item())
                 if self.use_null_expert and expert_counts.numel() > self.num_true_experts:
                     true_counts = expert_counts[: self.num_true_experts]
                     null_paths = float(expert_counts[self.num_true_experts :].sum().item())
@@ -152,6 +156,9 @@ class TopKMoeLayer(nn.Module):
                     active_frac = float((true_counts > 0).float().mean().item())
                 record_mola_metrics(
                     {
+                        "true_expert_load": true_load,
+                        "null_expert_load": null_per_token,
+                        "bypass_token_pct": bypass_pct,
                         "null_token_pct": tokens_with_null / float(token_count),
                         "null_path_pct": null_paths / float(assign_count),
                         "expert_load_cv": load_cv,
