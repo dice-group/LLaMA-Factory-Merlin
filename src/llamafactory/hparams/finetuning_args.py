@@ -592,11 +592,26 @@ class FinetuningArguments(
     )
     mola_num_experts: int = field(default=4, metadata={"help": "Number of experts used by MoLA."})
     mola_top_k: int = field(default=2, metadata={"help": "Top-k experts routed to for each token in MoLA."})
-    mola_use_null_expert: bool = field(default=False, metadata={"help": "Enable a null expert in MoLA routing."})
+    mola_use_null_expert: bool = field(
+        default=False,
+        metadata={"help": "Enable a single null expert in MoLA routing (deprecated; use mola_num_null_experts)."},
+    )
+    mola_num_null_experts: int = field(
+        default=0,
+        metadata={"help": "Number of null experts for daMOE-style routing (0 disables)."},
+    )
+    mola_output_router_logits: bool = field(
+        default=False,
+        metadata={"help": "Enable router-logit collection for daMOE auxiliary loss."},
+    )
     mola_router_aux_loss_coef: float = field(default=0.01, metadata={"help": "Router auxiliary loss weight for MoLA."})
+    mola_aux_loss_coef_end: Optional[float] = field(
+        default=None,
+        metadata={"help": "End value for MoLA aux loss coefficient when annealing (defaults to 0.0)."},
+    )
     mola_null_expert_penalty: float = field(
         default=0.1,
-        metadata={"help": "Penalty applied to null-expert usage in MoLA."},
+        metadata={"help": "Deprecated; null expert penalties are not used in the daMOE formulation."},
     )
     mola_aux_loss_annealing: bool = field(default=False, metadata={"help": "Anneal the MoLA auxiliary loss during training."})
     mola_debug_mode: bool = field(default=False, metadata={"help": "Verbose logging inside MoLA routers."})

@@ -29,46 +29,56 @@ class TopKMoeLayer(nn.Module):
     Adapted from https://github.com/mistralai/mistral-src
     """
 
-    def __init__(self, experts: nn.ModuleList, gate: nn.Module, top_k: int, use_null_expert: bool, router_aux_loss_coef: float, null_expert_penalty: float, aux_loss_annealing: bool, debug_mode: bool):
+    def __init__(
+        self,
+        experts: nn.ModuleList,
+        gate: nn.Module,
+        top_k: int,
+        num_true_experts: int,
+        num_null_experts: int,
+        output_router_logits: bool,
+        router_aux_loss_coef: float,
+        aux_loss_annealing: bool,
+        debug_mode: bool,
+    ):
         super().__init__()
         self.experts = experts
         self.gate = gate
         self.top_k = top_k
-        self.use_null_expert = use_null_expert
+        self.num_true_experts = num_true_experts
+        self.num_null_experts = num_null_experts
+        self.num_experts = num_true_experts + num_null_experts
+        self.use_null_expert = num_null_experts > 0
+        self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
-        self.null_expert_penalty = null_expert_penalty
         self.aux_loss_annealing = aux_loss_annealing
         self.debug_mode = debug_mode
         self.layer_loss = torch.tensor(0.0, device=next(gate.parameters()).device)
+        self.last_gate_logits: Optional[torch.Tensor] = None
 
     def get_layer_loss(self, gate_logits: torch.Tensor, selected_experts: torch.Tensor) -> torch.Tensor:
         """
-        Get the load balancing loss by following the Switch Transformer
+        Get the load balancing loss following daMOE.
         """
         num_inputs = gate_logits.shape[0]
-        num_experts = len(self.experts)
-        expert_counts = torch.bincount(selected_experts.reshape(-1), minlength=num_experts)
-        expert_fractions = expert_counts / num_inputs
-        expert_probs = torch.sum(gate_logits, dim=0) / num_inputs
+        if num_inputs == 0:
+            return torch.tensor(0.0, device=gate_logits.device, dtype=gate_logits.dtype)
+        gate_probs = F.softmax(gate_logits, dim=-1)
+        expert_counts = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
+        total_assignments = float(num_inputs * self.top_k)
+        expert_fractions = expert_counts.float() / total_assignments
+        expert_probs = gate_probs.float().mean(dim=0)
+        if self.use_null_expert:
+            true_fractions = expert_fractions[: self.num_true_experts]
+            null_fractions = expert_fractions[self.num_true_experts :]
+            null_mean = null_fractions.mean() if null_fractions.numel() > 0 else expert_fractions.new_tensor(0.0)
+            null_fractions = null_mean.repeat(self.num_null_experts)
+            expert_fractions = torch.cat([true_fractions, null_fractions])
+
+        loss = self.num_experts * torch.sum(expert_fractions * expert_probs)
         if self.debug_mode:
             _debug_print(f"[MOLA DEBUG] expert_fractions: {expert_fractions}")
             _debug_print(f"[MOLA DEBUG] expert_probs: {expert_probs}")
-
-        if self.use_null_expert:
-            # AdaMoE loss
-            # Last expert is the null expert
-            true_expert_fractions = expert_fractions[:-1]
-            true_expert_probs = expert_probs[:-1]
-            null_expert_fraction = expert_fractions[-1]
-            if self.debug_mode:
-                _debug_print(f"[MOLA DEBUG] null_expert_fraction: {null_expert_fraction}")
-
-            loss = self.router_aux_loss_coef * (torch.sum(true_expert_fractions * true_expert_probs) - self.null_expert_penalty * null_expert_fraction)
-        else:
-            # Standard load balancing loss
-            loss = self.router_aux_loss_coef * num_experts * torch.sum(expert_fractions * expert_probs)
-
-        if self.debug_mode:
             _debug_print(f"[MOLA DEBUG] aux_loss={loss}")
         return loss
 
@@ -77,28 +87,40 @@ class TopKMoeLayer(nn.Module):
         Forward propagation
         """
         flattened_inputs = inputs.view((-1, inputs.shape[-1]))
-        gate_logits = F.softmax(self.gate(flattened_inputs), dim=-1)
+        gate_logits = self.gate(flattened_inputs)
+        gate_probs = F.softmax(gate_logits, dim=-1)
         if self.debug_mode:
             _debug_print(f"[MOLA DEBUG] self.gate.weight.requires_grad: {self.gate.weight.requires_grad}")
-            _debug_print(f"[MOLA DEBUG] gate_logits.requires_grad: {gate_logits.requires_grad}")
-        weights, selected_experts = torch.topk(input=gate_logits, k=self.top_k, dim=-1)
-        weights = weights / torch.sum(weights, dim=-1, keepdim=True, dtype=inputs.dtype)
+            _debug_print(f"[MOLA DEBUG] gate_probs.requires_grad: {gate_probs.requires_grad}")
+        weights, selected_experts = torch.topk(input=gate_probs, k=self.top_k, dim=-1)
+        if self.output_router_logits:
+            self.last_gate_logits = gate_logits
+        if self.use_null_expert:
+            true_mask = selected_experts < self.num_true_experts
+        else:
+            true_mask = torch.ones_like(selected_experts, dtype=torch.bool)
+        true_weights = weights * true_mask
+        denom = true_weights.sum(dim=-1, keepdim=True)
+        denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+        normalized_weights = (true_weights / denom).to(dtype=flattened_inputs.dtype)
         results = torch.zeros_like(self.experts[0](flattened_inputs))
 
         for i, expert in enumerate(self.experts):
-            batch_idx, nth_expert = torch.where(selected_experts == i)
-            if self.use_null_expert and i == len(self.experts) - 1:
-                # This is the null expert, do nothing
+            if i >= self.num_true_experts:
                 continue
-            results[batch_idx] += \
-                weights[batch_idx, nth_expert, None] * expert(flattened_inputs[batch_idx])
+            batch_idx, nth_expert = torch.where(selected_experts == i)
+            if batch_idx.numel() == 0:
+                continue
+            results[batch_idx] += normalized_weights[batch_idx, nth_expert, None] * expert(flattened_inputs[batch_idx])
 
         results = results.view((*inputs.shape[:-1], results.shape[-1]))
         self.layer_loss = self.get_layer_loss(gate_logits=gate_logits, selected_experts=selected_experts)
         if self.debug_mode:
             with torch.no_grad():
-                expert_counts = torch.bincount(selected_experts.reshape(-1), minlength=len(self.experts))
-                null_count = expert_counts[-1].item() if self.use_null_expert else 0
+                expert_counts = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
+                null_count = (
+                    expert_counts[self.num_true_experts :].sum().item() if self.use_null_expert else 0
+                )
                 _debug_print(
                     "[MOLA DEBUG] tokens={} expert_counts={} null_expert_tokens={}".format(
                         flattened_inputs.shape[0],
@@ -111,12 +133,12 @@ class TopKMoeLayer(nn.Module):
             token_count = flattened_inputs.shape[0]
             assign_count = selected_experts.numel()
             if token_count > 0 and assign_count > 0:
-                entropy = (-gate_logits.float() * torch.log(gate_logits.float() + 1e-8)).sum(dim=-1).mean()
-                expert_counts = torch.bincount(selected_experts.reshape(-1), minlength=len(self.experts))
-                if self.use_null_expert and expert_counts.numel() > 0:
-                    true_counts = expert_counts[:-1]
-                    null_paths = float(expert_counts[-1].item())
-                    tokens_with_null = float((selected_experts == len(self.experts) - 1).any(dim=-1).sum().item())
+                entropy = (-gate_probs.float() * torch.log(gate_probs.float() + 1e-8)).sum(dim=-1).mean()
+                expert_counts = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
+                if self.use_null_expert and expert_counts.numel() > self.num_true_experts:
+                    true_counts = expert_counts[: self.num_true_experts]
+                    null_paths = float(expert_counts[self.num_true_experts :].sum().item())
+                    tokens_with_null = float((selected_experts >= self.num_true_experts).any(dim=-1).sum().item())
                 else:
                     true_counts = expert_counts
                     null_paths = 0.0
@@ -139,6 +161,13 @@ class TopKMoeLayer(nn.Module):
                     weight=float(token_count),
                 )
         return results
+
+    def pop_router_state(self) -> Optional[torch.Tensor]:
+        if not self.output_router_logits or self.last_gate_logits is None:
+            return None
+        gate_logits = self.last_gate_logits
+        self.last_gate_logits = None
+        return gate_logits
 
 
 class LoraExpert(nn.Module):
@@ -173,7 +202,8 @@ class MolaLayer(LoraLayer, ABC):
 
     def update_layer(
         self, adapter_name: str, lora_rank: int, lora_alpha: int, lora_dropout: float, init_lora_weights: bool,
-        num_experts: int, top_k: int, use_null_expert: bool, router_aux_loss_coef: float, null_expert_penalty: float, aux_loss_annealing: bool, mola_debug_mode: bool
+        num_experts: int, top_k: int, num_null_experts: int, output_router_logits: bool, router_aux_loss_coef: float,
+        aux_loss_annealing: bool, mola_debug_mode: bool
     ) -> None:
         """
         Update the layer
@@ -185,9 +215,9 @@ class MolaLayer(LoraLayer, ABC):
         self.lora_alpha[adapter_name] = lora_alpha
 
         if lora_dropout > 0.0:
-            lora_dropout_layer = nn.ModuleList(nn.Dropout(p=lora_dropout) for _ in range(num_experts))
+            lora_dropout_layer = nn.Dropout(p=lora_dropout)
         else:
-            lora_dropout_layer = nn.ModuleList(nn.Identity() for _ in range(num_experts))
+            lora_dropout_layer = nn.Identity()
 
         self.lora_dropout[adapter_name] = lora_dropout_layer.to(self.base_layer.weight.device)
         self.lora_A[adapter_name] = nn.ModuleList(
@@ -198,16 +228,20 @@ class MolaLayer(LoraLayer, ABC):
         ).to(self.base_layer.weight.device)
         self.scaling[adapter_name] = lora_alpha / lora_rank
         
-        gating_num_experts = num_experts
-        if use_null_expert:
-            gating_num_experts += 1
-            
-        self.lora_gating[adapter_name] = nn.Linear(self.in_features, gating_num_experts, bias=False).to(self.base_layer.weight.device)
+        num_null_experts = max(0, num_null_experts)
+        gating_num_experts = num_experts + num_null_experts
+        if top_k > gating_num_experts:
+            raise ValueError(
+                f"top_k ({top_k}) cannot exceed total experts ({gating_num_experts})."
+            )
+        self.lora_gating[adapter_name] = nn.Linear(self.in_features, gating_num_experts, bias=False).to(
+            self.base_layer.weight.device
+        )
 
         if mola_debug_mode:
             _debug_print(
-                "[MOLA DEBUG] Adapter {} -> base={} in={} out={} rank={} alpha={} num_experts={} top_k={} "
-                "use_null={} dropout={:.2f}".format(
+                "[MOLA DEBUG] Adapter {} -> base={} in={} out={} rank={} alpha={} num_experts={} num_null_experts={} "
+                "top_k={} dropout={:.2f}".format(
                     adapter_name,
                     self.base_layer.__class__.__name__,
                     self.in_features,
@@ -215,25 +249,35 @@ class MolaLayer(LoraLayer, ABC):
                     lora_rank,
                     lora_alpha,
                     num_experts,
+                    num_null_experts,
                     top_k,
-                    use_null_expert,
                     lora_dropout,
                 )
             )
 
-        experts = nn.ModuleList(LoraExpert(
-            self.lora_A[adapter_name][i],
-            self.lora_B[adapter_name][i],
-            self.lora_dropout[adapter_name][i],
-            self.scaling[adapter_name],
-        ) for i in range(num_experts))
+        experts = nn.ModuleList(
+            LoraExpert(
+                self.lora_A[adapter_name][i],
+                self.lora_B[adapter_name][i],
+                self.lora_dropout[adapter_name],
+                self.scaling[adapter_name],
+            )
+            for i in range(num_experts)
+        )
         
-        if use_null_expert:
+        for _ in range(num_null_experts):
             experts.append(NullExpert().to(self.base_layer.weight.device))
 
         self.moe_layer[adapter_name] = TopKMoeLayer(
-            experts=experts, gate=self.lora_gating[adapter_name], top_k=top_k, use_null_expert=use_null_expert,
-            router_aux_loss_coef=router_aux_loss_coef, null_expert_penalty=null_expert_penalty, aux_loss_annealing=aux_loss_annealing, debug_mode=mola_debug_mode
+            experts=experts,
+            gate=self.lora_gating[adapter_name],
+            top_k=top_k,
+            num_true_experts=num_experts,
+            num_null_experts=num_null_experts,
+            output_router_logits=output_router_logits,
+            router_aux_loss_coef=router_aux_loss_coef,
+            aux_loss_annealing=aux_loss_annealing,
+            debug_mode=mola_debug_mode,
         ).to(self.base_layer.weight.device)
 
         self.reset_parameters(adapter_name, init_lora_weights)
@@ -265,10 +309,10 @@ class LinearMolaLayer(nn.Module, MolaLayer):
         lora_dropout: float = 0.0,
         init_lora_weights: bool = True,
         num_experts: int = 4,
+        num_null_experts: int = 0,
         top_k: int = 2,
-        use_null_expert: bool = False,
+        output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.01,
-        null_expert_penalty: float = 0.1,
         aux_loss_annealing: bool = False,
         mola_debug_mode: bool = False,
         **kwargs,
@@ -278,7 +322,7 @@ class LinearMolaLayer(nn.Module, MolaLayer):
         self._active_adapter = adapter_name
         self.update_layer(
             adapter_name, lora_rank, lora_alpha, lora_dropout, init_lora_weights, num_experts, top_k,
-            use_null_expert, router_aux_loss_coef, null_expert_penalty, aux_loss_annealing, mola_debug_mode)
+            num_null_experts, output_router_logits, router_aux_loss_coef, aux_loss_annealing, mola_debug_mode)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """

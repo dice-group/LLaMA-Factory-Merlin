@@ -1018,6 +1018,8 @@ def _setup_mola_tuning(
             mola_num_experts=finetuning_args.mola_num_experts,
             mola_top_k=finetuning_args.mola_top_k,
             mola_use_null_expert=finetuning_args.mola_use_null_expert,
+            mola_num_null_experts=finetuning_args.mola_num_null_experts,
+            mola_output_router_logits=finetuning_args.mola_output_router_logits,
             mola_router_aux_loss_coef=finetuning_args.mola_router_aux_loss_coef,
             mola_null_expert_penalty=finetuning_args.mola_null_expert_penalty,
             mola_aux_loss_annealing=finetuning_args.mola_aux_loss_annealing,

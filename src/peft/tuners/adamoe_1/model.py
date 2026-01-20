@@ -12,7 +12,7 @@ from peft.utils import get_quantization_config
 
 from ..lora import LoraModel
 from .config import MolaConfig
-from .layer import LinearMolaLayer, MolaLayer
+from .layer import LinearMolaLayer, MolaLayer, TopKMoeLayer
 
 
 class MolaModel(LoraModel):
@@ -44,6 +44,9 @@ class MolaModel(LoraModel):
         )
         rank = mola_config.rank_pattern.get(target_name_key, mola_config.r)
         alpha = mola_config.alpha_pattern.get(target_name_key, mola_config.lora_alpha)
+        num_null_experts = mola_config.mola_num_null_experts
+        if num_null_experts <= 0 and mola_config.mola_use_null_expert:
+            num_null_experts = 1
 
         layer_kwargs = {
             "lora_rank": rank,
@@ -52,9 +55,9 @@ class MolaModel(LoraModel):
             "init_lora_weights": mola_config.init_lora_weights,
             "num_experts": mola_config.mola_num_experts,
             "top_k": mola_config.mola_top_k,
-            "use_null_expert": mola_config.mola_use_null_expert,
+            "num_null_experts": num_null_experts,
+            "output_router_logits": mola_config.mola_output_router_logits,
             "router_aux_loss_coef": mola_config.mola_router_aux_loss_coef,
-            "null_expert_penalty": mola_config.mola_null_expert_penalty,
             "aux_loss_annealing": mola_config.mola_aux_loss_annealing,
             "mola_debug_mode": mola_config.mola_debug_mode,
         }
@@ -102,10 +105,20 @@ class MolaModel(LoraModel):
             "Currently, only `torch.nn.Linear` layers can be adapted with MoLA."
         )
 
-    def get_aux_loss(self, adapter_name: str = "default") -> torch.Tensor:
+    @staticmethod
+    def _extract_layer_key(name: str) -> str:
+        for pattern in (r"\.layers\.(\d+)\.", r"\.layer\.(\d+)\.", r"\.h\.(\d+)\."):
+            match = re.search(pattern, name)
+            if match is not None:
+                return match.group(1)
+        return name
+
+    def get_aux_loss(self, adapter_name: str = "default") -> torch.Tensor | None:
         param = next(self.model.parameters(), None)
         device = param.device if param is not None else torch.device("cpu")
         model_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+        layer_groups: dict[str, list[tuple[TopKMoeLayer, torch.Tensor]]] = {}
 
         for name, module in self.model.named_modules():
             if not name.endswith("moe_layer"):
@@ -113,10 +126,36 @@ class MolaModel(LoraModel):
             if isinstance(module, nn.ModuleDict) and adapter_name in module:
                 layer = module[adapter_name]
             else:
-                layer = None
-            if layer is None or layer.layer_loss is None:
                 continue
-            model_loss = model_loss + layer.layer_loss
-            layer.layer_loss = None
+            if not isinstance(layer, TopKMoeLayer):
+                continue
+            pop_fn = getattr(layer, "pop_router_state", None)
+            if not callable(pop_fn):
+                continue
+            gate_logits = pop_fn()
+            if gate_logits is None:
+                continue
+            layer_key = self._extract_layer_key(name)
+            layer_groups.setdefault(layer_key, []).append((layer, gate_logits))
 
+        any_loss = False
+        for _, entries in layer_groups.items():
+            ref_layer = entries[0][0]
+            num_experts = entries[0][1].shape[-1]
+            top_k = ref_layer.top_k
+            gate_list = []
+            for layer, gate_logits in entries:
+                if gate_logits.shape[-1] != num_experts or layer.top_k != top_k:
+                    continue
+                gate_list.append(gate_logits)
+            if not gate_list:
+                continue
+            gate_logits = torch.cat(gate_list, dim=0)
+            gate_probs = torch.softmax(gate_logits, dim=-1)
+            _, selected_experts = torch.topk(gate_probs, k=top_k, dim=-1)
+            model_loss = model_loss + ref_layer.get_layer_loss(gate_logits, selected_experts)
+            any_loss = True
+
+        if not any_loss:
+            return None
         return model_loss

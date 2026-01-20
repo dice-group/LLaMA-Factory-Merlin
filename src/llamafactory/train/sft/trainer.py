@@ -306,6 +306,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if self.finetuning_args.finetuning_type != "mola":
             return None
 
+        coef = float(getattr(self.finetuning_args, "mola_router_aux_loss_coef", 0.0) or 0.0)
+        if coef <= 0:
+            return None
+
         module = getattr(model, "module", model)
         aux_fn = getattr(module, "get_aux_loss", None)
         if not callable(aux_fn):
@@ -315,8 +319,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if aux is None:
             return None
 
-        self.log({"mola_aux_loss": float(aux.detach().mean().cpu())})
-        return aux
+        if self.finetuning_args.mola_aux_loss_annealing:
+            end_coef = getattr(self.finetuning_args, "mola_aux_loss_coef_end", None)
+            if end_coef is None:
+                end_coef = 0.0
+            max_steps = getattr(self.state, "max_steps", 0) or 0
+            if max_steps > 0:
+                progress = min(1.0, float(self.state.global_step) / float(max_steps))
+            else:
+                progress = 1.0
+            coef = (1.0 - progress) * coef + progress * float(end_coef)
+
+        scaled = coef * aux
+        self.log({"mola_aux_loss": float(scaled.detach().mean().cpu())})
+        return scaled
 
     def _compute_moelpr_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
         if self.finetuning_args.finetuning_type != "moelpr":
