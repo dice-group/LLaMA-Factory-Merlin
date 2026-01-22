@@ -333,6 +333,43 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
         self._save_adapter(kwargs.pop("model"), output_dir, args.save_safetensors)
 
 
+class SaveOnSignalCallback(TrainerCallback):
+    r"""Trigger a save + stop when receiving SIGTERM/USR1 (e.g., before SLURM timeout)."""
+
+    def __init__(self) -> None:
+        self._save_requested = False
+        self._orig_handlers: dict[int, Any] = {}
+
+    def _handle_signal(self, signum, frame) -> None:
+        self._save_requested = True
+
+    @override
+    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        for sig in (signal.SIGTERM, signal.SIGUSR1):
+            try:
+                self._orig_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._handle_signal)
+            except Exception:
+                continue
+
+    @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if self._save_requested:
+            if state.is_world_process_zero:
+                logger.warning_rank0("Signal received: requesting save and stop.")
+            control.should_save = True
+            control.should_training_stop = True
+        return control
+
+    @override
+    def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        for sig, handler in self._orig_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except Exception:
+                continue
+
+
 class PissaConvertCallback(TrainerCallback):
     r"""A callback for converting the PiSSA adapter to a normal one."""
 
