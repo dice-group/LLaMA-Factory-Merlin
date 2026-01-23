@@ -14,6 +14,7 @@
 
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -333,43 +334,37 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
         self._save_adapter(kwargs.pop("model"), output_dir, args.save_safetensors)
 
 
-class SaveOnSignalCallback(TrainerCallback):
-    r"""Trigger a save + stop when receiving SIGTERM/USR1 (e.g., before SLURM timeout)."""
+class SaveAdapterMilestoneCallback(TrainerCallback):
+    r"""Copy adapter checkpoints to a milestones folder at fixed step intervals."""
 
     def __init__(self) -> None:
-        self._save_requested = False
-        self._orig_handlers: dict[int, Any] = {}
-
-    def _handle_signal(self, signum, frame) -> None:
-        if not self._save_requested:
-            logger.warning_rank0("SaveOnSignalCallback received signal %s.", signum)
-        self._save_requested = True
+        steps = os.environ.get("LLAMAFACTORY_ADAPTER_MILESTONE_STEPS", "0")
+        try:
+            self.milestone_steps = max(int(steps), 0)
+        except Exception:
+            self.milestone_steps = 0
 
     @override
-    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
-        for sig in (signal.SIGTERM, signal.SIGUSR1):
-            try:
-                self._orig_handlers[sig] = signal.getsignal(sig)
-                signal.signal(sig, self._handle_signal)
-            except Exception:
-                continue
-
-    @override
-    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
-        if self._save_requested:
-            if state.is_world_process_zero:
-                logger.warning_rank0("Signal received: requesting save and stop.")
-            control.should_save = True
-            control.should_training_stop = True
-        return control
-
-    @override
-    def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
-        for sig, handler in self._orig_handlers.items():
-            try:
-                signal.signal(sig, handler)
-            except Exception:
-                continue
+    def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if self.milestone_steps <= 0:
+            return
+        step = state.global_step
+        if step <= 0 or step % self.milestone_steps != 0:
+            return
+        if not state.is_world_process_zero:
+            return
+        adapter_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{step}_adapter")
+        if not os.path.isdir(adapter_dir):
+            logger.warning_rank0("Milestone adapter save skipped; adapter dir missing: %s", adapter_dir)
+            return
+        milestones_dir = os.path.join(args.output_dir, "milestones")
+        os.makedirs(milestones_dir, exist_ok=True)
+        dest_dir = os.path.join(milestones_dir, f"step-{step}_adapter")
+        if os.path.exists(dest_dir):
+            logger.warning_rank0("Milestone adapter already exists, skipping: %s", dest_dir)
+            return
+        shutil.copytree(adapter_dir, dest_dir, dirs_exist_ok=False)
+        logger.info_rank0("Milestone adapter saved at: %s", dest_dir)
 
 
 class PissaConvertCallback(TrainerCallback):
