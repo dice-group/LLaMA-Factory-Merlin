@@ -341,6 +341,8 @@ class SaveOnSignalCallback(TrainerCallback):
         self._orig_handlers: dict[int, Any] = {}
 
     def _handle_signal(self, signum, frame) -> None:
+        if not self._save_requested:
+            logger.warning_rank0("SaveOnSignalCallback received signal %s.", signum)
         self._save_requested = True
 
     @override
