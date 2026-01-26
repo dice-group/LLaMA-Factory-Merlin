@@ -365,6 +365,16 @@ class SaveAdapterMilestoneCallback(TrainerCallback):
             return
         shutil.copytree(adapter_dir, dest_dir, dirs_exist_ok=False)
         logger.info_rank0("Milestone adapter saved at: %s", dest_dir)
+        checkpoint_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{step}")
+        if not os.path.isdir(checkpoint_dir):
+            logger.warning_rank0("Milestone full save skipped; checkpoint dir missing: %s", checkpoint_dir)
+            return
+        full_dest_dir = os.path.join(milestones_dir, f"step-{step}_full")
+        if os.path.exists(full_dest_dir):
+            logger.warning_rank0("Milestone full checkpoint already exists, skipping: %s", full_dest_dir)
+            return
+        shutil.copytree(checkpoint_dir, full_dest_dir, dirs_exist_ok=False)
+        logger.info_rank0("Milestone full checkpoint saved at: %s", full_dest_dir)
 
 
 class PissaConvertCallback(TrainerCallback):
