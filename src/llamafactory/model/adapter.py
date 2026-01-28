@@ -376,6 +376,10 @@ def _setup_lora_tuning(
         and getattr(model_args, "compute_dtype", None) in (torch.float16, torch.bfloat16)
     ):
         target_dtype = model_args.compute_dtype
+        if finetuning_args.finetuning_type == "moelpr":
+            for name, param in model.named_parameters():
+                if "moe_" in name and param.dtype != target_dtype:
+                    param.data = param.data.to(target_dtype)
         for param in filter(lambda p: p.requires_grad, model.parameters()):
             if param.dtype != target_dtype:
                 param.data = param.data.to(target_dtype)
