@@ -39,6 +39,7 @@ from .lora import (
 )
 from .miss import MissConfig, MissModel
 from .mixed import MixedModel
+from .moelora import MoELoraConfig, MoELoraModel
 from .moelpr import MoeConfig as MoelprConfig, MoeModel as MoelprModel
 from .multitask_prompt_tuning import MultitaskPromptEmbedding, MultitaskPromptTuningConfig, MultitaskPromptTuningInit
 from .oft import OFTConfig, OFTModel
@@ -93,6 +94,8 @@ __all__ = [
     "MissConfig",
     "MissModel",
     "MixedModel",
+    "MoELoraConfig",
+    "MoELoraModel",
     "MolaConfig",
     "MolaModel",
     "MoelprConfig",
