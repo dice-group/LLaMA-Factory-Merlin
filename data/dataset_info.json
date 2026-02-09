@@ -151,6 +151,32 @@
     "hf_hub_url": "sahil2801/CodeAlpaca-20k",
     "ms_hub_url": "AI-ModelScope/CodeAlpaca-20k"
   },
+  "dolly_15k_en": {
+    "hf_hub_url": "databricks/databricks-dolly-15k",
+    "columns": {
+      "prompt": "instruction",
+      "query": "context",
+      "response": "response"
+    }
+  },
+  "gsm8k_train": {
+    "hf_hub_url": "gsm8k",
+    "subset": "main",
+    "split": "train",
+    "columns": {
+      "prompt": "question",
+      "response": "answer"
+    }
+  },
+  "gsm8k_test": {
+    "hf_hub_url": "gsm8k",
+    "subset": "main",
+    "split": "test",
+    "columns": {
+      "prompt": "question",
+      "response": "answer"
+    }
+  },
   "alpaca_cot": {
     "hf_hub_url": "QingyiSi/Alpaca-CoT",
     "ms_hub_url": "AI-ModelScope/Alpaca-CoT"
