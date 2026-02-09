@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from ..lora import LoraLayer
+from ...metrics import record_movlora_metrics
 
 
 class MovLoraLayer(LoraLayer, ABC):
@@ -135,6 +136,59 @@ class MovLoraLayer(LoraLayer, ABC):
 
         return probs.reshape(*batch_shape, self.num_experts[adapter_name])
 
+    def _record_routing_metrics(self, adapter_name: str, routing: torch.Tensor) -> None:
+        with torch.no_grad():
+            num_experts = int(self.num_experts[adapter_name])
+            flat_routing = routing.detach().to(torch.float32).reshape(-1, num_experts)
+            token_count = flat_routing.size(0)
+            if token_count == 0:
+                return
+
+            row_sum = flat_routing.sum(dim=-1)
+            active_mask = row_sum > 0
+            active_tokens = int(active_mask.sum().item())
+            zero_tokens = token_count - active_tokens
+
+            experts_per_token = (flat_routing > 0).sum(dim=-1).to(torch.float32)
+            expert_load = flat_routing.sum(dim=0)
+            mean_load = expert_load.mean().item()
+            if mean_load > 0:
+                load_cv = float((expert_load.std(unbiased=False) / (mean_load + 1e-6)).item())
+            else:
+                load_cv = 0.0
+
+            total_load = expert_load.sum().item()
+            if total_load > 0:
+                load_frac = expert_load / total_load
+                load_max = float(load_frac.max().item())
+                load_min = float(load_frac.min().item())
+            else:
+                load_max = 0.0
+                load_min = 0.0
+
+            if active_tokens > 0:
+                normalized = flat_routing[active_mask] / (row_sum[active_mask].unsqueeze(-1) + 1e-8)
+                entropy = float((-normalized * torch.log(normalized + 1e-8)).sum(dim=-1).mean().item())
+                max_prob = float(normalized.max(dim=-1).values.mean().item())
+            else:
+                entropy = 0.0
+                max_prob = 0.0
+
+            record_movlora_metrics(
+                {
+                    "active_token_pct": active_tokens / float(token_count),
+                    "zero_routed_pct": zero_tokens / float(token_count),
+                    "experts_per_token": float(experts_per_token.mean().item()),
+                    "expert_load_cv": load_cv,
+                    "expert_load_max_frac": load_max,
+                    "expert_load_min_frac": load_min,
+                    "router_entropy": entropy,
+                    "router_max_prob": max_prob,
+                    "topk_density": float(experts_per_token.mean().item()) / max(float(num_experts), 1.0),
+                },
+                weight=float(token_count),
+            )
+
 
 class LinearMovLoraLayer(nn.Module, MovLoraLayer):
     def __init__(
@@ -193,6 +247,8 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
 
             x_cast = x.to(self.lora_A[active_adapter][0].weight.dtype)
             routing = self._compute_routing_weights(active_adapter, x_cast)
+            if self.training:
+                self._record_routing_metrics(active_adapter, routing)
             scale = self.scaling[active_adapter]
 
             for expert_idx in range(self.num_experts[active_adapter]):

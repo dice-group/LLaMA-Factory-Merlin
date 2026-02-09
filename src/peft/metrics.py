@@ -190,6 +190,10 @@ def record_hydralora_metrics(metrics: Dict[str, float], weight: float) -> None:
     _SCALAR_STORE.update("hydralora", metrics, weight)
 
 
+def record_movlora_metrics(metrics: Dict[str, float], weight: float) -> None:
+    _SCALAR_STORE.update("movlora", metrics, weight)
+
+
 def record_moelpr_language_routing(
     language_ids: Optional[torch.Tensor],
     selected_experts: torch.Tensor,
