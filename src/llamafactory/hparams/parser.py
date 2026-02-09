@@ -141,6 +141,7 @@ def _verify_model_args(
         "cola",
         "hydralora",
         "adamole",
+        "movlora",
         "mola",
         "moelpr",
     ]:

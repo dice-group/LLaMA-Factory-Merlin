@@ -64,7 +64,17 @@ def _training_function(config: dict[str, Any]) -> None:
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())
 
-    if finetuning_args.finetuning_type in ["lora", "adalora", "pissa", "hydralora", "cola", "adamole", "mola", "moelpr"]:
+    if finetuning_args.finetuning_type in [
+        "lora",
+        "adalora",
+        "pissa",
+        "hydralora",
+        "cola",
+        "adamole",
+        "movlora",
+        "mola",
+        "moelpr",
+    ]:
         callbacks.append(SaveAdapterCheckpointCallback())
         if os.environ.get("LLAMAFACTORY_ADAPTER_MILESTONE_STEPS"):
             callbacks.append(SaveAdapterMilestoneCallback())

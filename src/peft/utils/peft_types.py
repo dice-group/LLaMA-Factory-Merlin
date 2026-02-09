@@ -42,6 +42,7 @@ class PeftType(str, enum.Enum):
     - FOURIERFT
     - HRA
     - ADAMOLE
+    - MOVLORA
     - MOLA
     - MOELPR
     - BONE
@@ -72,6 +73,7 @@ class PeftType(str, enum.Enum):
     XLORA = "XLORA"
     HRA = "HRA"
     ADAMOLE = "ADAMOLE"
+    MOVLORA = "MOVLORA"
     MOLA = "MOLA"
     MOELPR = "MOELPR"
     VBLORA = "VBLORA"
