@@ -22,7 +22,7 @@ class MoELoraModel(LoraModel):
     def __init__(self, model: nn.Module, config: MoELoraConfig, adapter_name: str = "default") -> None:
         self.lora_task_embedding = None
         self.lora_gate = None
-        self._cached_task_ids = None
+        self._cached_routing_ids = None
         super().__init__(model, config, adapter_name)
         self.lora_task_embedding = nn.ModuleDict({})
         self.lora_gate = nn.ModuleDict({})
@@ -34,12 +34,16 @@ class MoELoraModel(LoraModel):
 
     @contextmanager
     def _enable_peft_forward_hooks(self, *args, **kwargs):
-        self._cached_task_ids = kwargs.get("task_ids", None)
+        # MoE-LoRA in this fork reuses multilingual `language_ids` for routing.
+        # Keep 'task_ids' as a fallback for backward compatibility.
+        self._cached_routing_ids = kwargs.get("language_ids", None)
+        if self._cached_routing_ids is None:
+            self._cached_routing_ids = kwargs.get("task_ids", None)
         try:
             with super()._enable_peft_forward_hooks(*args, **kwargs):
                 yield
         finally:
-            self._cached_task_ids = None
+            self._cached_routing_ids = None
 
     def _ensure_shared_gate(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
         if self.lora_task_embedding is None or self.lora_gate is None:
@@ -60,47 +64,55 @@ class MoELoraModel(LoraModel):
             self.lora_task_embedding[adapter_name].to(device)
             self.lora_gate[adapter_name].to(device)
 
-    def _sanitize_task_ids(self, task_ids: Any, batch_size: int, task_num: int, device: torch.device) -> torch.Tensor:
-        if task_ids is None:
+    def _sanitize_routing_ids(
+        self, routing_ids: Any, batch_size: int, routing_id_count: int, device: torch.device
+    ) -> torch.Tensor:
+        if routing_ids is None:
             return torch.zeros(batch_size, dtype=torch.long, device=device)
 
-        if not torch.is_tensor(task_ids):
-            task_ids = torch.tensor(task_ids, device=device)
+        if not torch.is_tensor(routing_ids):
+            routing_ids = torch.tensor(routing_ids, device=device)
         else:
-            task_ids = task_ids.to(device)
+            routing_ids = routing_ids.to(device)
 
-        if task_ids.dim() == 0:
-            task_ids = task_ids.view(1)
+        if routing_ids.dim() == 0:
+            routing_ids = routing_ids.view(1)
 
-        if task_ids.dim() == 1:
-            if task_ids.numel() == 1 and batch_size > 1:
-                task_ids = task_ids.expand(batch_size)
-            elif task_ids.numel() != batch_size:
-                if task_ids.numel() > batch_size:
-                    task_ids = task_ids[:batch_size]
+        if routing_ids.dim() == 1:
+            if routing_ids.numel() == 1 and batch_size > 1:
+                routing_ids = routing_ids.expand(batch_size)
+            elif routing_ids.numel() != batch_size:
+                if routing_ids.numel() > batch_size:
+                    routing_ids = routing_ids[:batch_size]
                 else:
-                    task_ids = torch.cat(
-                        [task_ids, torch.zeros(batch_size - task_ids.numel(), dtype=task_ids.dtype, device=device)], dim=0
+                    routing_ids = torch.cat(
+                        [
+                            routing_ids,
+                            torch.zeros(batch_size - routing_ids.numel(), dtype=routing_ids.dtype, device=device),
+                        ],
+                        dim=0,
                     )
-            return torch.remainder(task_ids.long(), task_num)
+            return routing_ids.long()
 
-        # Multi-task weights: [batch_size, task_num]
-        if task_ids.shape[0] == 1 and batch_size > 1:
-            task_ids = task_ids.expand(batch_size, -1)
-        elif task_ids.shape[0] != batch_size:
-            if task_ids.shape[0] > batch_size:
-                task_ids = task_ids[:batch_size]
+        # Multi-task weights: [batch_size, routing_id_count]
+        if routing_ids.shape[0] == 1 and batch_size > 1:
+            routing_ids = routing_ids.expand(batch_size, -1)
+        elif routing_ids.shape[0] != batch_size:
+            if routing_ids.shape[0] > batch_size:
+                routing_ids = routing_ids[:batch_size]
             else:
-                pad = torch.zeros(batch_size - task_ids.shape[0], task_ids.shape[1], device=device, dtype=task_ids.dtype)
-                task_ids = torch.cat([task_ids, pad], dim=0)
+                pad = torch.zeros(
+                    batch_size - routing_ids.shape[0], routing_ids.shape[1], device=device, dtype=routing_ids.dtype
+                )
+                routing_ids = torch.cat([routing_ids, pad], dim=0)
 
-        if task_ids.shape[1] < task_num:
-            pad = torch.zeros(batch_size, task_num - task_ids.shape[1], device=device, dtype=task_ids.dtype)
-            task_ids = torch.cat([task_ids, pad], dim=1)
-        elif task_ids.shape[1] > task_num:
-            task_ids = task_ids[:, :task_num]
+        if routing_ids.shape[1] < routing_id_count:
+            pad = torch.zeros(batch_size, routing_id_count - routing_ids.shape[1], device=device, dtype=routing_ids.dtype)
+            routing_ids = torch.cat([routing_ids, pad], dim=1)
+        elif routing_ids.shape[1] > routing_id_count:
+            routing_ids = routing_ids[:, :routing_id_count]
 
-        return task_ids
+        return torch.relu(routing_ids.float())
 
     def get_routing_weights(
         self,
@@ -110,14 +122,18 @@ class MoELoraModel(LoraModel):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         config = self.peft_config[adapter_name]
-        task_ids = self._sanitize_task_ids(self._cached_task_ids, batch_size, config.task_num, device)
+        routing_ids = self._sanitize_routing_ids(self._cached_routing_ids, batch_size, config.task_num, device)
         task_embedder = self.lora_task_embedding[adapter_name]
         gate = self.lora_gate[adapter_name]
 
-        if task_ids.dim() == 1:
-            task_embeds = task_embedder(task_ids)
+        if routing_ids.dim() == 1:
+            valid = (routing_ids >= 0) & (routing_ids < config.task_num)
+            safe_ids = routing_ids.clamp(min=0, max=config.task_num - 1)
+            task_embeds = task_embedder(safe_ids)
+            if not torch.all(valid):
+                task_embeds = task_embeds * valid.unsqueeze(-1).to(task_embeds.dtype)
         else:
-            task_weights = task_ids.float()
+            task_weights = routing_ids
             denom = task_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
             task_weights = task_weights / denom
             task_embeds = task_weights @ task_embedder.weight

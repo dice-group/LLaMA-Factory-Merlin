@@ -666,11 +666,11 @@ class FinetuningArguments(
     )
     moelora_task_num: int = field(
         default=1,
-        metadata={"help": "Number of task ids for the shared MoE-LoRA gate."},
+        metadata={"help": "Number of routing ids for the shared MoE-LoRA gate (e.g., language ids)."},
     )
     moelora_task_embedding_dim: int = field(
         default=64,
-        metadata={"help": "Task embedding size used by the shared MoE-LoRA gate."},
+        metadata={"help": "Routing-id embedding size used by the shared MoE-LoRA gate."},
     )
     moelora_sparse_top_k: int = field(
         default=0,
