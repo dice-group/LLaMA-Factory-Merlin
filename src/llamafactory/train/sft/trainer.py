@@ -281,7 +281,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return None
 
         aux = weight * sum(losses) / len(losses)
-        record_cola_metrics({"language_prior_loss": float(aux.detach().mean().cpu())}, weight=1.0)
+        language_prior_loss = float(aux.detach().mean().cpu())
+        record_cola_metrics({"language_prior_loss": language_prior_loss}, weight=1.0)
+        # Keep parity with other auxiliary losses so trainer_state captures this signal.
+        self.log({"language_prior_loss": language_prior_loss})
         return aux
 
     def _compute_adamole_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
