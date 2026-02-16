@@ -169,15 +169,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ) -> "torch.Tensor":
         loss = super().training_step(model, inputs, *args, **kwargs)
 
-        if not hasattr(self, "_cola_router_params"):
-            module = getattr(model, "module", model)
-            self._cola_router_params = [
-                param for name, param in module.named_parameters() if "router.weight" in name
-            ]
-        total = len(self._cola_router_params)
-        present = sum(1 for param in self._cola_router_params if param.grad is not None)
-        frac = float(present / total) if total > 0 else 0.0
-        record_cola_metrics({"router_grad_present_frac": frac}, weight=1.0)
+        if self.finetuning_args.finetuning_type == "cola":
+            if not hasattr(self, "_cola_router_params"):
+                module = getattr(model, "module", model)
+                self._cola_router_params = [
+                    param for name, param in module.named_parameters() if "router.weight" in name
+                ]
+            total = len(self._cola_router_params)
+            present = sum(1 for param in self._cola_router_params if param.grad is not None)
+            frac = float(present / total) if total > 0 else 0.0
+            record_cola_metrics({"router_grad_present_frac": frac}, weight=1.0)
 
         return loss
 

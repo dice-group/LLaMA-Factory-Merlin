@@ -461,7 +461,7 @@ class FinetuningArguments(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
-    finetuning_type: Literal["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mola", "moelpr"] = field(
+    finetuning_type: Literal["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "mola", "moelpr"] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
     )
@@ -660,6 +660,26 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Enable verbose AdaMoLE routing diagnostics."},
     )
+    moelora_num_experts: int = field(
+        default=8,
+        metadata={"help": "Number of LoRA experts per adapted module in MoE-LoRA."},
+    )
+    moelora_task_num: int = field(
+        default=1,
+        metadata={"help": "Number of routing ids for the shared MoE-LoRA gate (e.g., language ids)."},
+    )
+    moelora_task_embedding_dim: int = field(
+        default=64,
+        metadata={"help": "Routing-id embedding size used by the shared MoE-LoRA gate."},
+    )
+    moelora_sparse_top_k: int = field(
+        default=0,
+        metadata={"help": "Optional sparse top-k routing for MoE-LoRA gate (<=0 means dense softmax)."},
+    )
+    moelora_gate_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Softmax temperature used in MoE-LoRA gate routing."},
+    )
     language_column: Optional[str] = field(
         default=None,
         init=False,
@@ -735,7 +755,7 @@ class FinetuningArguments(
         if self.cola_strategy == "random":
             self.cola_strategy = "random_ab"
 
-        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mola", "moelpr"]
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "mola", "moelpr"]
         assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
@@ -748,10 +768,24 @@ class FinetuningArguments(
             if self.moelpr_stage == 2 and not self.moelpr_original_language:
                 raise ValueError("`moelpr_original_language` is required for Stage 2 training.")
 
+        if self.finetuning_type == "moelora":
+            if self.moelora_num_experts <= 0:
+                raise ValueError("`moelora_num_experts` must be positive.")
+            if self.moelora_task_num <= 0:
+                raise ValueError("`moelora_task_num` must be positive.")
+            if self.moelora_task_embedding_dim <= 0:
+                raise ValueError("`moelora_task_embedding_dim` must be positive.")
+            if self.moelora_sparse_top_k < 0 or self.moelora_sparse_top_k > self.moelora_num_experts:
+                raise ValueError("`moelora_sparse_top_k` must be in range [0, moelora_num_experts].")
+            if self.moelora_gate_temperature <= 0:
+                raise ValueError("`moelora_gate_temperature` must be positive.")
+            if self.lora_rank % self.moelora_num_experts != 0:
+                raise ValueError("`lora_rank` must be divisible by `moelora_num_experts` for MoE-LoRA.")
+
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
 
-        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "mola", "moelpr"]
+        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "moelora", "mola", "moelpr"]
 
         if self.stage == "ppo" and self.reward_model_type == "lora" and not lora_like:
             raise ValueError("`reward_model_type` cannot be lora for Freeze/Full PPO training.")
