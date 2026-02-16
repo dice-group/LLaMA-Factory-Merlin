@@ -824,6 +824,8 @@ class Linear(nn.Module, ColaLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         language_ids = kwargs.pop("language_ids", None)
+        if language_ids is None:
+            language_ids = getattr(self, "language_ids", None)
         if isinstance(language_ids, torch.Tensor):
             language_ids = language_ids.to(x.device).long()
             if language_ids.dim() > 1:

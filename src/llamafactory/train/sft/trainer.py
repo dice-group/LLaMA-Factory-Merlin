@@ -118,6 +118,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def compute_loss(
         self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"], return_outputs: bool = False, **kwargs
     ) -> Union["torch.Tensor", Tuple["torch.Tensor", Any]]:
+        self._inject_language_router_inputs(model, inputs)
+
         if (
             self.finetuning_args.finetuning_type == "moelpr"
             and self.finetuning_args.moelpr_stage == 2
@@ -368,6 +370,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if mask.size(1) == 1:
             mask = mask.expand(-1, seq_len)
         return mask
+
+    def _inject_language_router_inputs(self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"]) -> None:
+        if self.finetuning_args.finetuning_type not in {"cola", "hydralora"}:
+            return
+
+        language_ids = inputs.get("language_ids")
+        module = getattr(model, "module", model)
+        routed_modules = getattr(self, "_language_routed_modules", None)
+        if routed_modules is None:
+            routed_modules = [
+                submodule
+                for submodule in module.modules()
+                if hasattr(submodule, "language_guidance_scope") and hasattr(submodule, "base_layer")
+            ]
+            self._language_routed_modules = routed_modules
+            if routed_modules:
+                logger.info_rank0(
+                    f"[LPR] Found {len(routed_modules)} language-routed adapter layers; injecting language_ids per batch."
+                )
+
+        if language_ids is None:
+            for routed_module in routed_modules:
+                setattr(routed_module, "language_ids", None)
+            return
+
+        for routed_module in routed_modules:
+            setattr(routed_module, "language_ids", language_ids)
 
     def _flush_language_router_cache(self) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
         caches: list[tuple[str, torch.Tensor, torch.Tensor]] = []
