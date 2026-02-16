@@ -461,7 +461,9 @@ class FinetuningArguments(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
-    finetuning_type: Literal["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "mola", "moelpr"] = field(
+    finetuning_type: Literal[
+        "lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "movlora", "mola", "moelpr"
+    ] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
     )
@@ -680,6 +682,34 @@ class FinetuningArguments(
         default=1.0,
         metadata={"help": "Softmax temperature used in MoE-LoRA gate routing."},
     )
+    movlora_num_experts: int = field(
+        default=8,
+        metadata={"help": "Number of LoRA experts per adapted module in MoV-LoRA."},
+    )
+    movlora_top_k: int = field(
+        default=0,
+        metadata={"help": "Optional sparse top-k routing for MoV-LoRA (<=0 means dense soft routing)."},
+    )
+    movlora_router_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Softmax temperature used in MoV-LoRA token routing."},
+    )
+    movlora_router_jitter_noise: float = field(
+        default=0.0,
+        metadata={"help": "Multiplicative jitter noise amplitude for MoV-LoRA router inputs."},
+    )
+    movlora_router_bias: bool = field(
+        default=False,
+        metadata={"help": "Whether to use bias in MoV-LoRA router projection layers."},
+    )
+    movlora_router_init_std: float = field(
+        default=2e-2,
+        metadata={"help": "Router weight initialization stddev for MoV-LoRA."},
+    )
+    movlora_router_ignore_padding_tokens: bool = field(
+        default=False,
+        metadata={"help": "Mask all-zero token states when computing MoV-LoRA routing probabilities."},
+    )
     language_column: Optional[str] = field(
         default=None,
         init=False,
@@ -755,7 +785,7 @@ class FinetuningArguments(
         if self.cola_strategy == "random":
             self.cola_strategy = "random_ab"
 
-        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "mola", "moelpr"]
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "movlora", "mola", "moelpr"]
         assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
@@ -782,10 +812,22 @@ class FinetuningArguments(
             if self.lora_rank % self.moelora_num_experts != 0:
                 raise ValueError("`lora_rank` must be divisible by `moelora_num_experts` for MoE-LoRA.")
 
+        if self.finetuning_type == "movlora":
+            if self.movlora_num_experts <= 0:
+                raise ValueError("`movlora_num_experts` must be positive.")
+            if self.movlora_top_k < 0 or self.movlora_top_k > self.movlora_num_experts:
+                raise ValueError("`movlora_top_k` must be in range [0, movlora_num_experts].")
+            if self.movlora_router_temperature <= 0:
+                raise ValueError("`movlora_router_temperature` must be positive.")
+            if self.movlora_router_jitter_noise < 0:
+                raise ValueError("`movlora_router_jitter_noise` must be non-negative.")
+            if self.movlora_router_init_std < 0:
+                raise ValueError("`movlora_router_init_std` must be non-negative.")
+
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
 
-        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "moelora", "mola", "moelpr"]
+        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "moelora", "movlora", "mola", "moelpr"]
 
         if self.stage == "ppo" and self.reward_model_type == "lora" and not lora_like:
             raise ValueError("`reward_model_type` cannot be lora for Freeze/Full PPO training.")
