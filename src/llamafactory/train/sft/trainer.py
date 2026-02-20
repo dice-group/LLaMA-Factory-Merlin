@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
-from peft.metrics import pop_tracked_metrics, record_cola_metrics
+from peft.metrics import pop_tracked_metrics, record_cola_metrics, record_hydralora_metrics
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
@@ -285,7 +285,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         aux = weight * sum(losses) / len(losses)
         language_prior_loss = float(aux.detach().mean().cpu())
-        record_cola_metrics({"language_prior_loss": language_prior_loss}, weight=1.0)
+        if self.finetuning_args.finetuning_type == "hydralora":
+            record_hydralora_metrics({"language_prior_loss": language_prior_loss}, weight=1.0)
+        else:
+            record_cola_metrics({"language_prior_loss": language_prior_loss}, weight=1.0)
         # Keep parity with other auxiliary losses so trainer_state captures this signal.
         self.log({"language_prior_loss": language_prior_loss})
         return aux
