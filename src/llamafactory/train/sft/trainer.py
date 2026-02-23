@@ -130,6 +130,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 inputs["lang_mask"] = mask
 
         base = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        base_loss = base[0] if return_outputs else base
         extra_losses = []
 
         language_loss = self._compute_language_prior_loss()
@@ -147,6 +148,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         moelpr_loss = self._compute_moelpr_aux_loss(model)
         if moelpr_loss is not None:
             extra_losses.append(moelpr_loss)
+
+        hmora_loss = self._compute_hmora_aux_loss(model, base_loss)
+        if hmora_loss is not None:
+            extra_losses.append(hmora_loss)
 
         if not extra_losses:
             return base
@@ -358,6 +363,34 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         self.log({"moelpr_aux_loss": float(aux.detach().mean().cpu())})
         return aux
+
+    def _compute_hmora_aux_loss(
+        self, model: "torch.nn.Module", base_loss: "torch.Tensor"
+    ) -> Optional[torch.Tensor]:
+        if self.finetuning_args.finetuning_type != "hmora":
+            return None
+
+        module = getattr(model, "module", model)
+        aux_fn = getattr(module, "get_aux_loss", None)
+        if not callable(aux_fn):
+            return None
+
+        lm_scale = float(getattr(self.finetuning_args, "hmora_lambda_lm", 1.0) or 1.0)
+        aux_scale = float(getattr(self.finetuning_args, "hmora_lambda_auxiliary", 0.0) or 0.0)
+
+        extra_terms = []
+        if lm_scale != 1.0:
+            extra_terms.append((lm_scale - 1.0) * base_loss)
+
+        aux = aux_fn()
+        if aux is not None and aux_scale > 0:
+            scaled_aux = aux_scale * aux
+            self.log({"hmora_aux_loss": float(scaled_aux.detach().mean().cpu())})
+            extra_terms.append(scaled_aux)
+
+        if not extra_terms:
+            return None
+        return sum(extra_terms)
 
     def _maybe_build_moelpr_mask(self, inputs: Dict[str, "torch.Tensor"]) -> Optional["torch.Tensor"]:
         target_id = getattr(self.finetuning_args, "moelpr_target_language_id", None)

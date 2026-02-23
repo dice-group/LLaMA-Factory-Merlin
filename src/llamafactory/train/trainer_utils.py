@@ -407,6 +407,51 @@ def _create_loraplus_optimizer(
     return optimizer
 
 
+def _create_hmora_optimizer(
+    model: "PreTrainedModel",
+    training_args: "TrainingArguments",
+    finetuning_args: "FinetuningArguments",
+) -> "torch.optim.Optimizer":
+    default_lr = float(training_args.learning_rate)
+    hmora_b_lr = default_lr * float(finetuning_args.hmora_eta_b)
+    decay_param_names = _get_decay_parameter_names(model)
+
+    param_dict: dict[str, list[torch.nn.Parameter]] = {
+        "base_decay": [],
+        "base_nodecay": [],
+        "b_decay": [],
+        "b_nodecay": [],
+    }
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_b_matrix = "lora_B" in name
+        is_decay = name in decay_param_names
+        if is_b_matrix and is_decay:
+            param_dict["b_decay"].append(param)
+        elif is_b_matrix:
+            param_dict["b_nodecay"].append(param)
+        elif is_decay:
+            param_dict["base_decay"].append(param)
+        else:
+            param_dict["base_nodecay"].append(param)
+
+    optim_class, optim_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
+    param_groups = [
+        dict(params=param_dict["base_nodecay"], lr=default_lr, weight_decay=0.0),
+        dict(params=param_dict["base_decay"], lr=default_lr, weight_decay=training_args.weight_decay),
+        dict(params=param_dict["b_nodecay"], lr=hmora_b_lr, weight_decay=0.0),
+        dict(params=param_dict["b_decay"], lr=hmora_b_lr, weight_decay=training_args.weight_decay),
+    ]
+    param_groups = [group for group in param_groups if group["params"]]
+
+    optimizer = optim_class(param_groups, **optim_kwargs)
+    logger.info_rank0(
+        f"Using HMoRA optimizer with eta_b={finetuning_args.hmora_eta_b:.4f} (B-matrix lr={hmora_b_lr:.6g})."
+    )
+    return optimizer
+
+
 def _create_badam_optimizer(
     model: "PreTrainedModel",
     training_args: "TrainingArguments",
@@ -532,6 +577,9 @@ def create_custom_optimizer(
 
     if finetuning_args.use_apollo:
         return _create_apollo_optimizer(model, training_args, finetuning_args)
+
+    if finetuning_args.finetuning_type == "hmora" and finetuning_args.hmora_eta_b != 1.0:
+        return _create_hmora_optimizer(model, training_args, finetuning_args)
 
     if finetuning_args.loraplus_lr_ratio is not None:
         return _create_loraplus_optimizer(model, training_args, finetuning_args)

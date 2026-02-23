@@ -1845,7 +1845,15 @@ class PeftModelForCausalLM(PeftModel):
             if peft_config.peft_type == PeftType.POLY:
                 kwargs["task_ids"] = task_ids
 
-            with self._enable_peft_forward_hooks(**kwargs):
+            hook_kwargs = dict(kwargs)
+            if input_ids is not None:
+                hook_kwargs["input_ids"] = input_ids
+            if attention_mask is not None:
+                hook_kwargs["attention_mask"] = attention_mask
+            if inputs_embeds is not None:
+                hook_kwargs["inputs_embeds"] = inputs_embeds
+
+            with self._enable_peft_forward_hooks(**hook_kwargs):
                 kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
                 return self.base_model(
                     input_ids=input_ids,

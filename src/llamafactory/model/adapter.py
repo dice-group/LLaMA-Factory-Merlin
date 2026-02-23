@@ -21,6 +21,7 @@ import torch
 from peft import (
     AdaMoleConfig,
     ColaConfig,
+    HMoRaConfig,
     HydraLoraConfig,
     LoraConfig,
     LoraModel,
@@ -33,6 +34,7 @@ from peft import (
     TaskType,
     get_peft_model,
 )
+from transformers import AutoTokenizer
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from ..extras import logging
@@ -90,6 +92,47 @@ def _parse_optional_int_list(value: Optional[Union[str, Sequence[int]]]) -> Opti
     for item in items:
         parsed.append(int(item))
     return parsed
+
+
+def _resolve_hmora_task_token_id(
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+) -> Optional[int]:
+    explicit_id = getattr(finetuning_args, "hmora_task_token_id", None)
+    if explicit_id is not None:
+        return int(explicit_id)
+
+    task_token = str(getattr(finetuning_args, "hmora_task_token", "?") or "?").strip()
+    if not task_token:
+        return None
+
+    tokenizer_source = str(getattr(model_args, "model_name_or_path", "") or "").strip()
+    if not tokenizer_source:
+        return None
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.hf_hub_token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+    except Exception as exc:
+        logger.warning_rank0(f"HMoRA: failed to load tokenizer for task token lookup: {exc}")
+        return None
+
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(task_token)
+    except Exception as exc:
+        logger.warning_rank0(f"HMoRA: task token id lookup failed for `{task_token}`: {exc}")
+        return None
+
+    if isinstance(token_id, int) and token_id >= 0:
+        return int(token_id)
+
+    logger.warning_rank0(f"HMoRA: task token `{task_token}` has no valid token id; task embedding will use random init.")
+    return None
 
 
 def _setup_full_tuning(
@@ -1151,6 +1194,141 @@ def _setup_movlora_tuning(
     return model
 
 
+def _setup_hmora_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if finetuning_args.use_dora:
+        raise ValueError("HMoRA currently does not support DoRA.")
+    if finetuning_args.pissa_init:
+        raise ValueError("HMoRA currently does not support PiSSA initialization.")
+    if model_args.use_unsloth or model_args.use_kt:
+        raise ValueError("HMoRA is not compatible with KTransformers or Unsloth.")
+
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: HMoRA")
+
+    adapter_to_resume = None
+
+    if model_args.adapter_name_or_path is not None:
+        is_mergeable = True
+        if getattr(model, "quantization_method", None):
+            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
+            is_mergeable = False
+
+        if is_deepspeed_zero3_enabled():
+            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
+            is_mergeable = False
+
+        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
+            adapter_to_merge = model_args.adapter_name_or_path[:-1]
+            adapter_to_resume = model_args.adapter_name_or_path[-1]
+        else:
+            adapter_to_merge = model_args.adapter_name_or_path
+
+        init_kwargs = {
+            "subfolder": model_args.adapter_folder,
+            "offload_folder": model_args.offload_folder,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+        for adapter in adapter_to_merge:
+            model: "LoraModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            model = model.merge_and_unload()
+
+        if len(adapter_to_merge) > 0:
+            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
+
+        if adapter_to_resume is not None:
+            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+
+        logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+
+    if is_trainable and adapter_to_resume is None:
+        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+        else:
+            target_modules = finetuning_args.lora_target
+
+        if finetuning_args.use_llama_pro:
+            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+        target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        if model_args.resize_vocab and finetuning_args.additional_target is None:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            module_names = set()
+            for name, module in model.named_modules():
+                if module in [input_embeddings, output_embeddings]:
+                    module_names.add(name.split(".")[-1])
+
+            finetuning_args.additional_target = module_names
+            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        model_type = getattr(config, "model_type", None)
+        share_router_for_qkv = bool(finetuning_args.hmora_share_router_for_qkv or model_type == "bloom")
+        hidden_size = (
+            getattr(config, "hidden_size", None)
+            or getattr(config, "n_embd", None)
+            or getattr(getattr(config, "text_config", None), "hidden_size", None)
+        )
+        task_token_id = _resolve_hmora_task_token_id(model_args, finetuning_args)
+
+        hmora_config = HMoRaConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=finetuning_args.lora_rank,
+            target_modules=target_modules,
+            lora_alpha=finetuning_args.lora_alpha,
+            lora_dropout=finetuning_args.lora_dropout,
+            modules_to_save=finetuning_args.additional_target,
+            hidden_size=hidden_size,
+            model_type=model_type,
+            torch_dtype=model.dtype,
+            dropout=finetuning_args.hmora_dropout,
+            num_experts=finetuning_args.hmora_num_experts,
+            use_hydra_lora=finetuning_args.hmora_use_hydra_lora,
+            top_k_routing_strategy=finetuning_args.hmora_top_k_routing_strategy,
+            top_k=finetuning_args.hmora_top_k,
+            use_task_router=finetuning_args.hmora_use_task_router,
+            task_router_only=finetuning_args.hmora_task_router_only,
+            share_router_for_qkv=share_router_for_qkv,
+            share_router_for_w_i=finetuning_args.hmora_share_router_for_w_i,
+            num_router_mlp_layers=finetuning_args.hmora_num_router_mlp_layers,
+            router_hidden_dim=finetuning_args.hmora_router_hidden_dim,
+            epsilon_alpha=finetuning_args.hmora_epsilon_alpha,
+            alpha_shift=finetuning_args.hmora_alpha_shift,
+            alpha_low_bound=finetuning_args.hmora_alpha_low_bound,
+            alpha_up_bound=finetuning_args.hmora_alpha_up_bound,
+            use_load_balancing_loss=finetuning_args.hmora_use_load_balancing_loss,
+            use_div_loss=finetuning_args.hmora_use_div_loss,
+            gamma_div_certain_t=finetuning_args.hmora_gamma_div_certain_t,
+            gamma_div_balance_t=finetuning_args.hmora_gamma_div_balance_t,
+            gamma_div_certain_s=finetuning_args.hmora_gamma_div_certain_s,
+            gamma_div_balance_s=finetuning_args.hmora_gamma_div_balance_s,
+            lambda_auxiliary=finetuning_args.hmora_lambda_auxiliary,
+            lambda_lm=finetuning_args.hmora_lambda_lm,
+            eta_b=finetuning_args.hmora_eta_b,
+            target_modules_lora=finetuning_args.hmora_target_modules_lora,
+            task_token=finetuning_args.hmora_task_token,
+            task_token_id=task_token_id,
+            num_encoder_layer=finetuning_args.hmora_num_encoder_layer,
+        )
+        model = get_peft_model(model, hmora_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
 def _setup_mola_tuning(
     config: "PretrainedConfig",
     model: "PreTrainedModel",
@@ -1398,6 +1576,10 @@ def init_adapter(
         )
     elif finetuning_args.finetuning_type == "movlora":
         model = _setup_movlora_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "hmora":
+        model = _setup_hmora_tuning(
             config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
         )
     elif finetuning_args.finetuning_type == "mola":

@@ -92,6 +92,7 @@ def get_peft_model_state_dict(
         PeftType.ADAMOLE,
         PeftType.MOELORA,
         PeftType.MOVLORA,
+        PeftType.HMORA,
         PeftType.MOLA,
     ):
         # to_return = lora_state_dict(model, bias=model.peft_config.bias)

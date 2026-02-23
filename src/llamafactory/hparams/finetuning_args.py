@@ -462,7 +462,7 @@ class FinetuningArguments(
         metadata={"help": "Which stage will be performed in training."},
     )
     finetuning_type: Literal[
-        "lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "movlora", "mola", "moelpr"
+        "lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "movlora", "hmora", "mola", "moelpr"
     ] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
@@ -710,6 +710,120 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Mask all-zero token states when computing MoV-LoRA routing probabilities."},
     )
+    hmora_num_experts: int = field(
+        default=8,
+        metadata={"help": "Number of experts per adapted linear layer in HMoRA."},
+    )
+    # remove bc its usual lOra config
+    hmora_dropout: float = field(
+        default=0.1,
+        metadata={"help": "Dropout used by HMoRA experts, routers, and task encoder."},
+    )
+    hmora_top_k_routing_strategy: bool = field(
+        default=False,
+        metadata={"help": "Enable sparse top-k routing in HMoRA."},
+    )
+    hmora_top_k: int = field(
+        default=2,
+        metadata={"help": "Top-k value for HMoRA sparse routing."},
+    )
+    hmora_use_task_router: bool = field(
+        default=False,
+        metadata={"help": "Enable task-level routing in HMoRA."},
+    )
+    hmora_task_router_only: bool = field(
+        default=False,
+        metadata={"help": "Use task-router-only routing for all adapted modules in HMoRA."},
+    )
+    hmora_share_router_for_qkv: bool = field(
+        default=False,
+        metadata={"help": "Share one router across q/k/v projections per decoder layer."},
+    )
+    hmora_share_router_for_w_i: bool = field(
+        default=False,
+        metadata={"help": "Share one router across gate/up projections per decoder layer."},
+    )
+    hmora_num_router_mlp_layers: int = field(
+        default=1,
+        metadata={"help": "Router MLP depth for HMoRA."},
+    )
+    hmora_router_hidden_dim: int = field(
+        default=32,
+        metadata={"help": "Hidden width for multi-layer HMoRA routers."},
+    )
+    hmora_epsilon_alpha: float = field(
+        default=4.0,
+        metadata={"help": "Epsilon in hierarchical alpha schedule α(l)."},
+    )
+    hmora_alpha_shift: float = field(
+        default=-2.0,
+        metadata={"help": "Shift term in hierarchical alpha schedule α(l)."},
+    )
+    hmora_alpha_low_bound: float = field(
+        default=0.2,
+        metadata={"help": "When α(l) < beta_low, use token routing only."},
+    )
+    hmora_alpha_up_bound: float = field(
+        default=0.8,
+        metadata={"help": "When α(l) > beta_high, use task routing only."},
+    )
+    hmora_use_load_balancing_loss: bool = field(
+        default=False,
+        metadata={"help": "Use Switch-style load-balancing loss in HMoRA."},
+    )
+    hmora_use_div_loss: bool = field(
+        default=True,
+        metadata={"help": "Use constrained-GJS divergence auxiliary loss in HMoRA."},
+    )
+    hmora_gamma_div_certain_t: float = field(
+        default=0.4,
+        metadata={"help": "Token-router certainty coefficient γc."},
+    )
+    hmora_gamma_div_balance_t: float = field(
+        default=1.0,
+        metadata={"help": "Token-router balance coefficient γb."},
+    )
+    hmora_gamma_div_certain_s: float = field(
+        default=0.4,
+        metadata={"help": "Task-router certainty coefficient γc."},
+    )
+    hmora_gamma_div_balance_s: float = field(
+        default=1.0,
+        metadata={"help": "Task-router balance coefficient γb."},
+    )
+    hmora_lambda_auxiliary: float = field(
+        default=0.003,
+        metadata={"help": "Auxiliary loss weight λ for HMoRA."},
+    )
+    hmora_lambda_lm: float = field(
+        default=1.0,
+        metadata={"help": "Language modeling loss weight for HMoRA."},
+    )
+    hmora_use_hydra_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable Hydra-LoRA+ variant in HMoRA (share A across experts)."},
+    )
+    ## what is this
+    hmora_eta_b: float = field(
+        default=1.0,
+        metadata={"help": "Learning-rate multiplier for HMoRA expert matrix B (Hydra-LoRA+)."},
+    )
+    hmora_target_modules_lora: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional comma-separated modules using single LoRA in HMoRA (e.g., o_proj,down_proj)."},
+    )
+    hmora_task_token: str = field(
+        default="?",
+        metadata={"help": "Task token used to initialize HMoRA task embedding."},
+    )
+    hmora_task_token_id: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional explicit task token id; overrides token lookup."},
+    )
+    hmora_num_encoder_layer: int = field(
+        default=1,
+        metadata={"help": "Number of transformer layers in HMoRA task encoder."},
+    )
     language_column: Optional[str] = field(
         default=None,
         init=False,
@@ -782,10 +896,14 @@ class FinetuningArguments(
             self.cola_expert_num_B = self.cola_expert_num_B.strip() or None
         if isinstance(self.hydralora_expert_lora_nums, str):
             self.hydralora_expert_lora_nums = self.hydralora_expert_lora_nums.strip() or None
+        if isinstance(self.hmora_target_modules_lora, str):
+            self.hmora_target_modules_lora = self.hmora_target_modules_lora.strip() or None
+        if isinstance(self.hmora_task_token, str):
+            self.hmora_task_token = self.hmora_task_token.strip() or "?"
         if self.cola_strategy == "random":
             self.cola_strategy = "random_ab"
 
-        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "movlora", "mola", "moelpr"]
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "moelora", "movlora", "hmora", "mola", "moelpr"]
         assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
@@ -824,10 +942,35 @@ class FinetuningArguments(
             if self.movlora_router_init_std < 0:
                 raise ValueError("`movlora_router_init_std` must be non-negative.")
 
+        if self.finetuning_type == "hmora":
+            if self.hmora_num_experts <= 0:
+                raise ValueError("`hmora_num_experts` must be positive.")
+            if self.hmora_dropout < 0 or self.hmora_dropout >= 1:
+                raise ValueError("`hmora_dropout` must be in [0, 1).")
+            if self.hmora_num_router_mlp_layers <= 0:
+                raise ValueError("`hmora_num_router_mlp_layers` must be positive.")
+            if self.hmora_router_hidden_dim <= 0:
+                raise ValueError("`hmora_router_hidden_dim` must be positive.")
+            if self.hmora_num_encoder_layer <= 0:
+                raise ValueError("`hmora_num_encoder_layer` must be positive.")
+            if self.hmora_top_k_routing_strategy:
+                if self.hmora_top_k <= 0 or self.hmora_top_k > self.hmora_num_experts:
+                    raise ValueError("`hmora_top_k` must be in range [1, hmora_num_experts] when top-k routing is enabled.")
+            if self.hmora_alpha_low_bound > self.hmora_alpha_up_bound:
+                raise ValueError("`hmora_alpha_low_bound` cannot be greater than `hmora_alpha_up_bound`.")
+            if self.hmora_use_load_balancing_loss and self.hmora_use_div_loss:
+                raise ValueError("Choose only one HMoRA auxiliary objective: load-balancing or divergence.")
+            if self.hmora_task_router_only and not self.hmora_use_task_router:
+                raise ValueError("`hmora_task_router_only` requires `hmora_use_task_router=True`.")
+            if self.hmora_eta_b <= 0:
+                raise ValueError("`hmora_eta_b` must be positive.")
+            if self.hmora_eta_b != 1.0 and self.loraplus_lr_ratio is not None:
+                raise ValueError("`hmora_eta_b` cannot be combined with `loraplus_lr_ratio`.")
+
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
 
-        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "moelora", "movlora", "mola", "moelpr"]
+        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "moelora", "movlora", "hmora", "mola", "moelpr"]
 
         if self.stage == "ppo" and self.reward_model_type == "lora" and not lora_like:
             raise ValueError("`reward_model_type` cannot be lora for Freeze/Full PPO training.")
