@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 import torch
 
 from typing import Any
@@ -12,13 +13,14 @@ from peft.utils import (
     TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING,
     get_quantization_config,
 )
+from transformers.pytorch_utils import Conv1D
 
-from ..lora import LoraModel
+from ..ia3 import IA3Layer, IA3Model
 from .config import MovLoraConfig
 from .layer import LinearMovLoraLayer, MovLoraLayer
 
 
-class MovLoraModel(LoraModel):
+class MovLoraModel(IA3Model):
     prefix: str = "lora_"
 
     def __init__(self, model: nn.Module, config: MovLoraConfig, adapter_name: str = "default") -> None:
@@ -38,13 +40,10 @@ class MovLoraModel(LoraModel):
 
         is_feedforward = self._check_target_module_feedforward(movlora_config, current_key)
 
-        layer_kwargs = {
-            # Unused by MoV layer implementation; kept for compatibility with the
-            # existing LoraModel create/update call path.
-            "lora_rank": movlora_config.r,
-            "lora_alpha": movlora_config.lora_alpha,
-            "lora_dropout": movlora_config.lora_dropout,
-            "init_lora_weights": movlora_config.init_lora_weights,
+        kwargs = {
+            "fan_in_fan_out": movlora_config.fan_in_fan_out,
+            "init_ia3_weights": movlora_config.init_ia3_weights,
+            "is_feedforward": is_feedforward,
             "num_experts": movlora_config.num_experts,
             "router_top_k": movlora_config.router_top_k,
             "router_temperature": movlora_config.router_temperature,
@@ -52,15 +51,6 @@ class MovLoraModel(LoraModel):
             "router_bias": movlora_config.router_bias,
             "router_init_std": movlora_config.router_init_std,
             "router_ignore_padding_tokens": movlora_config.router_ignore_padding_tokens,
-            "use_rslora": movlora_config.use_rslora,
-            "is_feedforward": is_feedforward,
-        }
-
-        new_module_kwargs = {
-            **layer_kwargs,
-            "fan_in_fan_out": movlora_config.fan_in_fan_out,
-            "use_dora": False,
-            "ephemeral_gpu_offload": movlora_config.runtime_config.ephemeral_gpu_offload,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -68,12 +58,25 @@ class MovLoraModel(LoraModel):
         for quant_method in ("gptq", "aqlm", "awq"):
             quantization_config = get_quantization_config(self.model, method=quant_method)
             if quantization_config is not None:
-                new_module_kwargs[f"{quant_method}_quantization_config"] = quantization_config
+                kwargs[f"{quant_method}_quantization_config"] = quantization_config
 
         if isinstance(target, MovLoraLayer):
-            target.update_layer(adapter_name, **layer_kwargs)
+            target.update_layer(
+                adapter_name=adapter_name,
+                init_ia3_weights=movlora_config.init_ia3_weights,
+                num_experts=movlora_config.num_experts,
+                router_top_k=movlora_config.router_top_k,
+                router_temperature=movlora_config.router_temperature,
+                router_jitter_noise=movlora_config.router_jitter_noise,
+                router_bias=movlora_config.router_bias,
+                router_init_std=movlora_config.router_init_std,
+                router_ignore_padding_tokens=movlora_config.router_ignore_padding_tokens,
+                is_feedforward=is_feedforward,
+            )
+        elif isinstance(target, IA3Layer):
+            raise ValueError("Cannot reuse IA3 layers with MoV adapters.")
         else:
-            new_module = self._create_new_module(movlora_config, adapter_name, target, **new_module_kwargs)
+            new_module = self._create_new_module(movlora_config, adapter_name, target, **kwargs)
             if adapter_name not in self.active_adapters:
                 new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
@@ -91,7 +94,15 @@ class MovLoraModel(LoraModel):
             target_base_layer = target
 
         if isinstance(target_base_layer, torch.nn.Linear):
+            if kwargs.get("fan_in_fan_out", False):
+                warnings.warn(
+                    "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
+                    "Setting fan_in_fan_out to False."
+                )
+                kwargs["fan_in_fan_out"] = movlora_config.fan_in_fan_out = False
             return LinearMovLoraLayer(base_layer=target, adapter_name=adapter_name, **kwargs)
+        elif isinstance(target_base_layer, Conv1D):
+            raise ValueError("Conv1D targets are not supported for MoV in this implementation.")
 
         raise ValueError(
             f"Target module {target} is not supported. Currently, only `torch.nn.Linear` layers can be adapted with MoV-LoRA."

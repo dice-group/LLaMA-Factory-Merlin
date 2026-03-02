@@ -4,11 +4,11 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from ..lora import LoraLayer
+from ..ia3 import IA3Layer
 from ...metrics import record_movlora_metrics
 
 
-class MovLoraLayer(LoraLayer, ABC):
+class MovLoraLayer(IA3Layer, ABC):
     """MoV-style routed IA3-vector scaling layer.
 
     This keeps the layer wrapper and config plumbing from LoRA, but the adapted
@@ -22,11 +22,11 @@ class MovLoraLayer(LoraLayer, ABC):
         "router_temperature",
         "router_jitter_noise",
         "router_ignore_padding_tokens",
-        "is_feedforward",
+        "adapter_is_feedforward",
     )
 
-    def __init__(self, base_layer: nn.Module, **kwargs):
-        super().__init__(base_layer, **kwargs)
+    def __init__(self, base_layer: nn.Module, is_feedforward: bool = False, **kwargs):
+        IA3Layer.__init__(self, base_layer=base_layer, is_feedforward=is_feedforward, **kwargs)
         self.lora_router = nn.ModuleDict({})
         self.lora_mov_scaling = nn.ParameterDict({})
         self.num_experts = {}
@@ -34,15 +34,12 @@ class MovLoraLayer(LoraLayer, ABC):
         self.router_temperature = {}
         self.router_jitter_noise = {}
         self.router_ignore_padding_tokens = {}
-        self.is_feedforward = {}
+        self.adapter_is_feedforward = {}
 
     def update_layer(
         self,
         adapter_name: str,
-        lora_rank: int,
-        lora_alpha: int,
-        lora_dropout: float,
-        init_lora_weights: bool,
+        init_ia3_weights: bool,
         num_experts: int,
         router_top_k: int,
         router_temperature: float,
@@ -50,15 +47,8 @@ class MovLoraLayer(LoraLayer, ABC):
         router_bias: bool,
         router_init_std: float,
         router_ignore_padding_tokens: bool,
-        use_rslora: bool,
         is_feedforward: bool,
     ) -> None:
-        del lora_rank
-        del lora_alpha
-        del lora_dropout
-        del init_lora_weights
-        del use_rslora
-
         if num_experts <= 0:
             raise ValueError(f"`num_experts` must be positive, got {num_experts}.")
         if router_top_k < 0 or router_top_k > num_experts:
@@ -75,10 +65,14 @@ class MovLoraLayer(LoraLayer, ABC):
         self.router_temperature[adapter_name] = router_temperature
         self.router_jitter_noise[adapter_name] = router_jitter_noise
         self.router_ignore_padding_tokens[adapter_name] = router_ignore_padding_tokens
-        self.is_feedforward[adapter_name] = is_feedforward
+        self.adapter_is_feedforward[adapter_name] = is_feedforward
 
         mov_dim = self.in_features if is_feedforward else self.out_features
-        self.lora_mov_scaling[adapter_name] = nn.Parameter(torch.ones((num_experts, mov_dim), dtype=torch.float32))
+        if init_ia3_weights:
+            scaling = torch.ones((num_experts, mov_dim), dtype=torch.float32)
+        else:
+            scaling = torch.randn((num_experts, mov_dim), dtype=torch.float32)
+        self.lora_mov_scaling[adapter_name] = nn.Parameter(scaling)
         self.lora_router[adapter_name] = nn.Linear(self.in_features, num_experts, bias=router_bias)
 
         nn.init.normal_(self.lora_router[adapter_name].weight, std=router_init_std)
@@ -172,10 +166,10 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
         self,
         base_layer: nn.Module,
         adapter_name: str,
-        lora_rank: int = 0,
-        lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        init_lora_weights: bool = True,
+        fan_in_fan_out: bool = False,
+        is_feedforward: bool = False,
+        is_target_conv_1d_layer: bool = False,
+        init_ia3_weights: bool = True,
         num_experts: int = 30,
         router_top_k: int = 0,
         router_temperature: float = 1.0,
@@ -183,19 +177,16 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
         router_bias: bool = False,
         router_init_std: float = 2e-2,
         router_ignore_padding_tokens: bool = False,
-        use_rslora: bool = False,
-        is_feedforward: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
-        MovLoraLayer.__init__(self, base_layer=base_layer, **kwargs)
+        self.fan_in_fan_out = fan_in_fan_out
+        self.is_target_conv_1d_layer = is_target_conv_1d_layer
+        MovLoraLayer.__init__(self, base_layer=base_layer, is_feedforward=is_feedforward, **kwargs)
         self._active_adapter = adapter_name
         self.update_layer(
             adapter_name=adapter_name,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            init_lora_weights=init_lora_weights,
+            init_ia3_weights=init_ia3_weights,
             num_experts=num_experts,
             router_top_k=router_top_k,
             router_temperature=router_temperature,
@@ -203,7 +194,6 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
             router_bias=router_bias,
             router_init_std=router_init_std,
             router_ignore_padding_tokens=router_ignore_padding_tokens,
-            use_rslora=use_rslora,
             is_feedforward=is_feedforward,
         )
 
@@ -235,7 +225,7 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
             scaling_bank = self.lora_mov_scaling[active_adapter]
             mixed_scaling = torch.einsum("...e,ed->...d", routing.to(scaling_bank.dtype), scaling_bank)
 
-            if self.is_feedforward[active_adapter]:
+            if self.adapter_is_feedforward[active_adapter]:
                 adapter_scale = mixed_scaling.to(x.dtype)
                 input_scaling = adapter_scale if input_scaling is None else input_scaling * adapter_scale
             else:

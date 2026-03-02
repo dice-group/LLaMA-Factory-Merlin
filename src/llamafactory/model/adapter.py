@@ -1166,11 +1166,9 @@ def _setup_movlora_tuning(
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
         peft_kwargs = {
-            "r": finetuning_args.lora_rank,
             "target_modules": target_modules,
-            "lora_alpha": finetuning_args.lora_alpha,
-            "lora_dropout": finetuning_args.lora_dropout,
             "modules_to_save": finetuning_args.additional_target,
+            "init_ia3_weights": True,
         }
 
         movlora_config = MovLoraConfig(

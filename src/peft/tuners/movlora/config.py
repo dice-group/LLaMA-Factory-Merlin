@@ -1,12 +1,12 @@
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
-from ..lora import LoraConfig
+from ..ia3 import IA3Config
 from ...utils.peft_types import PeftType
 
 
 @dataclass
-class MovLoraConfig(LoraConfig):
+class MovLoraConfig(IA3Config):
     num_experts: int = field(default=30, metadata={"help": "Number of IA3-vector experts per adapted module."})
     feedforward_modules: Optional[Union[list[str], str]] = field(
         default=None,
