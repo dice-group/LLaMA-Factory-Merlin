@@ -104,7 +104,9 @@ def get_peft_model_state_dict(
         if config.peft_type == PeftType.HYDRALORA and getattr(config, "use_hydralora_experts", False):
             include_expert_keys = True
 
-        bias = config.bias
+        # Some LoRA-prefixed custom tuners (e.g. IA3-style MoV variants) may not expose
+        # a `bias` config field. Treat them as "none" by default.
+        bias = getattr(config, "bias", "none")
         if bias == "none":
             to_return = {k: state_dict[k] for k in state_dict if "lora_" in k}
         elif bias == "all":

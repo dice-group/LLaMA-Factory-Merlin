@@ -125,8 +125,13 @@ class MovLoraModel(IA3Model):
         if peft_config.feedforward_modules is None:
             if model_config["model_type"] not in TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING:
                 raise ValueError("Please specify `feedforward_modules` in `peft_config`")
-            peft_config.feedforward_modules = set(
-                TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING[model_config["model_type"]]
-            )
+            default_ff = set(TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING[model_config["model_type"]])
+            if isinstance(peft_config.target_modules, set):
+                # IA3 requires feedforward_modules <= target_modules. Keep only active target modules.
+                peft_config.feedforward_modules = default_ff.intersection(peft_config.target_modules)
+            else:
+                peft_config.feedforward_modules = default_ff
+        elif isinstance(peft_config.feedforward_modules, set) and isinstance(peft_config.target_modules, set):
+            peft_config.feedforward_modules = peft_config.feedforward_modules.intersection(peft_config.target_modules)
 
         return peft_config

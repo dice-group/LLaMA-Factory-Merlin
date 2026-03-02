@@ -1109,7 +1109,10 @@ def _setup_movlora_tuning(
     adapter_to_resume = None
 
     if model_args.adapter_name_or_path is not None:
-        is_mergeable = True
+        # MoV adapters are non-mergeable; load as PEFT adapters for both train and inference.
+        is_mergeable = False
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("MoV does not support loading multiple adapters because merge is unavailable.")
         if getattr(model, "quantization_method", None):
             assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
             is_mergeable = False
