@@ -683,32 +683,32 @@ class FinetuningArguments(
         metadata={"help": "Softmax temperature used in MoE-LoRA gate routing."},
     )
     movlora_num_experts: int = field(
-        default=8,
-        metadata={"help": "Number of LoRA experts per adapted module in MoV-LoRA."},
+        default=30,
+        metadata={"help": "Number of IA3-vector experts per adapted module in MoV."},
     )
     movlora_top_k: int = field(
         default=0,
-        metadata={"help": "Optional sparse top-k routing for MoV-LoRA (<=0 means dense soft routing)."},
+        metadata={"help": "Optional sparse top-k routing for MoV (<=0 means dense soft routing)."},
     )
     movlora_router_temperature: float = field(
         default=1.0,
-        metadata={"help": "Softmax temperature used in MoV-LoRA token routing."},
+        metadata={"help": "Softmax temperature used in MoV token routing."},
     )
     movlora_router_jitter_noise: float = field(
         default=0.0,
-        metadata={"help": "Multiplicative jitter noise amplitude for MoV-LoRA router inputs."},
+        metadata={"help": "Multiplicative jitter noise amplitude for MoV router inputs."},
     )
     movlora_router_bias: bool = field(
         default=False,
-        metadata={"help": "Whether to use bias in MoV-LoRA router projection layers."},
+        metadata={"help": "Whether to use bias in MoV router projection layers."},
     )
     movlora_router_init_std: float = field(
         default=2e-2,
-        metadata={"help": "Router weight initialization stddev for MoV-LoRA."},
+        metadata={"help": "Router weight initialization stddev for MoV."},
     )
     movlora_router_ignore_padding_tokens: bool = field(
         default=False,
-        metadata={"help": "Mask all-zero token states when computing MoV-LoRA routing probabilities."},
+        metadata={"help": "Mask all-zero token states when computing MoV routing probabilities."},
     )
     hmora_num_experts: int = field(
         default=8,

@@ -1097,14 +1097,14 @@ def _setup_movlora_tuning(
     cast_trainable_params_to_fp32: bool,
 ) -> "PeftModel":
     if finetuning_args.use_dora:
-        raise ValueError("MoV-LoRA currently does not support DoRA.")
+        raise ValueError("MoV currently does not support DoRA.")
     if finetuning_args.pissa_init:
-        raise ValueError("MoV-LoRA currently does not support PiSSA initialization.")
+        raise ValueError("MoV currently does not support PiSSA initialization.")
     if model_args.use_unsloth or model_args.use_kt:
-        raise ValueError("MoV-LoRA is not compatible with KTransformers or Unsloth.")
+        raise ValueError("MoV is not compatible with KTransformers or Unsloth.")
 
     if is_trainable:
-        logger.info_rank0("Fine-tuning method: MoV-LoRA")
+        logger.info_rank0("Fine-tuning method: MoV")
 
     adapter_to_resume = None
 

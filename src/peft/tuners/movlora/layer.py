@@ -1,4 +1,3 @@
-import math
 from abc import ABC
 from typing import Optional
 
@@ -10,25 +9,32 @@ from ...metrics import record_movlora_metrics
 
 
 class MovLoraLayer(LoraLayer, ABC):
-    _PAPER_LORA_A_STD = 2e-2
+    """MoV-style routed IA3-vector scaling layer.
 
-    adapter_layer_names = LoraLayer.adapter_layer_names + ("lora_router",)
-    other_param_names = LoraLayer.other_param_names + (
+    This keeps the layer wrapper and config plumbing from LoRA, but the adapted
+    computation is IA3-style multiplicative scaling mixed across experts.
+    """
+
+    adapter_layer_names = ("lora_router", "lora_mov_scaling")
+    other_param_names = (
         "num_experts",
         "router_top_k",
         "router_temperature",
         "router_jitter_noise",
         "router_ignore_padding_tokens",
+        "is_feedforward",
     )
 
     def __init__(self, base_layer: nn.Module, **kwargs):
         super().__init__(base_layer, **kwargs)
         self.lora_router = nn.ModuleDict({})
+        self.lora_mov_scaling = nn.ParameterDict({})
         self.num_experts = {}
         self.router_top_k = {}
         self.router_temperature = {}
         self.router_jitter_noise = {}
         self.router_ignore_padding_tokens = {}
+        self.is_feedforward = {}
 
     def update_layer(
         self,
@@ -45,9 +51,14 @@ class MovLoraLayer(LoraLayer, ABC):
         router_init_std: float,
         router_ignore_padding_tokens: bool,
         use_rslora: bool,
+        is_feedforward: bool,
     ) -> None:
-        if lora_rank <= 0:
-            raise ValueError(f"The rank `r` should be a positive integer value but got {lora_rank}.")
+        del lora_rank
+        del lora_alpha
+        del lora_dropout
+        del init_lora_weights
+        del use_rslora
+
         if num_experts <= 0:
             raise ValueError(f"`num_experts` must be positive, got {num_experts}.")
         if router_top_k < 0 or router_top_k > num_experts:
@@ -59,56 +70,23 @@ class MovLoraLayer(LoraLayer, ABC):
         if router_init_std < 0:
             raise ValueError(f"`router_init_std` must be non-negative, got {router_init_std}.")
 
-        self.r[adapter_name] = lora_rank
-        self.lora_alpha[adapter_name] = lora_alpha
         self.num_experts[adapter_name] = num_experts
         self.router_top_k[adapter_name] = router_top_k
         self.router_temperature[adapter_name] = router_temperature
         self.router_jitter_noise[adapter_name] = router_jitter_noise
         self.router_ignore_padding_tokens[adapter_name] = router_ignore_padding_tokens
+        self.is_feedforward[adapter_name] = is_feedforward
 
-        if lora_dropout > 0.0:
-            dropout_layers = nn.ModuleList([nn.Dropout(p=lora_dropout) for _ in range(num_experts)])
-        else:
-            dropout_layers = nn.ModuleList([nn.Identity() for _ in range(num_experts)])
-
-        self.lora_dropout[adapter_name] = dropout_layers
-        self.lora_A[adapter_name] = nn.ModuleList(
-            [nn.Linear(self.in_features, lora_rank, bias=False) for _ in range(num_experts)]
-        )
-        self.lora_B[adapter_name] = nn.ModuleList(
-            [nn.Linear(lora_rank, self.out_features, bias=False) for _ in range(num_experts)]
-        )
+        mov_dim = self.in_features if is_feedforward else self.out_features
+        self.lora_mov_scaling[adapter_name] = nn.Parameter(torch.ones((num_experts, mov_dim), dtype=torch.float32))
         self.lora_router[adapter_name] = nn.Linear(self.in_features, num_experts, bias=router_bias)
 
-        if use_rslora:
-            self.scaling[adapter_name] = lora_alpha / math.sqrt(lora_rank)
-        else:
-            self.scaling[adapter_name] = lora_alpha / lora_rank
-
-        self.reset_lora_parameters(adapter_name, init_lora_weights)
         nn.init.normal_(self.lora_router[adapter_name].weight, std=router_init_std)
         if self.lora_router[adapter_name].bias is not None:
             nn.init.zeros_(self.lora_router[adapter_name].bias)
 
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
-
-    def reset_lora_parameters(self, adapter_name: str, init_lora_weights) -> None:
-        if init_lora_weights is False:
-            return
-        if adapter_name not in self.lora_A:
-            return
-
-        for expert_idx in range(self.num_experts[adapter_name]):
-            if init_lora_weights is True:
-                # Paper-faithful default used by the original MoLoRA implementation.
-                nn.init.normal_(self.lora_A[adapter_name][expert_idx].weight, std=self._PAPER_LORA_A_STD)
-            elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "gaussian":
-                nn.init.normal_(self.lora_A[adapter_name][expert_idx].weight, std=1 / self.r[adapter_name])
-            else:
-                raise ValueError(f"Unsupported MoV-LoRA initialization: {init_lora_weights}")
-            nn.init.zeros_(self.lora_B[adapter_name][expert_idx].weight)
 
     def _compute_routing_weights(self, adapter_name: str, x: torch.Tensor) -> torch.Tensor:
         batch_shape = x.shape[:-1]
@@ -119,15 +97,14 @@ class MovLoraLayer(LoraLayer, ABC):
             flat_inputs = flat_inputs * torch.empty_like(flat_inputs).uniform_(1.0 - jitter_noise, 1.0 + jitter_noise)
 
         logits = self.lora_router[adapter_name](flat_inputs).float() / self.router_temperature[adapter_name]
-
         probs = torch.softmax(logits, dim=-1)
 
         top_k = self.router_top_k[adapter_name]
         if 0 < top_k < self.num_experts[adapter_name]:
-            # Match original MoLoRA behavior: mask probabilities after softmax.
             _, topk_indices = torch.topk(probs, k=top_k, dim=-1)
             topk_mask = torch.zeros_like(probs)
             topk_mask.scatter_(1, topk_indices, 1.0)
+            # Match original MoV/MoLoRA top-k behavior: post-softmax masking.
             probs = probs * topk_mask
 
         if self.router_ignore_padding_tokens[adapter_name]:
@@ -199,7 +176,7 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
         init_lora_weights: bool = True,
-        num_experts: int = 8,
+        num_experts: int = 30,
         router_top_k: int = 0,
         router_temperature: float = 1.0,
         router_jitter_noise: float = 0.0,
@@ -207,6 +184,7 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
         router_init_std: float = 2e-2,
         router_ignore_padding_tokens: bool = False,
         use_rslora: bool = False,
+        is_feedforward: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -226,36 +204,47 @@ class LinearMovLoraLayer(nn.Module, MovLoraLayer):
             router_init_std=router_init_std,
             router_ignore_padding_tokens=router_ignore_padding_tokens,
             use_rslora=use_rslora,
+            is_feedforward=is_feedforward,
         )
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
-        pass
+        del safe_merge
+        del adapter_names
+        raise NotImplementedError("MoV layers do not support merge/unmerge in this implementation.")
 
     def unmerge(self) -> None:
-        pass
+        raise NotImplementedError("MoV layers do not support merge/unmerge in this implementation.")
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         previous_dtype = x.dtype
-        result = self.base_layer(x, *args, **kwargs)
 
         if self.disable_adapters:
-            return result.to(previous_dtype)
+            return self.base_layer(x, *args, **kwargs).to(previous_dtype)
 
+        input_scaling = None
+        output_scaling = None
         for active_adapter in self.active_adapters:
-            if active_adapter not in self.lora_A:
+            if active_adapter not in self.lora_mov_scaling:
                 continue
 
-            x_cast = x.to(self.lora_A[active_adapter][0].weight.dtype)
+            x_cast = x.to(self.lora_router[active_adapter].weight.dtype)
             routing = self._compute_routing_weights(active_adapter, x_cast)
             if self.training:
                 self._record_routing_metrics(active_adapter, routing)
-            scale = self.scaling[active_adapter]
 
-            for expert_idx in range(self.num_experts[active_adapter]):
-                delta = self.lora_B[active_adapter][expert_idx](
-                    self.lora_A[active_adapter][expert_idx](self.lora_dropout[active_adapter][expert_idx](x_cast))
-                )
-                gate = routing[..., expert_idx].unsqueeze(-1).to(delta.dtype)
-                result = result + (delta * gate * scale).to(result.dtype)
+            scaling_bank = self.lora_mov_scaling[active_adapter]
+            mixed_scaling = torch.einsum("...e,ed->...d", routing.to(scaling_bank.dtype), scaling_bank)
+
+            if self.is_feedforward[active_adapter]:
+                adapter_scale = mixed_scaling.to(x.dtype)
+                input_scaling = adapter_scale if input_scaling is None else input_scaling * adapter_scale
+            else:
+                adapter_scale = mixed_scaling
+                output_scaling = adapter_scale if output_scaling is None else output_scaling * adapter_scale
+
+        scaled_input = x if input_scaling is None else x * input_scaling.to(x.dtype)
+        result = self.base_layer(scaled_input, *args, **kwargs)
+        if output_scaling is not None:
+            result = result * output_scaling.to(result.dtype)
 
         return result.to(previous_dtype)

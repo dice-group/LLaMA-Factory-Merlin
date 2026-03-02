@@ -3,12 +3,15 @@ from __future__ import annotations
 import re
 import torch
 
-from itertools import chain
 from typing import Any
 from torch import nn
 
 from peft.tuners.tuners_utils import BaseTunerLayer
-from peft.utils import get_quantization_config
+from peft.utils import (
+    TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING,
+    get_quantization_config,
+)
 
 from ..lora import LoraModel
 from .config import MovLoraConfig
@@ -33,14 +36,13 @@ class MovLoraModel(LoraModel):
         if current_key is None:
             raise ValueError("Current key shouldn't be `None`")
 
-        pattern_keys = list(chain(movlora_config.rank_pattern.keys(), movlora_config.alpha_pattern.keys()))
-        target_name_key = next((key for key in pattern_keys if re.match(rf".*\.{key}$", current_key)), current_key)
-        rank = movlora_config.rank_pattern.get(target_name_key, movlora_config.r)
-        alpha = movlora_config.alpha_pattern.get(target_name_key, movlora_config.lora_alpha)
+        is_feedforward = self._check_target_module_feedforward(movlora_config, current_key)
 
         layer_kwargs = {
-            "lora_rank": rank,
-            "lora_alpha": alpha,
+            # Unused by MoV layer implementation; kept for compatibility with the
+            # existing LoraModel create/update call path.
+            "lora_rank": movlora_config.r,
+            "lora_alpha": movlora_config.lora_alpha,
             "lora_dropout": movlora_config.lora_dropout,
             "init_lora_weights": movlora_config.init_lora_weights,
             "num_experts": movlora_config.num_experts,
@@ -51,6 +53,7 @@ class MovLoraModel(LoraModel):
             "router_init_std": movlora_config.router_init_std,
             "router_ignore_padding_tokens": movlora_config.router_ignore_padding_tokens,
             "use_rslora": movlora_config.use_rslora,
+            "is_feedforward": is_feedforward,
         }
 
         new_module_kwargs = {
@@ -93,3 +96,26 @@ class MovLoraModel(LoraModel):
         raise ValueError(
             f"Target module {target} is not supported. Currently, only `torch.nn.Linear` layers can be adapted with MoV-LoRA."
         )
+
+    @staticmethod
+    def _check_target_module_feedforward(movlora_config: MovLoraConfig, key: str) -> bool:
+        if isinstance(movlora_config.feedforward_modules, str):
+            return bool(re.fullmatch(movlora_config.feedforward_modules, key))
+
+        return any(key.endswith(target_key) for target_key in movlora_config.feedforward_modules)
+
+    @staticmethod
+    def _prepare_adapter_config(peft_config: MovLoraConfig, model_config: dict) -> MovLoraConfig:
+        if peft_config.target_modules is None:
+            if model_config["model_type"] not in TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING:
+                raise ValueError("Please specify `target_modules` in `peft_config`")
+            peft_config.target_modules = set(TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING[model_config["model_type"]])
+
+        if peft_config.feedforward_modules is None:
+            if model_config["model_type"] not in TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING:
+                raise ValueError("Please specify `feedforward_modules` in `peft_config`")
+            peft_config.feedforward_modules = set(
+                TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING[model_config["model_type"]]
+            )
+
+        return peft_config
