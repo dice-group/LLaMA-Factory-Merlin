@@ -75,6 +75,7 @@ class PeftType(str, enum.Enum):
     XLORA = "XLORA"
     HRA = "HRA"
     ADAMOLE = "ADAMOLE"
+    MIXLORA = "MIXLORA"
     MOELORA = "MOELORA"
     MOVLORA = "MOVLORA"
     HMORA = "HMORA"

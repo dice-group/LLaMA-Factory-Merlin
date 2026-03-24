@@ -40,6 +40,7 @@ from .lora import (
 )
 from .miss import MissConfig, MissModel
 from .mixed import MixedModel
+from .mixlora import MixLoraConfig, MixLoraModel
 from .moelora import MoELoraConfig, MoELoraModel
 from .movlora import MovLoraConfig, MovLoraModel
 from .moelpr import MoeConfig as MoelprConfig, MoeModel as MoelprModel
@@ -98,6 +99,8 @@ __all__ = [
     "MissConfig",
     "MissModel",
     "MixedModel",
+    "MixLoraConfig",
+    "MixLoraModel",
     "MoELoraConfig",
     "MoELoraModel",
     "MovLoraConfig",

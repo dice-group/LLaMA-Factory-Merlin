@@ -25,6 +25,7 @@ from peft import (
     HydraLoraConfig,
     LoraConfig,
     LoraModel,
+    MixLoraConfig,
     MoELoraConfig,
     MovLoraConfig,
     MoelprConfig,
@@ -659,6 +660,79 @@ def _setup_cola_tuning(
             finetuning_args.num_A,
             finetuning_args.num_B,
         )
+
+    return model
+
+
+def _setup_mixlora_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    del config
+    if model_args.use_kt or model_args.use_unsloth:
+        raise ValueError("MixLoRA is not compatible with KTransformers or Unsloth.")
+
+    if model_args.adapter_name_or_path is not None:
+        raise NotImplementedError("MixLoRA adapter loading/resume is not implemented yet.")
+
+    if not is_trainable:
+        return model
+
+    logger.info_rank0("Fine-tuning method: MixLoRA")
+
+    # note: in mixlora the FFN is employed with multiple exerts, while the attention modules use a single shared LoRA adapter per module. Therefore, we distinguish here
+    if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+        raise ValueError("MixLoRA requires explicit attention targets in `lora_target`; do not use `all`.")
+
+    target_modules = list(finetuning_args.lora_target)
+    if finetuning_args.use_llama_pro:
+        target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+    target_modules = patch_target_modules(model, finetuning_args, target_modules)
+    mixlora_targets = sorted(set(target_modules).union(set(finetuning_args.mixlora_moe_target_modules or [])))
+
+    if model_args.resize_vocab and finetuning_args.additional_target is None:
+        input_embeddings = model.get_input_embeddings()
+        output_embeddings = model.get_output_embeddings()
+        module_names = set()
+        for name, module in model.named_modules():
+            if module in [input_embeddings, output_embeddings]:
+                module_names.add(name.split(".")[-1])
+
+        finetuning_args.additional_target = module_names
+        logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+    mixlora_config = MixLoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=finetuning_args.lora_rank,
+        target_modules=mixlora_targets,
+        lora_alpha=finetuning_args.lora_alpha,
+        lora_dropout=finetuning_args.lora_dropout,
+        use_rslora=finetuning_args.use_rslora,
+        use_dora=finetuning_args.use_dora,
+        modules_to_save=finetuning_args.additional_target,
+        num_experts=finetuning_args.mixlora_num_experts,
+        top_k=finetuning_args.mixlora_top_k,
+        router_init_range=finetuning_args.mixlora_router_init_range,
+        jitter_noise=finetuning_args.mixlora_jitter_noise,
+        router_loss=finetuning_args.mixlora_router_loss,
+        router_aux_loss_coef=finetuning_args.mixlora_router_aux_loss_coef,
+        act_fn=finetuning_args.mixlora_act_fn,
+        moe_target_modules=finetuning_args.mixlora_moe_target_modules,
+        expert_lora_r=finetuning_args.mixlora_expert_lora_rank,
+        expert_lora_alpha=finetuning_args.mixlora_expert_lora_alpha,
+        expert_lora_dropout=finetuning_args.mixlora_expert_lora_dropout,
+    )
+    model = get_peft_model(model, mixlora_config)
+
+    if cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
 
     return model
 
@@ -1569,6 +1643,10 @@ def init_adapter(
         )
     elif finetuning_args.finetuning_type == "adamole":
         model = _setup_adamole_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "mixlora":
+        model = _setup_mixlora_tuning(
             config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
         )
     elif finetuning_args.finetuning_type == "moelora":
