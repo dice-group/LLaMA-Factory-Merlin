@@ -145,6 +145,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if mola_loss is not None:
             extra_losses.append(mola_loss)
 
+        mixlora_loss = self._compute_mixlora_aux_loss(model)
+        if mixlora_loss is not None:
+            extra_losses.append(mixlora_loss)
+
         moelpr_loss = self._compute_moelpr_aux_loss(model)
         if moelpr_loss is not None:
             extra_losses.append(moelpr_loss)
@@ -346,6 +350,27 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         scaled = coef * aux
         self.log({"mola_aux_loss": float(scaled.detach().mean().cpu())})
+        return scaled
+
+    def _compute_mixlora_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
+        if self.finetuning_args.finetuning_type != "mixlora":
+            return None
+
+        coef = float(getattr(self.finetuning_args, "mixlora_router_aux_loss_coef", 0.0) or 0.0)
+        if coef <= 0:
+            return None
+
+        module = getattr(model, "module", model)
+        aux_fn = getattr(module, "get_aux_loss", None)
+        if not callable(aux_fn):
+            return None
+
+        aux = aux_fn()
+        if aux is None:
+            return None
+
+        scaled = coef * aux
+        self.log({"mixlora_aux_loss": float(scaled.detach().mean().cpu())})
         return scaled
 
     def _compute_moelpr_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:

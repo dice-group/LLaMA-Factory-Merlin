@@ -90,6 +90,7 @@ def get_peft_model_state_dict(
         PeftType.COLA,
         PeftType.HYDRALORA,
         PeftType.ADAMOLE,
+        PeftType.MIXLORA,
         PeftType.MOELORA,
         PeftType.MOVLORA,
         PeftType.HMORA,
