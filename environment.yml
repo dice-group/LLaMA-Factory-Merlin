@@ -3,6 +3,7 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
+  - nodefaults
 dependencies:
   - python=3.10
   - omegaconf
@@ -11,5 +12,6 @@ dependencies:
   - torchaudio
   - pytorch-cuda=12.1
   - cuda-toolkit=12.1
+  - pillow>=10
   - pytest
   - pip
