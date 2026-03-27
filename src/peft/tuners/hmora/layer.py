@@ -28,18 +28,52 @@ class PositionalEncoding(nn.Module):
 
 
 class TaskEncoder(nn.Module):
-    def __init__(self, hidden_size: int, dropout: float, num_encoder_layer: int, task_embedding: Optional[torch.Tensor]):
+    def __init__(
+        self,
+        hidden_size: int,
+        dropout: float,
+        num_encoder_layer: int,
+        task_embedding: Optional[torch.Tensor],
+        num_task_embeddings: int = 1,
+    ):
         super().__init__()
         self.pos_encoder = PositionalEncoding(hidden_size)
         encoder_layers = nn.TransformerEncoderLayer(hidden_size, nhead=16, dim_feedforward=hidden_size * 2, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_encoder_layer)
         dtype = task_embedding.dtype if task_embedding is not None else torch.float32
-        self.task_embedding = nn.Embedding(1, hidden_size, dtype=dtype)
+        self.task_embedding = nn.Embedding(max(int(num_task_embeddings), 1), hidden_size, dtype=dtype)
         if task_embedding is not None:
-            self.task_embedding.weight.data.copy_(task_embedding)
+            self.task_embedding.weight.data.copy_(task_embedding.unsqueeze(0).expand_as(self.task_embedding.weight))
 
-    def forward(self, src: torch.Tensor, src_attention_mask: torch.Tensor) -> torch.Tensor:
-        task_embedding = self.task_embedding(torch.tensor([0], device=src.device)).expand(src.shape[0], -1, -1)
+    def ensure_task_embedding_capacity(self, num_task_embeddings: int) -> None:
+        required = max(int(num_task_embeddings), 1)
+        current = self.task_embedding.num_embeddings
+        if required <= current:
+            return
+
+        old_weight = self.task_embedding.weight.data
+        expanded = nn.Embedding(required, old_weight.shape[1], dtype=old_weight.dtype, device=old_weight.device)
+        expanded.weight.data[:current].copy_(old_weight)
+        expanded.weight.data[current:].copy_(old_weight[0].unsqueeze(0).expand(required - current, -1))
+        self.task_embedding = expanded
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_attention_mask: torch.Tensor,
+        task_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if task_ids is None:
+            task_index = torch.zeros(src.shape[0], dtype=torch.long, device=src.device)
+        else:
+            task_index = task_ids.to(device=src.device, dtype=torch.long).view(-1)
+            task_index = torch.where(task_index >= 0, task_index, torch.zeros_like(task_index))
+            if task_index.numel() > 0 and int(task_index.max().item()) >= self.task_embedding.num_embeddings:
+                raise ValueError(
+                    f"HMoRA task id {int(task_index.max().item())} exceeds configured task embeddings "
+                    f"({self.task_embedding.num_embeddings})."
+                )
+        task_embedding = self.task_embedding(task_index).unsqueeze(1)
         src = self.pos_encoder(src)
         src = torch.cat([src, task_embedding], dim=1)
         src = src.transpose(0, 1)

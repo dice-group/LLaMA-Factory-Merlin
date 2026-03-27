@@ -45,6 +45,15 @@ class HMoRaConfig(LoraConfig):
         metadata={"help": "Optional subset of target modules using single LoRA (no routing), e.g. o_proj,down_proj."},
     )
 
+    use_language_ids_as_task_ids: bool = field(
+        default=False,
+        metadata={"help": "Use batch `language_ids` as task ids for selecting task embeddings in multilingual HMoRA."},
+    )
+    num_task_embeddings: int = field(
+        default=1,
+        metadata={"help": "Number of task-embedding rows reserved for HMoRA task ids."},
+    )
+
     task_token: str = field(default="?", metadata={"help": "Token used to initialize the task embedding."})
     task_token_id: Optional[int] = field(default=None, metadata={"help": "Explicit task token id for task embedding init."})
     num_encoder_layer: int = field(default=1, metadata={"help": "Number of transformer layers in the task encoder."})
@@ -58,3 +67,4 @@ class HMoRaConfig(LoraConfig):
             self.target_modules_lora = values or None
         elif self.target_modules_lora is not None:
             self.target_modules_lora = [str(item).strip() for item in self.target_modules_lora if str(item).strip()]
+        self.num_task_embeddings = max(int(self.num_task_embeddings or 1), 1)

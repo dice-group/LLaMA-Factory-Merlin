@@ -856,6 +856,14 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Optional comma-separated modules using single LoRA in HMoRA (e.g., o_proj,down_proj)."},
     )
+    hmora_use_language_ids_as_task_ids: bool = field(
+        default=False,
+        metadata={"help": "Use batch language_ids as multilingual HMoRA task ids for selecting task embeddings."},
+    )
+    hmora_num_task_embeddings: int = field(
+        default=1,
+        metadata={"help": "Number of HMoRA task-embedding rows. Usually inferred from the dataset for multilingual runs."},
+    )
     hmora_task_token: str = field(
         default="?",
         metadata={"help": "Task token used to initialize HMoRA task embedding."},
@@ -1033,6 +1041,10 @@ class FinetuningArguments(
                 raise ValueError("Choose only one HMoRA auxiliary objective: load-balancing or divergence.")
             if self.hmora_task_router_only and not self.hmora_use_task_router:
                 raise ValueError("`hmora_task_router_only` requires `hmora_use_task_router=True`.")
+            if self.hmora_use_language_ids_as_task_ids and not self.hmora_use_task_router:
+                raise ValueError("`hmora_use_language_ids_as_task_ids` requires `hmora_use_task_router=True`.")
+            if self.hmora_num_task_embeddings <= 0:
+                raise ValueError("`hmora_num_task_embeddings` must be positive.")
             if self.hmora_eta_b <= 0:
                 raise ValueError("`hmora_eta_b` must be positive.")
             if self.hmora_eta_b != 1.0 and self.loraplus_lr_ratio is not None:

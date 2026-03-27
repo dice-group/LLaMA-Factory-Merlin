@@ -90,6 +90,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             self.compute_loss_func = dft_loss_func
 
+        self._hmora_task_input_batches: List[torch.Tensor] = []
+        self._hmora_task_attention_batches: List[torch.Tensor] = []
+        self._hmora_task_id_batches: List[torch.Tensor] = []
+
         # Verify FP8 status after trainer initialization (accelerator should be available)
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, model_args)
@@ -119,6 +123,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"], return_outputs: bool = False, **kwargs
     ) -> Union["torch.Tensor", Tuple["torch.Tensor", Any]]:
         self._inject_language_router_inputs(model, inputs)
+        self._inject_hmora_task_inputs(model, inputs)
 
         if (
             self.finetuning_args.finetuning_type == "moelpr"
@@ -177,6 +182,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         **kwargs,
     ) -> "torch.Tensor":
         loss = super().training_step(model, inputs, *args, **kwargs)
+
+        if self.finetuning_args.finetuning_type == "hmora" and getattr(self.accelerator, "sync_gradients", False):
+            extra = self._apply_hmora_task_router_step_loss(model)
+            if extra is not None:
+                loss = loss + extra.detach()
 
         if self.finetuning_args.finetuning_type == "cola":
             if not hasattr(self, "_cola_router_params"):
@@ -407,7 +417,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if lm_scale != 1.0:
             extra_terms.append((lm_scale - 1.0) * base_loss)
 
-        aux = aux_fn()
+        aux = aux_fn(include_task_router=False)
         if aux is not None and aux_scale > 0:
             scaled_aux = aux_scale * aux
             self.log({"hmora_aux_loss": float(scaled_aux.detach().mean().cpu())})
@@ -459,6 +469,112 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         for routed_module in routed_modules:
             setattr(routed_module, "language_ids", language_ids)
+
+    def _build_hmora_task_batch(
+        self, inputs: Dict[str, "torch.Tensor"]
+    ) -> tuple[Optional["torch.Tensor"], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
+        input_ids = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+        if input_ids is None or attention_mask is None:
+            return None, None, None
+
+        labels = inputs.get("labels")
+        pad_token_id = getattr(self.processing_class, "pad_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        if labels is None:
+            return input_ids, attention_mask, inputs.get("language_ids")
+
+        prompt_masks = []
+        max_prompt_len = 0
+        for row_labels, row_attention in zip(labels, attention_mask):
+            prompt_mask = (row_attention > 0) & (row_labels == IGNORE_INDEX)
+            if not torch.any(prompt_mask):
+                prompt_mask = row_attention > 0
+            prompt_masks.append(prompt_mask)
+            max_prompt_len = max(max_prompt_len, int(prompt_mask.sum().item()))
+
+        if max_prompt_len <= 0:
+            return input_ids, attention_mask, inputs.get("language_ids")
+
+        task_input_ids = input_ids.new_full((input_ids.size(0), max_prompt_len), int(pad_token_id))
+        task_attention_mask = attention_mask.new_zeros((attention_mask.size(0), max_prompt_len))
+        for row_idx, prompt_mask in enumerate(prompt_masks):
+            selected = input_ids[row_idx][prompt_mask]
+            length = selected.size(0)
+            if length == 0:
+                continue
+            task_input_ids[row_idx, :length] = selected
+            task_attention_mask[row_idx, :length] = 1
+
+        return task_input_ids, task_attention_mask, inputs.get("language_ids")
+
+    def _inject_hmora_task_inputs(self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"]) -> None:
+        if self.finetuning_args.finetuning_type != "hmora":
+            return
+
+        module = getattr(model, "module", model)
+        set_task_inputs = getattr(module, "set_runtime_task_inputs", None)
+        if not callable(set_task_inputs):
+            return
+
+        task_input_ids, task_attention_mask, task_ids = self._build_hmora_task_batch(inputs)
+        set_task_inputs(
+            task_input_ids=task_input_ids,
+            task_attention_mask=task_attention_mask,
+            task_ids=task_ids,
+        )
+
+        if (
+            self.model.training
+            and self.finetuning_args.hmora_use_div_loss
+            and task_input_ids is not None
+            and task_attention_mask is not None
+        ):
+            self._hmora_task_input_batches.append(task_input_ids.detach().cpu())
+            self._hmora_task_attention_batches.append(task_attention_mask.detach().cpu())
+            if task_ids is not None:
+                self._hmora_task_id_batches.append(task_ids.detach().cpu())
+
+    def _clear_hmora_task_batch_cache(self) -> None:
+        self._hmora_task_input_batches.clear()
+        self._hmora_task_attention_batches.clear()
+        self._hmora_task_id_batches.clear()
+
+    def _apply_hmora_task_router_step_loss(self, model: "torch.nn.Module") -> Optional["torch.Tensor"]:
+        if not self.finetuning_args.hmora_use_div_loss:
+            self._clear_hmora_task_batch_cache()
+            return None
+        if not self._hmora_task_input_batches or not self._hmora_task_attention_batches:
+            return None
+
+        module = getattr(model, "module", model)
+        aux_fn = getattr(module, "get_task_router_aux_loss", None)
+        if not callable(aux_fn):
+            self._clear_hmora_task_batch_cache()
+            return None
+
+        task_input_ids = torch.cat(self._hmora_task_input_batches, dim=0).to(self.accelerator.device)
+        task_attention_mask = torch.cat(self._hmora_task_attention_batches, dim=0).to(self.accelerator.device)
+        task_ids = None
+        if self._hmora_task_id_batches:
+            task_ids = torch.cat(self._hmora_task_id_batches, dim=0).to(self.accelerator.device)
+
+        self._clear_hmora_task_batch_cache()
+
+        aux_scale = float(getattr(self.finetuning_args, "hmora_lambda_auxiliary", 0.0) or 0.0)
+        if aux_scale <= 0:
+            return None
+
+        aux = aux_fn(task_input_ids=task_input_ids, task_attention_mask=task_attention_mask, task_ids=task_ids)
+        if aux is None:
+            return None
+
+        scaled_aux = aux_scale * aux
+        self.accelerator.backward(scaled_aux)
+        self.log({"hmora_task_router_aux_loss": float(scaled_aux.detach().mean().cpu())})
+        return scaled_aux
 
     def _flush_language_router_cache(self) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
         caches: list[tuple[str, torch.Tensor, torch.Tensor]] = []

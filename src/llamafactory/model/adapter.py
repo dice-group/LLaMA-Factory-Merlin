@@ -1427,6 +1427,8 @@ def _setup_hmora_tuning(
             lambda_lm=finetuning_args.hmora_lambda_lm,
             eta_b=finetuning_args.hmora_eta_b,
             target_modules_lora=finetuning_args.hmora_target_modules_lora,
+            use_language_ids_as_task_ids=finetuning_args.hmora_use_language_ids_as_task_ids,
+            num_task_embeddings=finetuning_args.hmora_num_task_embeddings,
             task_token=finetuning_args.hmora_task_token,
             task_token_id=task_token_id,
             num_encoder_layer=finetuning_args.hmora_num_encoder_layer,

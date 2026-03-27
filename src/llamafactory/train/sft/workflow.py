@@ -39,6 +39,35 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _infer_hmora_num_task_embeddings(train_dataset) -> int:
+    if train_dataset is None:
+        return 1
+
+    column_names = getattr(train_dataset, "column_names", None) or []
+    if "language_ids" not in column_names:
+        return 1
+
+    unique_fn = getattr(train_dataset, "unique", None)
+    if callable(unique_fn):
+        try:
+            values = unique_fn("language_ids")
+        except Exception:
+            values = None
+    else:
+        values = None
+
+    if values is None:
+        try:
+            values = train_dataset["language_ids"]
+        except Exception:
+            return 1
+
+    valid = [int(value) for value in values if value is not None and int(value) >= 0]
+    if not valid:
+        return 1
+    return max(valid) + 1
+
+
 def run_sft(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -51,6 +80,12 @@ def run_sft(
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
+    if finetuning_args.finetuning_type == "hmora" and finetuning_args.hmora_use_language_ids_as_task_ids:
+        train_dataset = dataset_module.get("train_dataset")
+        finetuning_args.hmora_num_task_embeddings = _infer_hmora_num_task_embeddings(train_dataset)
+        logger.info_rank0(
+            f"HMoRA: inferred hmora_num_task_embeddings={finetuning_args.hmora_num_task_embeddings} from train dataset language_ids."
+        )
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
     if getattr(model, "is_quantized", False) and not training_args.do_train:

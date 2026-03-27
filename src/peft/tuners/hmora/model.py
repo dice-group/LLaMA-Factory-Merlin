@@ -36,6 +36,16 @@ class HMoRaModel(LoraModel):
         }
         return mapping.get(text, torch.float32)
 
+    @staticmethod
+    def _required_task_embedding_count(task_ids: Optional[torch.Tensor]) -> int:
+        if task_ids is None or task_ids.numel() == 0:
+            return 1
+        valid = task_ids.to(dtype=torch.long)
+        valid = valid[valid >= 0]
+        if valid.numel() == 0:
+            return 1
+        return int(valid.max().item()) + 1
+
     def __init__(self, model: nn.Module, config: HMoRaConfig, adapter_name: str = "default") -> None:
         # Delay ModuleDict registration until after `super().__init__` has initialized `nn.Module`.
         self.lora_router_pool: dict[str, dict[str, TokenRouter]] | nn.ModuleDict = {}
@@ -46,6 +56,10 @@ class HMoRaModel(LoraModel):
         self._hmora_max_layer = self._infer_max_layer(model)
         self._hmora_aux_attention_mask: Optional[torch.Tensor] = None
         self._hmora_cached_input_ids: Optional[torch.Tensor] = None
+        self._hmora_cached_language_ids: Optional[torch.Tensor] = None
+        self._hmora_runtime_task_input_ids: Optional[torch.Tensor] = None
+        self._hmora_runtime_task_attention_mask: Optional[torch.Tensor] = None
+        self._hmora_runtime_task_ids: Optional[torch.Tensor] = None
         super().__init__(model, config, adapter_name)
 
         if not isinstance(self.lora_router_pool, nn.ModuleDict):
@@ -182,8 +196,43 @@ class HMoRaModel(LoraModel):
             dropout=config.dropout,
             num_encoder_layer=config.num_encoder_layer,
             task_embedding=task_embedding,
+            num_task_embeddings=config.num_task_embeddings,
         )
         self.lora_task_encoder[adapter_name] = task_encoder
+
+    def set_runtime_task_inputs(
+        self,
+        *,
+        task_input_ids: Optional[torch.Tensor],
+        task_attention_mask: Optional[torch.Tensor],
+        task_ids: Optional[torch.Tensor],
+    ) -> None:
+        self._hmora_runtime_task_input_ids = task_input_ids
+        self._hmora_runtime_task_attention_mask = task_attention_mask
+        self._hmora_runtime_task_ids = task_ids
+
+    def clear_runtime_task_inputs(self) -> None:
+        self._hmora_runtime_task_input_ids = None
+        self._hmora_runtime_task_attention_mask = None
+        self._hmora_runtime_task_ids = None
+
+    def _task_inputs_for_adapter(
+        self,
+        adapter_name: str,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        config = self.peft_config[adapter_name]
+
+        task_input_ids = self._hmora_runtime_task_input_ids
+        task_attention_mask = self._hmora_runtime_task_attention_mask
+        if task_input_ids is None or task_attention_mask is None:
+            task_input_ids = self._hmora_cached_input_ids
+            task_attention_mask = self._hmora_aux_attention_mask
+
+        task_ids = self._hmora_runtime_task_ids
+        if task_ids is None and config.use_language_ids_as_task_ids:
+            task_ids = self._hmora_cached_language_ids
+
+        return task_input_ids, task_attention_mask, task_ids
 
     def get_router(self, adapter_name: str, router_key: str) -> Optional[TokenRouter]:
         if adapter_name not in self.lora_router_pool:
@@ -198,17 +247,28 @@ class HMoRaModel(LoraModel):
             return
         if adapter_name not in self.lora_task_encoder:
             return
-        if self._hmora_cached_input_ids is None or self._hmora_aux_attention_mask is None:
+        task_input_ids, task_attention_mask, task_ids = self._task_inputs_for_adapter(adapter_name)
+        if task_input_ids is None or task_attention_mask is None:
             return
 
         input_embeddings = self.model.get_input_embeddings()
         if input_embeddings is None:
             return
 
-        hidden_states = input_embeddings(self._hmora_cached_input_ids)
+        hidden_states = input_embeddings(task_input_ids)
         task_encoder = self.lora_task_encoder[adapter_name]
+        if config.use_language_ids_as_task_ids:
+            next_size = self._required_task_embedding_count(task_ids)
+            if next_size > task_encoder.task_embedding.num_embeddings:
+                if self.training:
+                    raise ValueError(
+                        f"HMoRA requires {next_size} task embeddings from language_ids, "
+                        f"but only {task_encoder.task_embedding.num_embeddings} were initialized."
+                    )
+                task_encoder.ensure_task_embedding_capacity(next_size)
+            config.num_task_embeddings = max(config.num_task_embeddings, next_size)
         hidden_states = hidden_states.to(task_encoder.task_embedding.weight.dtype)
-        task_embed = task_encoder(hidden_states, self._hmora_aux_attention_mask)
+        task_embed = task_encoder(hidden_states, task_attention_mask, task_ids=task_ids)
 
         for task_router in self._hmora_task_routers.get(adapter_name, []):
             task_router(task_embed)
@@ -217,6 +277,7 @@ class HMoRaModel(LoraModel):
     def _enable_peft_forward_hooks(self, *args, **kwargs):
         self._hmora_cached_input_ids = kwargs.get("input_ids", None)
         self._hmora_aux_attention_mask = kwargs.get("attention_mask", None)
+        self._hmora_cached_language_ids = kwargs.get("language_ids", None)
 
         for adapter_name in self.active_adapters:
             if adapter_name in self.peft_config:
@@ -227,12 +288,18 @@ class HMoRaModel(LoraModel):
                 yield
         finally:
             self._hmora_cached_input_ids = None
+            self._hmora_cached_language_ids = None
+            self.clear_runtime_task_inputs()
 
     def clear_router_state(self, adapter_name: str = "default") -> None:
         for router in self._hmora_token_routers.get(adapter_name, []):
             router.clear()
+        for task_router in self._hmora_task_routers.get(adapter_name, []):
+            clear_fn = getattr(task_router, "clear", None)
+            if callable(clear_fn):
+                clear_fn()
 
-    def get_aux_loss(self, adapter_name: str = "default") -> Optional[torch.Tensor]:
+    def get_aux_loss(self, adapter_name: str = "default", *, include_task_router: bool = True) -> Optional[torch.Tensor]:
         if adapter_name not in self.peft_config:
             return None
 
@@ -249,11 +316,59 @@ class HMoRaModel(LoraModel):
             elif config.use_div_loss:
                 aux_losses.append(router.divergence_loss(attention_mask))
 
-        if config.use_div_loss and not config.use_load_balancing_loss:
+        if include_task_router and config.use_div_loss and not config.use_load_balancing_loss:
             for task_router in self._hmora_task_routers.get(adapter_name, []):
                 aux_losses.append(task_router.divergence_loss())
 
         self.clear_router_state(adapter_name)
+        self._hmora_aux_attention_mask = None
+
+        if not aux_losses:
+            return None
+        return torch.stack(aux_losses, dim=0).sum()
+
+    def get_task_router_aux_loss(
+        self,
+        *,
+        task_input_ids: torch.Tensor,
+        task_attention_mask: torch.Tensor,
+        task_ids: Optional[torch.Tensor] = None,
+        adapter_name: str = "default",
+    ) -> Optional[torch.Tensor]:
+        if adapter_name not in self.peft_config:
+            return None
+
+        config = self.peft_config[adapter_name]
+        if not config.use_task_router or not config.use_div_loss or config.use_load_balancing_loss:
+            return None
+        if adapter_name not in self.lora_task_encoder:
+            return None
+
+        input_embeddings = self.model.get_input_embeddings()
+        if input_embeddings is None:
+            return None
+
+        task_encoder = self.lora_task_encoder[adapter_name]
+        if config.use_language_ids_as_task_ids:
+            next_size = self._required_task_embedding_count(task_ids)
+            if next_size > task_encoder.task_embedding.num_embeddings:
+                if self.training:
+                    raise ValueError(
+                        f"HMoRA requires {next_size} task embeddings from language_ids, "
+                        f"but only {task_encoder.task_embedding.num_embeddings} were initialized."
+                    )
+                task_encoder.ensure_task_embedding_capacity(next_size)
+            config.num_task_embeddings = max(config.num_task_embeddings, next_size)
+
+        hidden_states = input_embeddings(task_input_ids)
+        hidden_states = hidden_states.to(task_encoder.task_embedding.weight.dtype)
+        task_embed = task_encoder(hidden_states, task_attention_mask, task_ids=task_ids)
+
+        aux_losses = []
+        for task_router in self._hmora_task_routers.get(adapter_name, []):
+            task_router(task_embed)
+            aux_losses.append(task_router.divergence_loss())
+            task_router.clear()
 
         if not aux_losses:
             return None
