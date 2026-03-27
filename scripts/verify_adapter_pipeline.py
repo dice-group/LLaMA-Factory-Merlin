@@ -38,7 +38,7 @@ APPROACH_SPECS: dict[str, ApproachSpec] = {
             "lora_rank": 8,
             "lora_alpha": 16,
             "lora_dropout": 0.05,
-            "lora_target": "q_proj,k_proj,v_proj,o_proj",
+            "lora_target": "k_proj,v_proj,down_proj",
             "use_rslora": False,
             "movlora_num_experts": 8,
             "movlora_top_k": 0,
@@ -48,8 +48,8 @@ APPROACH_SPECS: dict[str, ApproachSpec] = {
             "movlora_router_init_std": 0.02,
             "movlora_router_ignore_padding_tokens": False,
         },
-        required_trainable_substrings=("lora_A", "lora_B", "lora_router"),
-        required_checkpoint_substrings=("lora_A", "lora_B", "lora_router"),
+        required_trainable_substrings=("lora_router", "lora_mov_scaling"),
+        required_checkpoint_substrings=("lora_router", "lora_mov_scaling"),
         metric_prefix="movlora/",
     ),
     "hydralora": ApproachSpec(
@@ -229,6 +229,8 @@ def _check_approach_wiring(approach: str, model: torch.nn.Module, finetuning_arg
 
     if approach == "movlora":
         matched = 0
+        headwise_layers = 0
+        feedforward_layers = 0
         for module in modules:
             if not (hasattr(module, "lora_router") and hasattr(module, "num_experts")):
                 continue
@@ -249,8 +251,19 @@ def _check_approach_wiring(approach: str, model: torch.nn.Module, finetuning_arg
                 math.isclose(float(module.router_temperature["default"]), float(finetuning_args.movlora_router_temperature)),
                 "MoV-LoRA router temperature mismatch in instantiated layer.",
             )
+            scaling = module.lora_mov_scaling["default"]
+            if bool(module.adapter_is_feedforward.get("default", False)):
+                feedforward_layers += 1
+                _assert(scaling.ndim == 2, "Feed-forward MoV scaling should be [experts, hidden].")
+            elif bool(module.router_headwise.get("default", False)):
+                headwise_layers += 1
+                _assert(scaling.ndim == 3, "Attention MoV scaling should be [heads, experts, head_dim].")
         _assert(matched > 0, "No MoV-LoRA layers found in model.")
+        _assert(headwise_layers > 0, "No head-wise MoV attention layers found in model.")
+        _assert(feedforward_layers > 0, "No feed-forward MoV layers found in model.")
         summary["checked_layers"] = matched
+        summary["headwise_layers"] = headwise_layers
+        summary["feedforward_layers"] = feedforward_layers
         return summary
 
     if approach == "hydralora":

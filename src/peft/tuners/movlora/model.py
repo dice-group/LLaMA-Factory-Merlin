@@ -39,6 +39,7 @@ class MovLoraModel(IA3Model):
             raise ValueError("Current key shouldn't be `None`")
 
         is_feedforward = self._check_target_module_feedforward(movlora_config, current_key)
+        router_num_heads, router_head_dim = self._get_attention_head_layout(parent, target_name, target)
 
         kwargs = {
             "fan_in_fan_out": movlora_config.fan_in_fan_out,
@@ -51,6 +52,8 @@ class MovLoraModel(IA3Model):
             "router_bias": movlora_config.router_bias,
             "router_init_std": movlora_config.router_init_std,
             "router_ignore_padding_tokens": movlora_config.router_ignore_padding_tokens,
+            "router_num_heads": router_num_heads,
+            "router_head_dim": router_head_dim,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -72,6 +75,8 @@ class MovLoraModel(IA3Model):
                 router_init_std=movlora_config.router_init_std,
                 router_ignore_padding_tokens=movlora_config.router_ignore_padding_tokens,
                 is_feedforward=is_feedforward,
+                router_num_heads=router_num_heads,
+                router_head_dim=router_head_dim,
             )
         elif isinstance(target, IA3Layer):
             raise ValueError("Cannot reuse IA3 layers with MoV adapters.")
@@ -114,6 +119,33 @@ class MovLoraModel(IA3Model):
             return bool(re.fullmatch(movlora_config.feedforward_modules, key))
 
         return any(key.endswith(target_key) for target_key in movlora_config.feedforward_modules)
+
+    @staticmethod
+    def _get_attention_head_layout(parent: nn.Module, target_name: str, target: nn.Module) -> tuple[int | None, int | None]:
+        if target_name not in {"k_proj", "v_proj", "k", "v"}:
+            return None, None
+
+        base_layer = target.get_base_layer() if isinstance(target, BaseTunerLayer) else target
+        out_features = getattr(base_layer, "out_features", None)
+        if out_features is None:
+            return None, None
+
+        head_dim = getattr(parent, "head_dim", None)
+        if head_dim is None:
+            return None, None
+
+        num_heads = getattr(parent, "num_key_value_heads", None)
+        if num_heads is None:
+            num_heads = getattr(parent, "num_heads", None)
+        if num_heads is None and int(out_features) % int(head_dim) == 0:
+            num_heads = int(out_features) // int(head_dim)
+        if num_heads is None:
+            return None, None
+
+        if int(num_heads) * int(head_dim) != int(out_features):
+            return None, None
+
+        return int(num_heads), int(head_dim)
 
     @staticmethod
     def _prepare_adapter_config(peft_config: MovLoraConfig, model_config: dict) -> MovLoraConfig:

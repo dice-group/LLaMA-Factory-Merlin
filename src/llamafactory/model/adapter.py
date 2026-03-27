@@ -328,7 +328,7 @@ def _setup_lora_tuning(
 
             target_modules[:] = new_list
 
-        if finetuning_args.use_llama_pro:
+        if finetuning_args.use_llama_pro and target_modules is not None:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
         target_modules = patch_target_modules(model, finetuning_args, target_modules)
@@ -495,14 +495,15 @@ def _setup_cola_tuning(
 
     if is_trainable and adapter_to_resume is None:
         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+            target_modules = None
         else:
             target_modules = finetuning_args.lora_target
 
         if finetuning_args.use_llama_pro:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model, finetuning_args, target_modules)
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
@@ -824,14 +825,15 @@ def _setup_hydralora_tuning(
 
     if is_trainable and adapter_to_resume is None:
         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+            target_modules = None
         else:
             target_modules = finetuning_args.lora_target
 
-        if finetuning_args.use_llama_pro:
+        if finetuning_args.use_llama_pro and target_modules is not None:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model, finetuning_args, target_modules)
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
@@ -1023,14 +1025,15 @@ def _setup_adamole_tuning(
 
     if is_trainable and adapter_to_resume is None:
         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+            target_modules = None
         else:
             target_modules = finetuning_args.lora_target
 
-        if finetuning_args.use_llama_pro:
+        if finetuning_args.use_llama_pro and target_modules is not None:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model, finetuning_args, target_modules)
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
@@ -1254,14 +1257,15 @@ def _setup_movlora_tuning(
 
     if is_trainable and adapter_to_resume is None:
         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
-            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+            target_modules = None
         else:
             target_modules = finetuning_args.lora_target
 
-        if finetuning_args.use_llama_pro:
+        if finetuning_args.use_llama_pro and target_modules is not None:
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
-        target_modules = patch_target_modules(model, finetuning_args, target_modules)
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
 
         if model_args.resize_vocab and finetuning_args.additional_target is None:
             input_embeddings = model.get_input_embeddings()
