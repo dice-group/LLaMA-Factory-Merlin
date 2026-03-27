@@ -138,8 +138,10 @@ class HMoRaModel(LoraModel):
             self._hmora_task_routers[adapter_name] = []
 
         if router_key not in router_bucket:
+            task_hidden_size = int(config.hidden_size or in_features)
             router = TokenRouter(
-                hidden_size=in_features,
+                token_hidden_size=in_features,
+                task_hidden_size=task_hidden_size,
                 num_experts=config.num_experts,
                 dropout=config.dropout,
                 num_router_mlp_layers=config.num_router_mlp_layers,

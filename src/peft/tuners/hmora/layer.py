@@ -151,7 +151,8 @@ class TokenRouter(nn.Module):
     def __init__(
         self,
         *,
-        hidden_size: int,
+        token_hidden_size: int,
+        task_hidden_size: int,
         num_experts: int,
         dropout: float,
         num_router_mlp_layers: int,
@@ -188,7 +189,7 @@ class TokenRouter(nn.Module):
         if use_task_router:
             if task_router_only:
                 self.task_router = TaskRouter(
-                    hidden_size,
+                    task_hidden_size,
                     num_experts,
                     dropout,
                     num_router_mlp_layers,
@@ -207,7 +208,7 @@ class TokenRouter(nn.Module):
                     self.alpha = None
                 elif alpha_ratio > alpha_up_bound:
                     self.task_router = TaskRouter(
-                        hidden_size,
+                        task_hidden_size,
                         num_experts,
                         dropout,
                         num_router_mlp_layers,
@@ -220,7 +221,7 @@ class TokenRouter(nn.Module):
                     self.alpha = None
                 else:
                     self.task_router = TaskRouter(
-                        hidden_size,
+                        task_hidden_size,
                         num_experts,
                         dropout,
                         num_router_mlp_layers,
@@ -240,12 +241,12 @@ class TokenRouter(nn.Module):
             if num_router_mlp_layers == 1:
                 self.mlp = nn.Sequential(
                     nn.Dropout(dropout),
-                    nn.Linear(hidden_size, num_experts, dtype=dtype),
+                    nn.Linear(token_hidden_size, num_experts, dtype=dtype),
                 )
             else:
                 layers: list[nn.Module] = [
                     nn.Dropout(dropout),
-                    nn.Linear(hidden_size, router_hidden_dim, dtype=dtype),
+                    nn.Linear(token_hidden_size, router_hidden_dim, dtype=dtype),
                     nn.ReLU(),
                 ]
                 for _ in range(num_router_mlp_layers - 2):

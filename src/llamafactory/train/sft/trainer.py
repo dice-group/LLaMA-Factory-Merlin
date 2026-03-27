@@ -555,8 +555,26 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self._clear_hmora_task_batch_cache()
             return None
 
-        task_input_ids = torch.cat(self._hmora_task_input_batches, dim=0).to(self.accelerator.device)
-        task_attention_mask = torch.cat(self._hmora_task_attention_batches, dim=0).to(self.accelerator.device)
+        max_task_len = max(batch.size(1) for batch in self._hmora_task_input_batches)
+        pad_token_id = getattr(self.processing_class, "pad_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        padded_task_inputs = []
+        padded_task_masks = []
+        for task_input_batch, task_attention_batch in zip(
+            self._hmora_task_input_batches,
+            self._hmora_task_attention_batches,
+        ):
+            pad_width = max_task_len - task_input_batch.size(1)
+            if pad_width > 0:
+                task_input_batch = F.pad(task_input_batch, (0, pad_width), value=int(pad_token_id))
+                task_attention_batch = F.pad(task_attention_batch, (0, pad_width), value=0)
+            padded_task_inputs.append(task_input_batch)
+            padded_task_masks.append(task_attention_batch)
+
+        task_input_ids = torch.cat(padded_task_inputs, dim=0).to(self.accelerator.device)
+        task_attention_mask = torch.cat(padded_task_masks, dim=0).to(self.accelerator.device)
         task_ids = None
         if self._hmora_task_id_batches:
             task_ids = torch.cat(self._hmora_task_id_batches, dim=0).to(self.accelerator.device)
