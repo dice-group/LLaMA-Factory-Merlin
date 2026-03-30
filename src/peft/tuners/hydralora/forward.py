@@ -18,9 +18,9 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
         dropout = layer.lora_dropout[active_adapter]
         scaling = layer.scaling[active_adapter]
 
-        x = x.to(lora_A.weight.dtype)
+        x_cast = x.to(lora_A.weight.dtype)
         route_dtype = lora_route.weight.dtype
-        route_logits = lora_route(x.to(route_dtype)).to(result.dtype)
+        route_logits = lora_route(x_cast.to(route_dtype)).to(result.dtype)
         use_head_guidance = layer.language_guidance_scope == "all"
         head_targets = layer._language_head_targets(language_ids, active_adapter) if use_head_guidance else None
         if use_head_guidance:
@@ -76,10 +76,18 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
                     )
                     record_hydralora_metrics(metrics, weight=metrics_weight)
 
-        for i in range(layer.lora_num[active_adapter]):
-            result = result + torch.unsqueeze(route_weight[:, :, i], -1) * lora_B[i](
-                (lora_A(dropout(x)))
-            ) * scaling
+        a_dot_x = lora_A(dropout(x_cast))
+        if len(lora_B) == 1:
+            result = result + lora_B[0](a_dot_x) * scaling
+        else:
+            # compute all B heads in one matmul, then apply routing weights to save computation
+            b_weight = lora_B[0].weight
+            if len(lora_B) > 1:
+                b_weight = torch.cat([b.weight for b in lora_B], dim=0)
+            out_all = torch.nn.functional.linear(a_dot_x.to(b_weight.dtype), b_weight, bias=None)
+            out_all = out_all.view(a_dot_x.size(0), a_dot_x.size(1), len(lora_B), -1)
+            out_weighted = (out_all * route_weight.to(out_all.dtype).unsqueeze(-1)).sum(dim=2)
+            result = result + out_weighted.to(result.dtype) * scaling
 
     return result.to(torch_result_dtype)
 
