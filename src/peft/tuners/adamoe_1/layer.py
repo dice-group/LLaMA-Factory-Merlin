@@ -104,14 +104,34 @@ class TopKMoeLayer(nn.Module):
         denom = torch.where(denom > 0, denom, torch.ones_like(denom))
         normalized_weights = (true_weights / denom).to(dtype=flattened_inputs.dtype)
         results = torch.zeros_like(self.experts[0](flattened_inputs))
+        dense_threshold = max(1, self.num_true_experts // 2)
 
-        for i, expert in enumerate(self.experts):
-            if i >= self.num_true_experts:
-                continue
-            batch_idx, nth_expert = torch.where(selected_experts == i)
-            if batch_idx.numel() == 0:
-                continue
-            results[batch_idx] += normalized_weights[batch_idx, nth_expert, None] * expert(flattened_inputs[batch_idx])
+        if self.num_true_experts > 0 and self.top_k >= dense_threshold:
+            dense_weights = torch.zeros(
+                (flattened_inputs.size(0), self.num_true_experts),
+                device=flattened_inputs.device,
+                dtype=flattened_inputs.dtype,
+            )
+            true_mask_flat = true_mask.reshape(-1)
+            if true_mask_flat.any():
+                row_idx, kth = torch.where(true_mask_flat.view(selected_experts.shape))
+                expert_idx = selected_experts[row_idx, kth]
+                dense_weights[row_idx, expert_idx] = normalized_weights[row_idx, kth]
+
+            lora_A_weights = torch.cat([expert.lora_A.weight for expert in self.experts[: self.num_true_experts]], dim=0)
+            lora_B_weights = torch.cat([expert.lora_B.weight for expert in self.experts[: self.num_true_experts]], dim=1)
+            dropped = self.experts[0].lora_dropout(flattened_inputs)
+            a_out = F.linear(dropped, lora_A_weights).view(flattened_inputs.size(0), self.num_true_experts, -1)
+            a_out = (a_out * dense_weights.unsqueeze(-1)).view(flattened_inputs.size(0), -1)
+            results = F.linear(a_out, lora_B_weights) * self.experts[0].scaling
+        else:
+            for i, expert in enumerate(self.experts):
+                if i >= self.num_true_experts:
+                    continue
+                batch_idx, nth_expert = torch.where(selected_experts == i)
+                if batch_idx.numel() == 0:
+                    continue
+                results[batch_idx] += normalized_weights[batch_idx, nth_expert, None] * expert(flattened_inputs[batch_idx])
 
         results = results.view((*inputs.shape[:-1], results.shape[-1]))
         self.layer_loss = self.get_layer_loss(gate_logits=gate_logits, selected_experts=selected_experts)

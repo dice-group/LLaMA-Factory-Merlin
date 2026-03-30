@@ -77,7 +77,8 @@ class AdaMoeLayer(nn.Module):
         weight_sums = torch.sum(weights, dim=-1, keepdim=True, dtype=inputs.dtype)
         weight_sums = torch.where(weight_sums == 0, torch.ones_like(weight_sums), weight_sums)
         weights = weights / weight_sums
-        results = torch.zeros_like(self.experts[0](flattened_inputs))
+        out_dim = self.experts[0].lora_B.out_features
+        results = flattened_inputs.new_zeros((flattened_inputs.size(0), out_dim))
 
         for i, expert in enumerate(self.experts):
             batch_idx = torch.where(selected_experts[:, i])[0]
