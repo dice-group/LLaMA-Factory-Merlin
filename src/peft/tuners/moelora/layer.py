@@ -145,11 +145,33 @@ class LinearMoELoraLayer(nn.Module, MoELoraLayer):
             routing = routing.to(result.dtype)
             x_cast = x.to(self.lora_A[active_adapter][0].weight.dtype)
             scale = self.scaling[active_adapter]
-            for expert_idx in range(self.expert_num[active_adapter]):
+            gate_eps = 1e-6
+            active_experts = torch.nonzero((routing > gate_eps).any(dim=0), as_tuple=False).flatten()
+            if active_experts.numel() == 0:
+                continue
+            for expert_idx in active_experts.tolist():
+                gate = routing[:, expert_idx]
+                active = gate > gate_eps
+                if not torch.any(active):
+                    continue
+
+                if torch.all(active):
+                    delta = self.lora_B[active_adapter][expert_idx](
+                        self.lora_A[active_adapter][expert_idx](self.lora_dropout[active_adapter][expert_idx](x_cast))
+                    )
+                    gate_view = gate.view(batch_size, *([1] * (delta.dim() - 1))).to(delta.dtype)
+                    result = result + (delta * gate_view * scale).to(result.dtype)
+                    continue
+
+                x_sub = x_cast[active]
+                if x_sub.numel() == 0:
+                    continue
+
                 delta = self.lora_B[active_adapter][expert_idx](
-                    self.lora_A[active_adapter][expert_idx](self.lora_dropout[active_adapter][expert_idx](x_cast))
+                    self.lora_A[active_adapter][expert_idx](self.lora_dropout[active_adapter][expert_idx](x_sub))
                 )
-                gate = routing[:, expert_idx].view(batch_size, *([1] * (delta.dim() - 1))).to(delta.dtype)
-                result = result + (delta * gate * scale).to(result.dtype)
+                gate_sub = gate[active].view(-1, *([1] * (delta.dim() - 1))).to(delta.dtype)
+                result_sub = result[active] + (delta * gate_sub * scale).to(result.dtype)
+                result[active] = result_sub
 
         return result.to(previous_dtype)

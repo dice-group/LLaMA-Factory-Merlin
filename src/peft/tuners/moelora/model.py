@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from itertools import chain
 from typing import Any, Optional
 
+import os
+import logging
 import torch
 from torch import nn
 
@@ -15,6 +17,7 @@ from ..lora import LoraModel
 from .config import MoELoraConfig
 from .layer import LinearMoELoraLayer, MoELoraLayer
 
+logger = logging.getLogger(__name__)
 
 class MoELoraModel(LoraModel):
     prefix: str = "lora_"
@@ -23,6 +26,8 @@ class MoELoraModel(LoraModel):
         self.lora_task_embedding = None
         self.lora_gate = None
         self._cached_routing_ids = None
+        self._cached_routing_weights = None
+        self._routing_debug_done = False
         super().__init__(model, config, adapter_name)
         self.lora_task_embedding = nn.ModuleDict({})
         self.lora_gate = nn.ModuleDict({})
@@ -39,11 +44,13 @@ class MoELoraModel(LoraModel):
         self._cached_routing_ids = kwargs.get("language_ids", None)
         if self._cached_routing_ids is None:
             self._cached_routing_ids = kwargs.get("task_ids", None)
+        self._cached_routing_weights = {}
         try:
             with super()._enable_peft_forward_hooks(*args, **kwargs):
                 yield
         finally:
             self._cached_routing_ids = None
+            self._cached_routing_weights = None
 
     def _ensure_shared_gate(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
         if self.lora_task_embedding is None or self.lora_gate is None:
@@ -121,6 +128,12 @@ class MoELoraModel(LoraModel):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        if self._cached_routing_weights is not None:
+            cache_key = (adapter_name, batch_size, device, dtype)
+            cached = self._cached_routing_weights.get(cache_key)
+            if cached is not None:
+                return cached
+
         config = self.peft_config[adapter_name]
         routing_ids = self._sanitize_routing_ids(self._cached_routing_ids, batch_size, config.task_num, device)
         task_embedder = self.lora_task_embedding[adapter_name]
@@ -145,7 +158,24 @@ class MoELoraModel(LoraModel):
             sparse_logits.scatter_(1, topk_idx, logits.gather(1, topk_idx))
             logits = sparse_logits
 
-        return torch.softmax(logits, dim=-1).to(dtype)
+        routing = torch.softmax(logits, dim=-1).to(dtype)
+        if os.getenv("MOELORA_DEBUG_ROUTING") and not self._routing_debug_done:
+            gate_eps = 1e-6
+            active_mask = routing > gate_eps
+            avg_active = active_mask.sum(dim=1).float().mean().item()
+            max_active = int(active_mask.sum(dim=1).max().item())
+            active_experts = int(active_mask.any(dim=0).sum().item())
+            logger.info(
+                "[MoE-LoRA] routing stats: avg_active=%.2f max_active=%d active_experts_in_batch=%d top_k=%s",
+                avg_active,
+                max_active,
+                active_experts,
+                str(config.gate_top_k),
+            )
+            self._routing_debug_done = True
+        if self._cached_routing_weights is not None:
+            self._cached_routing_weights[cache_key] = routing
+        return routing
 
     def _create_and_replace(
         self,
