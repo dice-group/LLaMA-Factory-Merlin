@@ -966,8 +966,16 @@ class Linear(nn.Module, ColaLayer):
 
         # Note: we apply dropout once and reuse A outputs; the original CoLA implementation applies dropout per A/B pair.
         intermediate = drop(x.to(A_list[0].weight.dtype))
-        a_outputs = [A(intermediate) for A in A_list]
-        num_a = len(a_outputs)
+        # sum A weights once to avoid multiple per-A matmuls, problem occured with 32 experts, that this blew up computation time
+        # sum is equivalent because A_i are linear.
+        if len(A_list) == 1:
+            a_sum = A_list[0](intermediate)
+        else:
+            a_weight = A_list[0].weight
+            for a_layer in A_list[1:]:
+                a_weight = a_weight + a_layer.weight
+            a_sum = F.linear(intermediate, a_weight, bias=None)
+        num_a = len(A_list)
         num_b = len(B_list)
         strategy = getattr(self, "cola_strategy", "fully")
         if strategy != "fully":
@@ -982,16 +990,19 @@ class Linear(nn.Module, ColaLayer):
             head_weights = self._language_head_weights(
                 head_targets, num_b, device=intermediate.device, dtype=intermediate.dtype
             )
+        # In the fully-collaborative strategy, B_j(sum_i A_i(x)) == sum_i B_j(A_i(x)) because both
+        # A_i and B_j are linear, so we can sum A outputs once to avoid A*B matmuls creating drastically high computation time for muliple A/B pairs
         if head_weights is None:
-            for a_out in a_outputs:
-                for b_layer in B_list:
-                    out = out + b_layer(a_out)
+            # sum B weights once to turn the full collaboration into a single linear op
+            weight_sum = B_list[0].weight
+            if num_b > 1:
+                for b_layer in B_list[1:]:
+                    weight_sum = weight_sum + b_layer.weight
+            out = out + F.linear(a_sum, weight_sum, bias=None)
         else:
             head_weights = head_weights.view(-1, 1, num_b)
             for b_idx, b_layer in enumerate(B_list):
-                b_sum = 0
-                for a_out in a_outputs:
-                    b_sum = b_sum + b_layer(a_out)
+                b_sum = b_layer(a_sum)
                 out = out + b_sum * head_weights[:, :, b_idx].to(b_sum.dtype).unsqueeze(-1)
 
         out = out * scale
