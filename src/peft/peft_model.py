@@ -451,6 +451,14 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         else:
             raise ValueError(f"The input config must be a PeftConfig, got {config.__class__}")
 
+        if (
+            isinstance(config, PeftConfig)
+            and config.peft_type == PeftType.HMORA
+            and autocast_adapter_dtype
+            and hasattr(config, "torch_dtype")
+        ):
+            config.torch_dtype = "float32"
+
         # See discussion in https://github.com/huggingface/transformers/pull/38627
         # Some transformers models can have a _checkpoint_conversion_mapping dict that is used to map state_dicts
         # stemming from updated model architectures so that they still correspond to the initial architecture. When
@@ -1315,6 +1323,12 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             )
             self._check_new_adapter_config(peft_config, is_trainable=is_trainable)
             peft_config.inference_mode = not is_trainable
+            if (
+                peft_config.peft_type == PeftType.HMORA
+                and autocast_adapter_dtype
+                and hasattr(peft_config, "torch_dtype")
+            ):
+                peft_config.torch_dtype = "float32"
             self.add_adapter(adapter_name, peft_config, low_cpu_mem_usage=low_cpu_mem_usage)
 
         adapters_weights = load_peft_weights(
