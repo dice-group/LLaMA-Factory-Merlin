@@ -315,11 +315,17 @@ def get_dataset(
                         desc="build train split",
                         **filter_kwargs,
                     )
+                    metadata_cols = ("language", "split", "doc_id", "chunk_idx", "doc_token_count", "text")
                     for name, ds in [("train", train_ds), ("validation", val_ds)]:
-                        cols = [c for c in ("language", "split") if c in ds.column_names]
+                        cols = [c for c in metadata_cols if c in ds.column_names]
                         if cols:
                             ds = ds.remove_columns(cols)
                         dataset_module[f"{'eval' if name == 'validation' else 'train'}_dataset"] = ds
+                else:
+                    metadata_cols = ("language", "doc_id", "chunk_idx", "doc_token_count", "text")
+                    cols = [c for c in metadata_cols if c in tokenized_train.column_names]
+                    if cols:
+                        dataset_module["train_dataset"] = tokenized_train.remove_columns(cols)
             if data_args.streaming:
                 dataset_module["train_dataset"] = dataset_module["train_dataset"].to_iterable_dataset()
 
