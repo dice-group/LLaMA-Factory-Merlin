@@ -24,21 +24,22 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, -x.size(1) :, :]
+        return x + self.pe[:, -x.size(1):, :]
 
 
 class TaskEncoder(nn.Module):
     def __init__(
-        self,
-        hidden_size: int,
-        dropout: float,
-        num_encoder_layer: int,
-        task_embedding: Optional[torch.Tensor],
-        num_task_embeddings: int = 1,
+            self,
+            hidden_size: int,
+            dropout: float,
+            num_encoder_layer: int,
+            task_embedding: Optional[torch.Tensor],
+            num_task_embeddings: int = 1,
     ):
         super().__init__()
         self.pos_encoder = PositionalEncoding(hidden_size)
-        encoder_layers = nn.TransformerEncoderLayer(hidden_size, nhead=16, dim_feedforward=hidden_size * 2, dropout=dropout)
+        encoder_layers = nn.TransformerEncoderLayer(hidden_size, nhead=16, dim_feedforward=hidden_size * 2,
+                                                    dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_encoder_layer)
         dtype = task_embedding.dtype if task_embedding is not None else torch.float32
         self.task_embedding = nn.Embedding(max(int(num_task_embeddings), 1), hidden_size, dtype=dtype)
@@ -58,10 +59,10 @@ class TaskEncoder(nn.Module):
         self.task_embedding = expanded
 
     def forward(
-        self,
-        src: torch.Tensor,
-        src_attention_mask: torch.Tensor,
-        task_ids: Optional[torch.Tensor] = None,
+            self,
+            src: torch.Tensor,
+            src_attention_mask: torch.Tensor,
+            task_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if task_ids is None:
             task_index = torch.zeros(src.shape[0], dtype=torch.long, device=src.device)
@@ -70,9 +71,7 @@ class TaskEncoder(nn.Module):
             task_index = torch.where(task_index >= 0, task_index, torch.zeros_like(task_index))
             if task_index.numel() > 0 and int(task_index.max().item()) >= self.task_embedding.num_embeddings:
                 raise ValueError(
-                    f"HMoRA task id {int(task_index.max().item())} exceeds configured task embeddings "
-                    f"({self.task_embedding.num_embeddings})."
-                )
+                    f"HMoRA task id {int(task_index.max().item())} exceeds configured task embeddings ({self.task_embedding.num_embeddings}).")
         task_embedding = self.task_embedding(task_index).unsqueeze(1)
         src = self.pos_encoder(src)
         src = torch.cat([src, task_embedding], dim=1)
@@ -81,7 +80,8 @@ class TaskEncoder(nn.Module):
         src_key_padding_mask = torch.cat(
             [
                 src_attention_mask,
-                torch.ones(src_attention_mask.shape[0], 1, device=src_attention_mask.device, dtype=src_attention_mask.dtype),
+                torch.ones(src_attention_mask.shape[0], 1, device=src_attention_mask.device,
+                           dtype=src_attention_mask.dtype),
             ],
             dim=1,
         )
@@ -92,7 +92,8 @@ class TaskEncoder(nn.Module):
 
 
 class TaskRouter(nn.Module):
-    def __init__(self, hidden_size: int, num_experts: int, dropout: float, num_router_mlp_layers: int, router_hidden_dim: int, gamma_div_balance: float, gamma_div_certain: float, dtype: torch.dtype):
+    def __init__(self, hidden_size: int, num_experts: int, dropout: float, num_router_mlp_layers: int,
+                 router_hidden_dim: int, gamma_div_balance: float, gamma_div_certain: float, dtype: torch.dtype):
         super().__init__()
         self.num_experts = num_experts
         self.gamma_div_balance = gamma_div_balance
@@ -110,7 +111,8 @@ class TaskRouter(nn.Module):
                 nn.ReLU(),
             ]
             for _ in range(num_router_mlp_layers - 2):
-                layers.extend([nn.Dropout(dropout), nn.Linear(router_hidden_dim, router_hidden_dim, dtype=dtype), nn.ReLU()])
+                layers.extend(
+                    [nn.Dropout(dropout), nn.Linear(router_hidden_dim, router_hidden_dim, dtype=dtype), nn.ReLU()])
             layers.extend([nn.Dropout(dropout), nn.Linear(router_hidden_dim, num_experts, dtype=dtype)])
             self.mlp = nn.Sequential(*layers)
 
@@ -127,8 +129,10 @@ class TaskRouter(nn.Module):
         if self.task_weight is None:
             return torch.tensor(0.0, device=next(self.parameters()).device)
 
+        # generalized Jensen-Shannon (GJS) divergence loss
         task_weight_batched = self.task_weight
-        max_entropy = torch.log(torch.tensor(self.num_experts, dtype=task_weight_batched.dtype, device=task_weight_batched.device))
+        max_entropy = torch.log(
+            torch.tensor(self.num_experts, dtype=task_weight_batched.dtype, device=task_weight_batched.device))
         max_entropy_m = self.gamma_div_balance * max_entropy
         min_entropy_p = self.gamma_div_certain * max_entropy
         max_div = max_entropy_m - min_entropy_p
@@ -149,29 +153,29 @@ class TaskRouter(nn.Module):
 
 class TokenRouter(nn.Module):
     def __init__(
-        self,
-        *,
-        token_hidden_size: int,
-        task_hidden_size: int,
-        num_experts: int,
-        dropout: float,
-        num_router_mlp_layers: int,
-        router_hidden_dim: int,
-        layer_id: int,
-        max_layer_id: int,
-        use_task_router: bool,
-        task_router_only: bool,
-        epsilon_alpha: float,
-        alpha_shift: float,
-        alpha_low_bound: float,
-        alpha_up_bound: float,
-        top_k_routing_strategy: bool,
-        top_k: int,
-        gamma_div_balance_t: float,
-        gamma_div_certain_t: float,
-        gamma_div_balance_s: float,
-        gamma_div_certain_s: float,
-        dtype: torch.dtype,
+            self,
+            *,
+            token_hidden_size: int,
+            task_hidden_size: int,
+            num_experts: int,
+            dropout: float,
+            num_router_mlp_layers: int,
+            router_hidden_dim: int,
+            layer_id: int,
+            max_layer_id: int,
+            use_task_router: bool,
+            task_router_only: bool,
+            epsilon_alpha: float,
+            alpha_shift: float,
+            alpha_low_bound: float,
+            alpha_up_bound: float,
+            top_k_routing_strategy: bool,
+            top_k: int,
+            gamma_div_balance_t: float,
+            gamma_div_certain_t: float,
+            gamma_div_balance_s: float,
+            gamma_div_certain_s: float,
+            dtype: torch.dtype,
     ):
         super().__init__()
 
@@ -250,7 +254,8 @@ class TokenRouter(nn.Module):
                     nn.ReLU(),
                 ]
                 for _ in range(num_router_mlp_layers - 2):
-                    layers.extend([nn.Dropout(dropout), nn.Linear(router_hidden_dim, router_hidden_dim, dtype=dtype), nn.ReLU()])
+                    layers.extend(
+                        [nn.Dropout(dropout), nn.Linear(router_hidden_dim, router_hidden_dim, dtype=dtype), nn.ReLU()])
                 layers.extend([nn.Dropout(dropout), nn.Linear(router_hidden_dim, num_experts, dtype=dtype)])
                 self.mlp = nn.Sequential(*layers)
         else:
@@ -263,7 +268,8 @@ class TokenRouter(nn.Module):
         if self.task_router_only:
             task_weight = self.task_router.get_task_weight() if self.task_router is not None else None
             if task_weight is None:
-                task_weight = torch.zeros(hidden_states.shape[0], self.num_experts, device=hidden_states.device, dtype=hidden_states.dtype)
+                task_weight = torch.zeros(hidden_states.shape[0], self.num_experts, device=hidden_states.device,
+                                          dtype=hidden_states.dtype)
                 task_weight[:, 0] = 1.0
             routing_weight = task_weight.unsqueeze(-2).expand(hidden_states.shape[:-1] + (self.num_experts,))
             self.routing_weight = routing_weight
@@ -273,7 +279,8 @@ class TokenRouter(nn.Module):
             if self.task_router is not None:
                 task_weight = self.task_router.get_task_weight()
                 if task_weight is None:
-                    task_weight = torch.zeros(token_weight.shape[0], self.num_experts, device=token_weight.device, dtype=token_weight.dtype)
+                    task_weight = torch.zeros(token_weight.shape[0], self.num_experts, device=token_weight.device,
+                                              dtype=token_weight.dtype)
                     task_weight[:, 0] = 1.0
                 alpha = torch.sigmoid(self.alpha)
                 self.routing_weight = (1 - alpha) * token_weight + alpha * task_weight.unsqueeze(-2)
@@ -303,7 +310,8 @@ class TokenRouter(nn.Module):
 
         token_routing_weight = self.token_routing_weight
         mask = attention_mask.to(token_routing_weight.dtype).unsqueeze(-1)
-        max_entropy = torch.log(torch.tensor(self.num_experts, dtype=token_routing_weight.dtype, device=token_routing_weight.device))
+        max_entropy = torch.log(
+            torch.tensor(self.num_experts, dtype=token_routing_weight.dtype, device=token_routing_weight.device))
         max_entropy_m = self.gamma_div_balance * max_entropy
         min_entropy_p = self.gamma_div_certain * max_entropy
         max_div = max_entropy_m - min_entropy_p
@@ -370,17 +378,17 @@ class HMoRaLayer(LoraLayer, ABC):
         return None if self._hmora_parent_ref is None else self._hmora_parent_ref()
 
     def update_layer(
-        self,
-        adapter_name: str,
-        lora_rank: int,
-        lora_alpha: int,
-        lora_dropout: float,
-        init_lora_weights: bool,
-        num_experts: int,
-        use_hydra_lora: bool,
-        use_single_lora: bool,
-        router_key: Optional[str],
-        router_use_cache: bool,
+            self,
+            adapter_name: str,
+            lora_rank: int,
+            lora_alpha: int,
+            lora_dropout: float,
+            init_lora_weights: bool,
+            num_experts: int,
+            use_hydra_lora: bool,
+            use_single_lora: bool,
+            router_key: Optional[str],
+            router_use_cache: bool,
     ) -> None:
         if lora_rank <= 0:
             raise ValueError(f"The rank `r` should be a positive integer value but got {lora_rank}.")
@@ -440,19 +448,19 @@ class HMoRaLayer(LoraLayer, ABC):
 
 class LinearHMoRaLayer(nn.Module, HMoRaLayer):
     def __init__(
-        self,
-        base_layer: nn.Module,
-        adapter_name: str,
-        lora_rank: int = 0,
-        lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        init_lora_weights: bool = True,
-        num_experts: int = 8,
-        use_hydra_lora: bool = False,
-        use_single_lora: bool = False,
-        router_key: Optional[str] = None,
-        router_use_cache: bool = False,
-        **kwargs,
+            self,
+            base_layer: nn.Module,
+            adapter_name: str,
+            lora_rank: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.0,
+            init_lora_weights: bool = True,
+            num_experts: int = 8,
+            use_hydra_lora: bool = False,
+            use_single_lora: bool = False,
+            router_key: Optional[str] = None,
+            router_use_cache: bool = False,
+            **kwargs,
     ) -> None:
         super().__init__()
         HMoRaLayer.__init__(self, base_layer=base_layer, **kwargs)
@@ -490,11 +498,13 @@ class LinearHMoRaLayer(nn.Module, HMoRaLayer):
             x_cast = x.to(self.lora_A[active_adapter].weight.dtype)
             dropped = self.lora_dropout[active_adapter](x_cast)
 
+            # simple lora computation if we only have single lora
             if self.use_single_lora[active_adapter]:
                 delta = self.lora_B[active_adapter](self.lora_A[active_adapter](dropped)) * self.scaling[active_adapter]
                 result = result + delta.to(result.dtype)
                 continue
 
+            # load router for multiple adapter hmora, fallback if not available
             router = self._get_router(active_adapter)
             if router is None:
                 gate_shape = x_cast.shape[:-1] + (self.num_experts[active_adapter],)
@@ -510,10 +520,10 @@ class LinearHMoRaLayer(nn.Module, HMoRaLayer):
                     gate = router(x_cast)
                 gate = gate.to(x_cast.dtype)
 
-            hidden_states = F.linear(dropped, self.lora_A[active_adapter].weight)
+            hidden_states = F.linear(dropped, self.lora_A[active_adapter].weight)   # project input inro low rank LoRA_A space
             rank = self.r[active_adapter]
             num_experts = self.num_experts[active_adapter]
-            target_shape = hidden_states.shape[:-1] + (num_experts, rank)
+            target_shape = hidden_states.shape[:-1] + (num_experts, rank)   # define shape to split into experts x rank
             if self.use_hydra_lora[active_adapter]:
                 hidden_states = hidden_states.unsqueeze(-2).expand(target_shape)
             else:
