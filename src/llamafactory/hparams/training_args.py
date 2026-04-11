@@ -95,6 +95,15 @@ class RayArguments:
 class TrainingArguments(RayArguments, BaseTrainingArguments):
     r"""Arguments pertaining to the trainer."""
 
+    enable_jit_checkpoint: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Save a final checkpoint on SIGTERM (Slurm: --signal=B:TERM@...)."
+            )
+        },
+    )
+
     overwrite_output_dir: bool = field(
         default=False,
         metadata={"help": "deprecated"},

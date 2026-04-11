@@ -29,6 +29,7 @@ from ..hparams import get_infer_args, get_ray_args, get_train_args, read_args
 from ..model import load_model, load_tokenizer
 from .callbacks import (
     LogCallback,
+    JitCheckpointCallback,
     PissaConvertCallback,
     ReporterCallback,
     SaveAdapterCheckpointCallback,
@@ -61,6 +62,8 @@ def _training_function(config: dict[str, Any]) -> None:
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
 
     callbacks.append(LogCallback())
+    if getattr(training_args, "enable_jit_checkpoint", False):
+        callbacks.append(JitCheckpointCallback())
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())
 

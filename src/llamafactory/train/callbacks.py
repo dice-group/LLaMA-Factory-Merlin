@@ -588,6 +588,66 @@ class LogCallback(TrainerCallback):
                 self.thread_pool.submit(self._write_log, args.output_dir, logs)
 
 
+class JitCheckpointCallback(TrainerCallback):
+    r"""Save a final checkpoint on SIGTERM and stop training gracefully.
+
+    Slurm can send SIGTERM some seconds before a job hits its time limit (e.g. `--signal=B:TERM@900`).
+    We convert that signal into: "save a checkpoint at the next step end" + "stop training".
+    """
+
+    def __init__(self) -> None:
+        self._got_signal = False
+        self._prev_handler = None
+        self._prev_usr1_handler = None
+
+    def _handle_signal(self, signum, frame) -> None:
+        # Extra diagnostics: helps confirm signal delivery + timing under Slurm.
+        # Logged on rank0 only by logger.warning_rank0.
+        import time as _time
+        sig_name = "SIGTERM" if signum == signal.SIGTERM else ("SIGUSR1" if signum == signal.SIGUSR1 else str(signum))
+        try:
+            logger.warning_rank0("Signal received at unix=%.3f: %s", _time.time(), sig_name)
+        except Exception:
+            pass
+
+        if not self._got_signal:
+            sig_name = "SIGTERM" if signum == signal.SIGTERM else ("SIGUSR1" if signum == signal.SIGUSR1 else str(signum))
+            logger.warning_rank0(
+                "Received %s: will save a checkpoint at next step end and stop training.", sig_name
+            )
+        self._got_signal = True
+
+    @override
+    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        self._prev_handler = signal.getsignal(signal.SIGTERM)
+        self._prev_usr1_handler = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGUSR1, self._handle_signal)
+
+    @override
+    def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if self._prev_handler is not None:
+            signal.signal(signal.SIGTERM, self._prev_handler)
+        if self._prev_usr1_handler is not None:
+            signal.signal(signal.SIGUSR1, self._prev_usr1_handler)
+
+    @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if self._got_signal:
+            # Request a checkpoint save at the next safe point.
+            logger.warning_rank0("Signal: requesting checkpoint save at step=%s.", state.global_step)
+            control.should_save = True
+            # Do not stop here; some Trainer loops check `should_training_stop` before saving.
+
+    @override
+    def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if self._got_signal:
+            logger.warning_rank0("Signal: checkpoint saved, stopping training.")
+            control.should_epoch_stop = True
+            control.should_training_stop = True
+            self._got_signal = False
+
+
 class ReporterCallback(TrainerCallback):
     r"""A callback for reporting training status to external logger."""
 
