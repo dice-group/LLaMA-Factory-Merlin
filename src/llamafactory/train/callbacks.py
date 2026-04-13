@@ -643,6 +643,7 @@ class JitCheckpointCallback(TrainerCallback):
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         if self._got_signal:
             logger.warning_rank0("Signal: checkpoint saved, stopping training.")
+            setattr(args, "jit_checkpoint_signal_stop", True)
             control.should_epoch_stop = True
             control.should_training_stop = True
             self._got_signal = False

@@ -181,15 +181,23 @@ def run_sft(
                 cb.set_accelerator(trainer.accelerator)
 
     # Training
+    signal_checkpoint_stop = False
     if training_args.do_train:
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        signal_checkpoint_stop = bool(getattr(training_args, "jit_checkpoint_signal_stop", False))
         # Ensure at least one log event flushes tracked router metrics to W&B.
         if trainer.is_world_process_zero():
             final_metrics = dict(train_result.metrics)
             if "train_loss" in final_metrics and "loss" not in final_metrics:
                 final_metrics["loss"] = final_metrics["train_loss"]
             trainer.log(final_metrics)
-        trainer.save_model()
+        if signal_checkpoint_stop:
+            logger.warning_rank0("Skipping final save_model after signal-triggered checkpoint save.")
+        else:
+            trainer.save_model()
+        if signal_checkpoint_stop:
+            logger.warning_rank0("Skipping post-train metric/state/modelcard work after signal-triggered checkpoint save.")
+            return
         if finetuning_args.include_effective_tokens_per_second:
             train_result.metrics["effective_tokens_per_sec"] = calculate_tps(
                 dataset_module["train_dataset"], train_result.metrics, stage="sft"
