@@ -599,6 +599,13 @@ class JitCheckpointCallback(TrainerCallback):
         self._got_signal = False
         self._prev_handler = None
         self._prev_usr1_handler = None
+        self._sentinel_path = None
+        self._train_started_monotonic = None
+        timeout_env = os.environ.get("LLAMAFACTORY_JIT_CHECKPOINT_AFTER_SECONDS", "").strip()
+        try:
+            self._checkpoint_after_seconds = float(timeout_env) if timeout_env else 0.0
+        except ValueError:
+            self._checkpoint_after_seconds = 0.0
 
     def _handle_signal(self, signum, frame) -> None:
         # Extra diagnostics: helps confirm signal delivery + timing under Slurm.
@@ -623,6 +630,13 @@ class JitCheckpointCallback(TrainerCallback):
         self._prev_usr1_handler = signal.getsignal(signal.SIGUSR1)
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGUSR1, self._handle_signal)
+        self._sentinel_path = os.path.join(args.output_dir, ".jit_checkpoint_requested")
+        self._train_started_monotonic = time.monotonic()
+        if self._sentinel_path and os.path.exists(self._sentinel_path):
+            try:
+                os.remove(self._sentinel_path)
+            except OSError:
+                pass
 
     @override
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
@@ -630,9 +644,33 @@ class JitCheckpointCallback(TrainerCallback):
             signal.signal(signal.SIGTERM, self._prev_handler)
         if self._prev_usr1_handler is not None:
             signal.signal(signal.SIGUSR1, self._prev_usr1_handler)
+        if self._sentinel_path and os.path.exists(self._sentinel_path):
+            try:
+                os.remove(self._sentinel_path)
+            except OSError:
+                pass
 
     @override
     def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if (
+            not self._got_signal
+            and self._checkpoint_after_seconds > 0
+            and self._train_started_monotonic is not None
+            and (time.monotonic() - self._train_started_monotonic) >= self._checkpoint_after_seconds
+        ):
+            logger.warning_rank0(
+                "Elapsed-time checkpoint trigger fired at step=%s after %.2fs.",
+                state.global_step,
+                time.monotonic() - self._train_started_monotonic,
+            )
+            self._got_signal = True
+        if not self._got_signal and self._sentinel_path and os.path.exists(self._sentinel_path):
+            logger.warning_rank0(
+                "Checkpoint request sentinel detected at step=%s: %s",
+                state.global_step,
+                self._sentinel_path,
+            )
+            self._got_signal = True
         if self._got_signal:
             # Request a checkpoint save at the next safe point.
             logger.warning_rank0("Signal: requesting checkpoint save at step=%s.", state.global_step)
@@ -642,6 +680,11 @@ class JitCheckpointCallback(TrainerCallback):
     @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         if self._got_signal:
+            if self._sentinel_path and os.path.exists(self._sentinel_path):
+                try:
+                    os.remove(self._sentinel_path)
+                except OSError:
+                    pass
             logger.warning_rank0("Signal: checkpoint saved, stopping training.")
             control.should_epoch_stop = True
             control.should_training_stop = True
