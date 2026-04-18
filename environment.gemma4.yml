@@ -1,0 +1,25 @@
+name: merlin-gemma4
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - omegaconf
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - cuda-toolkit=12.1
+  - pillow>=10
+  - pytest
+  - pip
+  - pip:
+      - transformers>=5.5.0
+      - datasets>=4.8.4
+      - accelerate>=1.8.0
+      - sentencepiece
+      - protobuf
+      - lm-eval==0.4.11
+      - huggingface_hub>=0.33.0
