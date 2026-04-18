@@ -326,6 +326,13 @@ def get_dataset(
                     cols = [c for c in metadata_cols if c in tokenized_train.column_names]
                     if cols:
                         dataset_module["train_dataset"] = tokenized_train.remove_columns(cols)
+
+            if data_args.max_samples is not None:
+                max_samples = int(data_args.max_samples)
+                for key in ("train_dataset", "eval_dataset"):
+                    dataset = dataset_module.get(key)
+                    if dataset is not None and hasattr(dataset, "select"):
+                        dataset_module[key] = dataset.select(range(min(max_samples, len(dataset))))
             if data_args.streaming:
                 dataset_module["train_dataset"] = dataset_module["train_dataset"].to_iterable_dataset()
 
