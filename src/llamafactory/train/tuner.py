@@ -76,6 +76,7 @@ def _training_function(config: dict[str, Any]) -> None:
         "adamole",
         "mixlora",
         "moelora",
+        "mtllora",
         "movlora",
         "hmora",
         "mola",
