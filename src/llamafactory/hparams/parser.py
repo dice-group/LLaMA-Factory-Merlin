@@ -143,6 +143,7 @@ def _verify_model_args(
         "adamole",
         "mixlora",
         "moelora",
+        "mtllora",
         "movlora",
         "hmora",
         "mola",
