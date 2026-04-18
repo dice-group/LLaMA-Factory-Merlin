@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 
 from ..lora import LoraConfig
 from ...utils.peft_types import PeftType
@@ -17,6 +17,10 @@ class MtlLoraConfig(LoraConfig):
     use_language_ids_as_task_ids: bool = field(
         default=True,
         metadata={"help": "Use batch language_ids as MTL-LoRA task ids."},
+    )
+    language_list: Optional[list[str]] = field(
+        default=None,
+        metadata={"help": "Ordered language list aligned with language_ids for eval-time task injection."},
     )
 
     def __post_init__(self):

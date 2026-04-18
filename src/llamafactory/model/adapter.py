@@ -1262,8 +1262,10 @@ def _setup_mtllora_tuning(
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
         task_num = finetuning_args.mtllora_task_num
+        language_list = None
         if finetuning_args.mtllora_use_language_ids_as_task_ids:
             language_map = load_language_map(finetuning_args.language_map)
+            language_list, _, _, _, _ = _build_language_metadata(finetuning_args.language_map)
             if language_map is not None:
                 language_count = len(language_map)
                 if task_num == 1:
@@ -1288,6 +1290,7 @@ def _setup_mtllora_tuning(
             temperature=finetuning_args.mtllora_temperature,
             lambda_format=finetuning_args.mtllora_lambda_format,
             use_language_ids_as_task_ids=finetuning_args.mtllora_use_language_ids_as_task_ids,
+            language_list=language_list,
         )
         model = get_peft_model(model, mtllora_config)
 
