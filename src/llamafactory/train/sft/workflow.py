@@ -86,6 +86,12 @@ def run_sft(
         logger.info_rank0(
             f"HMoRA: inferred hmora_num_task_embeddings={finetuning_args.hmora_num_task_embeddings} from train dataset language_ids."
         )
+    if finetuning_args.finetuning_type == "mtllora" and finetuning_args.mtllora_use_language_ids_as_task_ids:
+        train_dataset = dataset_module.get("train_dataset")
+        finetuning_args.mtllora_task_num = _infer_hmora_num_task_embeddings(train_dataset)
+        logger.info_rank0(
+            f"MTL-LoRA: inferred mtllora_task_num={finetuning_args.mtllora_task_num} from train dataset language_ids."
+        )
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
     if getattr(model, "is_quantized", False) and not training_args.do_train:

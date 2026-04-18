@@ -462,7 +462,7 @@ class FinetuningArguments(
         metadata={"help": "Which stage will be performed in training."},
     )
     finetuning_type: Literal[
-        "lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mixlora", "moelora", "movlora", "hmora", "mola", "moelpr"
+        "lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"
     ] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
@@ -726,6 +726,26 @@ class FinetuningArguments(
         default=1.0,
         metadata={"help": "Softmax temperature used in MoE-LoRA gate routing."},
     )
+    mtllora_task_num: int = field(
+        default=1,
+        metadata={"help": "Number of task ids for MTL-LoRA. In MoE Study these are language ids."},
+    )
+    mtllora_num_up_projections: int = field(
+        default=3,
+        metadata={"help": "Number of shared B/up-projection matrices used by MTL-LoRA."},
+    )
+    mtllora_temperature: float = field(
+        default=0.1,
+        metadata={"help": "Softmax temperature used for MTL-LoRA task-specific B mixing."},
+    )
+    mtllora_lambda_format: Literal["full", "diagonal"] = field(
+        default="full",
+        metadata={"help": "Task-specific MTL-LoRA lambda transform format."},
+    )
+    mtllora_use_language_ids_as_task_ids: bool = field(
+        default=True,
+        metadata={"help": "Use batch language_ids as task ids for MTL-LoRA."},
+    )
     movlora_num_experts: int = field(
         default=30,
         metadata={"help": "Number of IA3-vector experts per adapted module in MoV."},
@@ -951,6 +971,8 @@ class FinetuningArguments(
         self.mixlora_moe_target_modules: Optional[list[str]] = split_arg(self.mixlora_moe_target_modules)
         if isinstance(self.mixlora_act_fn, str):
             self.mixlora_act_fn = self.mixlora_act_fn.strip() or None
+        if isinstance(self.mtllora_lambda_format, str):
+            self.mtllora_lambda_format = self.mtllora_lambda_format.strip().lower()
         if isinstance(self.hmora_target_modules_lora, str):
             self.hmora_target_modules_lora = self.hmora_target_modules_lora.strip() or None
         if isinstance(self.hmora_task_token, str):
@@ -958,7 +980,7 @@ class FinetuningArguments(
         if self.cola_strategy == "random":
             self.cola_strategy = "random_ab"
 
-        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mixlora", "moelora", "movlora", "hmora", "mola", "moelpr"]
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
         assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
@@ -1009,6 +1031,16 @@ class FinetuningArguments(
             if self.lora_rank % self.moelora_num_experts != 0:
                 raise ValueError("`lora_rank` must be divisible by `moelora_num_experts` for MoE-LoRA.")
 
+        if self.finetuning_type == "mtllora":
+            if self.mtllora_task_num <= 0:
+                raise ValueError("`mtllora_task_num` must be positive.")
+            if self.mtllora_num_up_projections <= 0:
+                raise ValueError("`mtllora_num_up_projections` must be positive.")
+            if self.mtllora_temperature <= 0:
+                raise ValueError("`mtllora_temperature` must be positive.")
+            if self.mtllora_lambda_format not in {"full", "diagonal"}:
+                raise ValueError("`mtllora_lambda_format` must be either 'full' or 'diagonal'.")
+
         if self.finetuning_type == "movlora":
             if self.movlora_num_experts <= 0:
                 raise ValueError("`movlora_num_experts` must be positive.")
@@ -1053,7 +1085,7 @@ class FinetuningArguments(
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
 
-        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "mixlora", "moelora", "movlora", "hmora", "mola", "moelpr"]
+        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
 
         if self.stage == "ppo" and self.reward_model_type == "lora" and not lora_like:
             raise ValueError("`reward_model_type` cannot be lora for Freeze/Full PPO training.")

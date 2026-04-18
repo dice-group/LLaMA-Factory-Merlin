@@ -44,6 +44,7 @@ from .mixlora import MixLoraConfig, MixLoraModel
 from .moelora import MoELoraConfig, MoELoraModel
 from .movlora import MovLoraConfig, MovLoraModel
 from .moelpr import MoeConfig as MoelprConfig, MoeModel as MoelprModel
+from .mtllora import MtlLoraConfig, MtlLoraModel
 from .multitask_prompt_tuning import MultitaskPromptEmbedding, MultitaskPromptTuningConfig, MultitaskPromptTuningInit
 from .oft import OFTConfig, OFTModel
 from .p_tuning import PromptEncoder, PromptEncoderConfig, PromptEncoderReparameterizationType
@@ -103,6 +104,8 @@ __all__ = [
     "MixLoraModel",
     "MoELoraConfig",
     "MoELoraModel",
+    "MtlLoraConfig",
+    "MtlLoraModel",
     "MovLoraConfig",
     "MovLoraModel",
     "MolaConfig",
