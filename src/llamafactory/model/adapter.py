@@ -694,7 +694,12 @@ def _setup_mixlora_tuning(
             assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
             is_mergeable = False
 
-        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
+        if not is_trainable:
+            if len(model_args.adapter_name_or_path) > 1:
+                raise ValueError("MixLoRA evaluation supports only a single adapter_name_or_path.")
+            adapter_to_merge = []
+            adapter_to_resume = model_args.adapter_name_or_path[-1]
+        elif (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
             adapter_to_merge = model_args.adapter_name_or_path[:-1]
             adapter_to_resume = model_args.adapter_name_or_path[-1]
         else:
