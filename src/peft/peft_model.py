@@ -1661,6 +1661,8 @@ class PeftModelForSequenceClassification(PeftModel):
         if not peft_config.is_prompt_learning:
             with self._enable_peft_forward_hooks(**kwargs):
                 kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                if task_ids is not None:
+                    kwargs["task_ids"] = task_ids
                 if peft_config.peft_type == PeftType.POLY:
                     kwargs["task_ids"] = task_ids
                 return self.base_model(

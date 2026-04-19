@@ -68,6 +68,35 @@ def _infer_hmora_num_task_embeddings(train_dataset) -> int:
     return max(valid) + 1
 
 
+def _infer_task_count(train_dataset, column_name: str) -> int:
+    if train_dataset is None:
+        return 1
+
+    column_names = getattr(train_dataset, "column_names", None) or []
+    if column_name not in column_names:
+        return 1
+
+    unique_fn = getattr(train_dataset, "unique", None)
+    if callable(unique_fn):
+        try:
+            values = unique_fn(column_name)
+        except Exception:
+            values = None
+    else:
+        values = None
+
+    if values is None:
+        try:
+            values = train_dataset[column_name]
+        except Exception:
+            return 1
+
+    valid = [int(value) for value in values if value is not None and int(value) >= 0]
+    if not valid:
+        return 1
+    return max(valid) + 1
+
+
 def run_sft(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -86,11 +115,23 @@ def run_sft(
         logger.info_rank0(
             f"HMoRA: inferred hmora_num_task_embeddings={finetuning_args.hmora_num_task_embeddings} from train dataset language_ids."
         )
+    elif finetuning_args.finetuning_type == "hmora":
+        train_dataset = dataset_module.get("train_dataset")
+        finetuning_args.hmora_num_task_embeddings = _infer_task_count(train_dataset, "task_ids")
+        logger.info_rank0(
+            f"HMoRA: inferred hmora_num_task_embeddings={finetuning_args.hmora_num_task_embeddings} from train dataset task_ids."
+        )
     if finetuning_args.finetuning_type == "mtllora" and finetuning_args.mtllora_use_language_ids_as_task_ids:
         train_dataset = dataset_module.get("train_dataset")
         finetuning_args.mtllora_task_num = _infer_hmora_num_task_embeddings(train_dataset)
         logger.info_rank0(
             f"MTL-LoRA: inferred mtllora_task_num={finetuning_args.mtllora_task_num} from train dataset language_ids."
+        )
+    elif finetuning_args.finetuning_type == "mtllora":
+        train_dataset = dataset_module.get("train_dataset")
+        finetuning_args.mtllora_task_num = _infer_task_count(train_dataset, "task_ids")
+        logger.info_rank0(
+            f"MTL-LoRA: inferred mtllora_task_num={finetuning_args.mtllora_task_num} from train dataset task_ids."
         )
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 

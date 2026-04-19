@@ -110,7 +110,9 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
         batch_language_ids = []
+        batch_task_ids = []
         have_language_ids = False
+        have_task_ids = False
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
@@ -126,6 +128,10 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             if lang_raw is not None:
                 have_language_ids = True
             batch_language_ids.append(lang_raw if lang_raw is not None else LANGUAGE_PAD_ID)
+            task_raw = feature.pop("task_ids", None)
+            if task_raw is not None:
+                have_task_ids = True
+            batch_task_ids.append(task_raw if task_raw is not None else LANGUAGE_PAD_ID)
 
         fake_input_ids = []
         if (
@@ -241,6 +247,8 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         features.update(mm_inputs)
         if have_language_ids:
             features["language_ids"] = torch.tensor(batch_language_ids, dtype=torch.long)
+        if have_task_ids:
+            features["task_ids"] = torch.tensor(batch_task_ids, dtype=torch.long)
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape

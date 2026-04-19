@@ -81,6 +81,15 @@ class DatasetConverter:
             return str(example[column])
         return None
 
+    def _extract_task_id(self, example: dict[str, Any]) -> Optional[int]:
+        value = example.get("task_id")
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     @abstractmethod
     def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
         r"""Convert a single example in the dataset to the standard format."""
@@ -134,6 +143,7 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
             "_language": self._extract_language(example),
+            "_task_id": self._extract_task_id(example),
         }
         return output
 
@@ -231,6 +241,7 @@ class SharegptDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
             "_language": self._extract_language(example),
+            "_task_id": self._extract_task_id(example),
         }
         return output
 
@@ -372,6 +383,7 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
             "_language": self._extract_language(example),
+            "_task_id": self._extract_task_id(example),
         }
         return output
 

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+TASK_PAD_ID = LANGUAGE_PAD_ID
 
 
 @dataclass
@@ -92,6 +93,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         model_inputs = defaultdict(list)
         language_meta = self.data_args.get_language_metadata()
         languages = examples.get("_language")
+        task_ids = examples.get("_task_id")
         for i in range(len(examples["_prompt"])):
             if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
                 logger.warning_rank0(
@@ -120,6 +122,13 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             else:
                 lang_id = LANGUAGE_PAD_ID
             model_inputs["language_ids"].append(lang_id)
+            task_id = TASK_PAD_ID
+            if task_ids is not None and task_ids[i] is not None:
+                try:
+                    task_id = int(task_ids[i])
+                except (TypeError, ValueError):
+                    task_id = TASK_PAD_ID
+            model_inputs["task_ids"].append(task_id)
 
         return model_inputs
 
@@ -209,5 +218,6 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
             model_inputs["videos"].append(packed_videos or None)
             model_inputs["audios"].append(packed_audios or None)
             model_inputs["language_ids"].append(LANGUAGE_PAD_ID)
+            model_inputs["task_ids"].append(TASK_PAD_ID)
 
         return model_inputs

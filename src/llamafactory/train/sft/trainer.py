@@ -521,7 +521,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             pad_token_id = 0
 
         if labels is None:
-            return input_ids, attention_mask, inputs.get("language_ids")
+            task_ids = inputs.get("task_ids")
+            if task_ids is None:
+                task_ids = inputs.get("language_ids")
+            return input_ids, attention_mask, task_ids
 
         prompt_masks = []
         max_prompt_len = 0
@@ -533,7 +536,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             max_prompt_len = max(max_prompt_len, int(prompt_mask.sum().item()))
 
         if max_prompt_len <= 0:
-            return input_ids, attention_mask, inputs.get("language_ids")
+            task_ids = inputs.get("task_ids")
+            if task_ids is None:
+                task_ids = inputs.get("language_ids")
+            return input_ids, attention_mask, task_ids
 
         task_input_ids = input_ids.new_full((input_ids.size(0), max_prompt_len), int(pad_token_id))
         task_attention_mask = attention_mask.new_zeros((attention_mask.size(0), max_prompt_len))
@@ -545,7 +551,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             task_input_ids[row_idx, :length] = selected
             task_attention_mask[row_idx, :length] = 1
 
-        return task_input_ids, task_attention_mask, inputs.get("language_ids")
+        task_ids = inputs.get("task_ids")
+        if task_ids is None:
+            task_ids = inputs.get("language_ids")
+        return task_input_ids, task_attention_mask, task_ids
 
     def _inject_hmora_task_inputs(self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"]) -> None:
         if self.finetuning_args.finetuning_type != "hmora":
