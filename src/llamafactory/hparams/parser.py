@@ -179,6 +179,19 @@ def _verify_model_args(
         logger.warning_rank0("fp8_enable_fsdp_float8_all_gather requires fp8=True. Setting fp8=True.")
         model_args.fp8 = True
 
+    if (
+        finetuning_args.finetuning_type in {"cola", "hydralora"}
+        and float(getattr(finetuning_args, "language_prior_weight", 0.0) or 0.0) > 0.0
+        and not model_args.disable_gradient_checkpointing
+        and model_args.use_reentrant_gc
+    ):
+        model_args.use_reentrant_gc = False
+        logger.warning_rank0(
+            "LPR with %s is incompatible with reentrant gradient checkpointing because cached router logits lose "
+            "autograd history. Forcing `use_reentrant_gc=False`.",
+            finetuning_args.finetuning_type,
+        )
+
 
 def _check_extra_dependencies(
     model_args: "ModelArguments",

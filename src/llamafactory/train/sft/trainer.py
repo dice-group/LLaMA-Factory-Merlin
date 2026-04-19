@@ -192,12 +192,42 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             if not hasattr(self, "_cola_router_params"):
                 module = getattr(model, "module", model)
                 self._cola_router_params = [
-                    param for name, param in module.named_parameters() if "router.weight" in name
+                    param for name, param in module.named_parameters() if ".router." in name
                 ]
             total = len(self._cola_router_params)
             present = sum(1 for param in self._cola_router_params if param.grad is not None)
             frac = float(present / total) if total > 0 else 0.0
-            record_cola_metrics({"router_grad_present_frac": frac}, weight=1.0)
+            record_cola_metrics(
+                {
+                    "router_grad_present_frac": frac,
+                    "expert_router_grad_present_frac": frac,
+                },
+                weight=1.0,
+            )
+        elif self.finetuning_args.finetuning_type == "hydralora":
+            if not hasattr(self, "_hydralora_expert_router_params"):
+                module = getattr(model, "module", model)
+                self._hydralora_expert_router_params = [
+                    param for name, param in module.named_parameters() if ".router." in name
+                ]
+                self._hydralora_head_router_params = [
+                    param for name, param in module.named_parameters() if ".lora_route." in name
+                ]
+
+            expert_total = len(self._hydralora_expert_router_params)
+            expert_present = sum(1 for param in self._hydralora_expert_router_params if param.grad is not None)
+            head_total = len(self._hydralora_head_router_params)
+            head_present = sum(1 for param in self._hydralora_head_router_params if param.grad is not None)
+            total = expert_total + head_total
+            present = expert_present + head_present
+            record_hydralora_metrics(
+                {
+                    "router_grad_present_frac": float(present / total) if total > 0 else 0.0,
+                    "expert_router_grad_present_frac": float(expert_present / expert_total) if expert_total > 0 else 0.0,
+                    "head_router_grad_present_frac": float(head_present / head_total) if head_total > 0 else 0.0,
+                },
+                weight=1.0,
+            )
 
         return loss
 
@@ -288,7 +318,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if not states:
             return None
 
-        losses = []
+        raw_losses = []
+        state_count = 0
+        valid_target_count = 0
         for _, logits, targets in states:
             if logits is None or targets is None:
                 continue
@@ -297,19 +329,29 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             valid = targets >= 0
             if not valid.any():
                 continue
-            losses.append(F.cross_entropy(logits[valid], targets[valid], reduction="mean"))
+            raw_losses.append(F.cross_entropy(logits[valid], targets[valid], reduction="mean"))
+            state_count += 1
+            valid_target_count += int(valid.sum().item())
 
-        if not losses:
+        if not raw_losses:
             return None
 
-        aux = weight * sum(losses) / len(losses)
+        raw = sum(raw_losses) / len(raw_losses)
+        aux = weight * raw
+        language_prior_loss_raw = float(raw.detach().mean().cpu())
         language_prior_loss = float(aux.detach().mean().cpu())
+        metrics = {
+            "language_prior_loss_raw": language_prior_loss_raw,
+            "language_prior_loss": language_prior_loss,
+            "language_prior_router_state_count": float(state_count),
+            "language_prior_valid_target_count": float(valid_target_count),
+        }
         if self.finetuning_args.finetuning_type == "hydralora":
-            record_hydralora_metrics({"language_prior_loss": language_prior_loss}, weight=1.0)
+            record_hydralora_metrics(metrics, weight=1.0)
         else:
-            record_cola_metrics({"language_prior_loss": language_prior_loss}, weight=1.0)
+            record_cola_metrics(metrics, weight=1.0)
         # Keep parity with other auxiliary losses so trainer_state captures this signal.
-        self.log({"language_prior_loss": language_prior_loss})
+        self.log(metrics)
         return aux
 
     def _compute_adamole_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
