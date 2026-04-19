@@ -188,7 +188,8 @@ class TokenRouter(nn.Module):
 
         safe_max_layer = max(max_layer_id, 1)
         alpha = -epsilon_alpha + 2 * epsilon_alpha * (layer_id / safe_max_layer) + alpha_shift
-        alpha_tensor = torch.tensor(alpha, dtype=dtype)
+        # FSDP rejects 0-D parameters, so keep alpha as a length-1 tensor.
+        alpha_tensor = torch.tensor([alpha], dtype=dtype)
 
         if use_task_router:
             if task_router_only:
@@ -205,7 +206,7 @@ class TokenRouter(nn.Module):
                 self.task_router_only = True
                 self.alpha = None
             else:
-                alpha_ratio = torch.sigmoid(alpha_tensor)
+                alpha_ratio = torch.sigmoid(alpha_tensor).item()
                 if alpha_ratio < alpha_low_bound:
                     self.task_router = None
                     self.task_router_only = False

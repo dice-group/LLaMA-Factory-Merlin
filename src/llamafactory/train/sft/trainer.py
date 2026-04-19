@@ -183,11 +183,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ) -> "torch.Tensor":
         loss = super().training_step(model, inputs, *args, **kwargs)
 
-        if self.finetuning_args.finetuning_type == "hmora" and getattr(self.accelerator, "sync_gradients", False):
-            extra = self._apply_hmora_task_router_step_loss(model)
-            if extra is not None:
-                loss = loss + extra.detach()
-
         if self.finetuning_args.finetuning_type == "cola":
             if not hasattr(self, "_cola_router_params"):
                 module = getattr(model, "module", model)
@@ -459,7 +454,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if lm_scale != 1.0:
             extra_terms.append((lm_scale - 1.0) * base_loss)
 
-        aux = aux_fn(include_task_router=False)
+        aux = aux_fn(include_task_router=True)
         if aux is not None and aux_scale > 0:
             scaled_aux = aux_scale * aux
             self.log({"hmora_aux_loss": float(scaled_aux.detach().mean().cpu())})
