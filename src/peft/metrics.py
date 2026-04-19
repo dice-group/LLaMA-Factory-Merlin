@@ -190,6 +190,10 @@ def record_hydralora_metrics(metrics: Dict[str, float], weight: float) -> None:
     _SCALAR_STORE.update("hydralora", metrics, weight)
 
 
+def record_hala_metrics(metrics: Dict[str, float], weight: float) -> None:
+    _SCALAR_STORE.update("hala", metrics, weight)
+
+
 def record_movlora_metrics(metrics: Dict[str, float], weight: float) -> None:
     _SCALAR_STORE.update("movlora", metrics, weight)
 
@@ -249,3 +253,8 @@ def pop_tracked_metrics() -> Dict[str, float]:
     routing_metrics = _MOELPR_ROUTING.pop()
     metrics.update(routing_metrics)
     return metrics
+
+
+def clear_tracked_metrics() -> None:
+    _SCALAR_STORE.pop()
+    _MOELPR_ROUTING.pop()

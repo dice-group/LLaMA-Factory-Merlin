@@ -26,7 +26,13 @@ import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
-from peft.metrics import pop_tracked_metrics, record_cola_metrics, record_hydralora_metrics
+from peft.metrics import (
+    clear_tracked_metrics,
+    pop_tracked_metrics,
+    record_cola_metrics,
+    record_hala_metrics,
+    record_hydralora_metrics,
+)
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
@@ -223,6 +229,30 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 },
                 weight=1.0,
             )
+        elif self.finetuning_args.finetuning_type == "hala":
+            if not hasattr(self, "_hala_expert_router_params"):
+                module = getattr(model, "module", model)
+                self._hala_expert_router_params = [
+                    param for name, param in module.named_parameters() if ".router." in name
+                ]
+                self._hala_head_router_params = [
+                    param for name, param in module.named_parameters() if ".lora_route." in name
+                ]
+
+            expert_total = len(self._hala_expert_router_params)
+            expert_present = sum(1 for param in self._hala_expert_router_params if param.grad is not None)
+            head_total = len(self._hala_head_router_params)
+            head_present = sum(1 for param in self._hala_head_router_params if param.grad is not None)
+            total = expert_total + head_total
+            present = expert_present + head_present
+            record_hala_metrics(
+                {
+                    "router_grad_present_frac": float(present / total) if total > 0 else 0.0,
+                    "expert_router_grad_present_frac": float(expert_present / expert_total) if expert_total > 0 else 0.0,
+                    "head_router_grad_present_frac": float(head_present / head_total) if head_total > 0 else 0.0,
+                },
+                weight=1.0,
+            )
 
         return loss
 
@@ -231,14 +261,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         is_train_log = any(key in logs for key in ("loss", "learning_rate")) or any(
             key.startswith("train/") for key in logs
         )
-        if is_train_log:
-            extra = pop_tracked_metrics()
-            if extra:
-                for key, value in extra.items():
-                    if value is None:
-                        continue
-                    scoped = key if key.startswith("train/") else f"train/{key}"
-                    logs[scoped] = value
+        extra = pop_tracked_metrics()
+        if extra:
+            phase_prefix = "train" if is_train_log else "eval"
+            for key, value in extra.items():
+                if value is None:
+                    continue
+                scoped = key if key.startswith(("train/", "eval/", "test/")) else f"{phase_prefix}/{key}"
+                logs[scoped] = value
+        elif not is_train_log:
+            clear_tracked_metrics()
         super().log(logs, *args, **kwargs)
 
     @override
@@ -343,6 +375,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         }
         if self.finetuning_args.finetuning_type == "hydralora":
             record_hydralora_metrics(metrics, weight=1.0)
+        elif self.finetuning_args.finetuning_type == "hala":
+            record_hala_metrics(metrics, weight=1.0)
         else:
             record_cola_metrics(metrics, weight=1.0)
         # Keep parity with other auxiliary losses so trainer_state captures this signal.
@@ -481,7 +515,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return mask
 
     def _inject_language_router_inputs(self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"]) -> None:
-        if self.finetuning_args.finetuning_type not in {"cola", "hydralora"}:
+        if self.finetuning_args.finetuning_type not in {"cola", "hydralora", "hala"}:
             return
 
         language_ids = inputs.get("language_ids")

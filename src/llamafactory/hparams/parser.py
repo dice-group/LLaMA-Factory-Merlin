@@ -140,6 +140,7 @@ def _verify_model_args(
         "oft",
         "cola",
         "hydralora",
+        "hala",
         "adamole",
         "mixlora",
         "moelora",
@@ -180,7 +181,7 @@ def _verify_model_args(
         model_args.fp8 = True
 
     if (
-        finetuning_args.finetuning_type in {"cola", "hydralora"}
+        finetuning_args.finetuning_type in {"cola", "hydralora", "hala"}
         and float(getattr(finetuning_args, "language_prior_weight", 0.0) or 0.0) > 0.0
         and not model_args.disable_gradient_checkpointing
         and model_args.use_reentrant_gc

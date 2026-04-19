@@ -15,18 +15,25 @@
 import os
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
+# its not nice, but workaround since gemma 4 model requires newer transformer version
 import torch
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForSeq2SeqLM,
-    AutoModelForTextToWaveform,
-    AutoModelForVision2Seq,
-    AutoProcessor,
-    AutoTokenizer,
-)
-from trl import AutoModelForCausalLMWithValueHead
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoProcessor, AutoTokenizer
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # compatibility fallback for older/local transformers builds
+    AutoModelForImageTextToText = None
+try:
+    from transformers import AutoModelForTextToWaveform
+except ImportError:  # compatibility fallback for older/local transformers builds
+    AutoModelForTextToWaveform = None
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # compatibility fallback for older/local transformers builds
+    AutoModelForVision2Seq = None
+try:
+    from trl import AutoModelForCausalLMWithValueHead
+except ImportError:  # compatibility fallback when RLHF extras are unavailable
+    AutoModelForCausalLMWithValueHead = None
 
 from ..extras import logging
 from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
@@ -162,13 +169,13 @@ def load_model(
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
         else:
-            if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
+            if AutoModelForImageTextToText is not None and type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
-            elif type(config) in AutoModelForVision2Seq._model_mapping.keys():  # image-text
+            elif AutoModelForVision2Seq is not None and type(config) in AutoModelForVision2Seq._model_mapping.keys():  # image-text
                 load_class = AutoModelForVision2Seq
             elif type(config) in AutoModelForSeq2SeqLM._model_mapping.keys():  # audio-text
                 load_class = AutoModelForSeq2SeqLM
-            elif type(config) in AutoModelForTextToWaveform._model_mapping.keys():  # audio hack for qwen omni
+            elif AutoModelForTextToWaveform is not None and type(config) in AutoModelForTextToWaveform._model_mapping.keys():  # audio hack for qwen omni
                 load_class = AutoModelForTextToWaveform
             else:
                 load_class = AutoModelForCausalLM
@@ -190,6 +197,8 @@ def load_model(
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
     if add_valuehead:
+        if AutoModelForCausalLMWithValueHead is None:
+            raise ImportError("AutoModelForCausalLMWithValueHead is unavailable in the local TRL install.")
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
         patch_valuehead_model(model)
 

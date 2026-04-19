@@ -29,6 +29,7 @@ class PeftType(str, enum.Enum):
     - ADALORA
     - COLA
     - HYDRALORA
+    - HALA
     - BOFT
     - ADAPTION_PROMPT
     - IA3
@@ -64,6 +65,7 @@ class PeftType(str, enum.Enum):
     ADALORA = "ADALORA"
     COLA = "COLA"
     HYDRALORA = "HYDRALORA"
+    HALA = "HALA"
     BOFT = "BOFT"
     ADAPTION_PROMPT = "ADAPTION_PROMPT"
     IA3 = "IA3"

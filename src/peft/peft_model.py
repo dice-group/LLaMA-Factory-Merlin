@@ -34,7 +34,11 @@ from huggingface_hub import HfFileSystem, ModelCard, ModelCardData, hf_hub_downl
 from safetensors import safe_open
 from safetensors.torch import save_file as safe_save_file
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from transformers import Cache, DynamicCache, EncoderDecoderCache, HybridCache, PreTrainedModel
+from transformers import Cache, DynamicCache, EncoderDecoderCache, PreTrainedModel
+try:
+    from transformers import HybridCache
+except ImportError:  # transformers compatibility fallback for older local environments
+    HybridCache = Cache
 from transformers.modeling_outputs import QuestionAnsweringModelOutput, SequenceClassifierOutput, TokenClassifierOutput
 from transformers.utils import PushToHubMixin
 

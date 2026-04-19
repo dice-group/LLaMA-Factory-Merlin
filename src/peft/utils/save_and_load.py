@@ -89,6 +89,7 @@ def get_peft_model_state_dict(
         PeftType.ADALORA,
         PeftType.COLA,
         PeftType.HYDRALORA,
+        PeftType.HALA,
         PeftType.ADAMOLE,
         PeftType.MIXLORA,
         PeftType.MOELORA,
@@ -104,6 +105,8 @@ def get_peft_model_state_dict(
         if config.peft_type == PeftType.COLA and getattr(config, "use_cola_experts", False):
             include_expert_keys = True
         if config.peft_type == PeftType.HYDRALORA and getattr(config, "use_hydralora_experts", False):
+            include_expert_keys = True
+        if config.peft_type == PeftType.HALA and getattr(config, "use_hydralora_experts", False):
             include_expert_keys = True
 
         # Some LoRA-prefixed custom tuners (e.g. IA3-style MoV variants) may not expose
@@ -135,7 +138,7 @@ def get_peft_model_state_dict(
                 for k, v in to_return.items()
                 if (("lora_" in k and adapter_name in k) or ("bias" in k))
             }
-        if config.peft_type in (PeftType.COLA, PeftType.HYDRALORA):
+        if config.peft_type in (PeftType.COLA, PeftType.HYDRALORA, PeftType.HALA):
             # CoLA/Hydra expert routers live under `*.router.*` and are not prefixed with "lora_".
             # Include them explicitly so adapter checkpoints contain expert routing weights.
             for key, val in state_dict.items():
@@ -148,7 +151,7 @@ def get_peft_model_state_dict(
                 config.rank_pattern = rank_pattern
                 to_return = model.resize_state_dict_by_rank_pattern(rank_pattern, to_return, adapter_name)
 
-        if getattr(config, "use_dora", False) and config.peft_type not in (PeftType.COLA, PeftType.HYDRALORA):
+        if getattr(config, "use_dora", False) and config.peft_type not in (PeftType.COLA, PeftType.HYDRALORA, PeftType.HALA):
             # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
             # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer. Since
             # we want the state_dict format not to change, we remove the "weight" part.
@@ -490,7 +493,7 @@ def set_peft_model_state_dict(
                     del state_dict[k]
                     del state_dict[k.replace("_topk_indices", "_topk_weights")]
 
-        if config.peft_type in (PeftType.COLA, PeftType.HYDRALORA) and any(
+        if config.peft_type in (PeftType.COLA, PeftType.HYDRALORA, PeftType.HALA) and any(
             ".expert_" in key for key in state_dict
         ):
             expert_state_dict = {k: v for k, v in state_dict.items() if ".expert_" in k}

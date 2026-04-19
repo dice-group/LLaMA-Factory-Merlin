@@ -53,6 +53,10 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _safe_serialization_enabled(args: "TrainingArguments") -> bool:
+    return bool(getattr(args, "save_safetensors", False))
+
+
 def fix_valuehead_checkpoint(
     model: "AutoModelForCausalLMWithValueHead", output_dir: str, safe_serialization: bool
 ) -> None:
@@ -106,7 +110,9 @@ class FixValueHeadModelCallback(TrainerCallback):
         if args.should_save:
             output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
             fix_valuehead_checkpoint(
-                model=kwargs.pop("model"), output_dir=output_dir, safe_serialization=args.save_safetensors
+                model=kwargs.pop("model"),
+                output_dir=output_dir,
+                safe_serialization=_safe_serialization_enabled(args),
             )
 
 
@@ -331,7 +337,7 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
     @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
-        self._save_adapter(kwargs.pop("model"), output_dir, args.save_safetensors)
+        self._save_adapter(kwargs.pop("model"), output_dir, _safe_serialization_enabled(args))
 
 
 class SaveAdapterMilestoneCallback(TrainerCallback):
@@ -389,7 +395,7 @@ class PissaConvertCallback(TrainerCallback):
             if isinstance(model, PeftModel):
                 init_lora_weights = getattr(model.peft_config["default"], "init_lora_weights")
                 setattr(model.peft_config["default"], "init_lora_weights", True)
-                model.save_pretrained(pissa_init_dir, safe_serialization=args.save_safetensors)
+                model.save_pretrained(pissa_init_dir, safe_serialization=_safe_serialization_enabled(args))
                 setattr(model.peft_config["default"], "init_lora_weights", init_lora_weights)
 
     @override
@@ -407,11 +413,11 @@ class PissaConvertCallback(TrainerCallback):
             if isinstance(model, PeftModel):
                 init_lora_weights = getattr(model.peft_config["default"], "init_lora_weights")
                 setattr(model.peft_config["default"], "init_lora_weights", True)
-                model.save_pretrained(pissa_backup_dir, safe_serialization=args.save_safetensors)
+                model.save_pretrained(pissa_backup_dir, safe_serialization=_safe_serialization_enabled(args))
                 setattr(model.peft_config["default"], "init_lora_weights", init_lora_weights)
                 model.save_pretrained(
                     pissa_convert_dir,
-                    safe_serialization=args.save_safetensors,
+                    safe_serialization=_safe_serialization_enabled(args),
                     path_initial_model_for_weight_conversion=pissa_init_dir,
                 )
                 model.load_adapter(pissa_backup_dir, "default", is_trainable=True)

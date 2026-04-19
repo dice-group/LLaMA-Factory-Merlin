@@ -69,13 +69,13 @@ MCA_SUPPORTED_MODELS = {
     "qwen3_next",
 }
 
-METHODS = ["full", "freeze", "lora", "oft", "cola", "hydralora", "adamole", "moelora", "movlora", "hmora", "mola", "moelpr"]
+METHODS = ["full", "freeze", "lora", "oft", "cola", "hydralora", "hala", "adamole", "moelora", "movlora", "hmora", "mola", "moelpr"]
 
 MOD_SUPPORTED_MODELS = {"bloom", "falcon", "gemma", "llama", "mistral", "mixtral", "phi", "starcoder2"}
 
 MULTIMODAL_SUPPORTED_MODELS = set()
 
-PEFT_METHODS = {"lora", "oft", "cola", "hydralora", "adamole", "moelora", "movlora", "hmora", "mola", "moelpr"}
+PEFT_METHODS = {"lora", "oft", "cola", "hydralora", "hala", "adamole", "moelora", "movlora", "hmora", "mola", "moelpr"}
 
 RUNNING_LOG = "running_log.txt"
 

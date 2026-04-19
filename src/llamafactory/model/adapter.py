@@ -22,6 +22,7 @@ from peft import (
     AdaMoleConfig,
     ColaConfig,
     HMoRaConfig,
+    HalaConfig,
     HydraLoraConfig,
     LoraConfig,
     LoraModel,
@@ -971,6 +972,159 @@ def _setup_hydralora_tuning(
     return model
 
 
+def _setup_hala_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if model_args.use_kt or model_args.use_unsloth:
+        raise ValueError("HALA is not compatible with KTransformers or Unsloth.")
+
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: HALA")
+
+    adapter_to_resume = None
+    expected_experts: Optional[int] = None
+    expected_heads: Optional[list[int]] = None
+
+    if model_args.adapter_name_or_path is not None:
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("HALA adapters are non-mergeable; only a single adapter_name_or_path is supported.")
+        if is_trainable and finetuning_args.create_new_adapter:
+            raise ValueError("HALA does not support create_new_adapter on top of an existing routed adapter.")
+        adapter_to_merge = []
+        adapter_to_resume = model_args.adapter_name_or_path[-1]
+
+        init_kwargs = {
+            "subfolder": model_args.adapter_folder,
+            "offload_folder": model_args.offload_folder,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+        if adapter_to_resume is not None:
+            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+        logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+
+    if is_trainable and adapter_to_resume is None:
+        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+            target_modules = None
+        else:
+            target_modules = finetuning_args.lora_target
+
+        if finetuning_args.use_llama_pro and target_modules is not None:
+            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        if model_args.resize_vocab and finetuning_args.additional_target is None:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            module_names = set()
+            for name, module in model.named_modules():
+                if module in [input_embeddings, output_embeddings]:
+                    module_names.add(name.split(".")[-1])
+            finetuning_args.additional_target = module_names
+            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        expert_lora_nums = _parse_optional_int_list(finetuning_args.hala_expert_lora_nums)
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "lora_num": finetuning_args.lora_num,
+            "expert_lora_nums": expert_lora_nums,
+            "use_hydralora_experts": True,
+            "num_experts": finetuning_args.hala_num_experts,
+            "top_k": finetuning_args.hala_top_k,
+            "head_top_k": finetuning_args.hala_head_top_k,
+            "hydralora_debug": finetuning_args.hala_debug,
+            "hala_execution_mode": finetuning_args.hala_execution_mode,
+            "modules_to_save": finetuning_args.additional_target,
+        }
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+        if family_list:
+            expected_experts = len(family_list)
+        if expected_experts and finetuning_args.hala_num_experts != expected_experts:
+            raise ValueError(
+                "HALA expert config mismatch: "
+                f"hala_num_experts={finetuning_args.hala_num_experts} "
+                f"but language_map defines {expected_experts} groups."
+            )
+        if expert_lora_nums is None and subgroup_sizes and any(size > 0 for size in subgroup_sizes):
+            expert_lora_nums = subgroup_sizes
+        if expert_lora_nums is None and expected_experts:
+            expert_lora_nums = [finetuning_args.lora_num] * expected_experts
+        if expert_lora_nums is not None and expected_experts:
+            if len(expert_lora_nums) != expected_experts:
+                raise ValueError(
+                    "HALA expert head config mismatch: "
+                    f"expected {expected_experts} entries but got {len(expert_lora_nums)}."
+                )
+            if any(count <= 0 for count in expert_lora_nums):
+                raise ValueError("HALA expert head config contains non-positive counts.")
+            expected_heads = list(expert_lora_nums)
+        peft_kwargs.update(
+            {
+                "expert_lora_nums": expert_lora_nums,
+                "language_map": language_map,
+                "language_list": language_list,
+                "family_list": family_list,
+                "language_to_family_ids": language_to_family,
+                "language_to_subgroup_ids": language_to_subgroup_ids,
+                "language_column": finetuning_args.language_column,
+                "language_router_mode": finetuning_args.language_router_mode,
+                "language_head_router_mode": finetuning_args.language_head_router_mode,
+                "language_guidance_scope": finetuning_args.language_guidance_scope,
+                "language_prior_weight": finetuning_args.language_prior_weight,
+                "language_bias_value": finetuning_args.language_bias_value,
+                "language_head_bias_value": finetuning_args.language_head_bias_value,
+            }
+        )
+        hala_config = HalaConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+        model = get_peft_model(model, hala_config)
+
+    sample_layer = next((m for _, m in model.named_modules() if hasattr(m, "use_hydralora_experts")), None)
+    if sample_layer is not None:
+        actual_experts = int(getattr(sample_layer, "num_experts", 0) or 0)
+        actual_heads = []
+        for idx in range(actual_experts):
+            key = f"expert_{idx}"
+            count = 0
+            if hasattr(sample_layer, "lora_num") and key in sample_layer.lora_num:
+                count = int(sample_layer.lora_num.get(key, 0) or 0)
+            actual_heads.append(count)
+        logger.info_rank0(
+            "[HALA SETUP] mode=%s experts=%s heads_per_expert=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
+            finetuning_args.hala_execution_mode,
+            actual_experts,
+            actual_heads,
+            finetuning_args.language_router_mode,
+            finetuning_args.language_head_router_mode,
+            finetuning_args.language_guidance_scope,
+            finetuning_args.hala_top_k,
+            finetuning_args.hala_head_top_k,
+        )
+        if expected_experts is not None and actual_experts != expected_experts:
+            raise ValueError(f"HALA runtime experts mismatch: expected {expected_experts}, got {actual_experts}.")
+        if expected_heads is not None and actual_heads != expected_heads:
+            raise ValueError(f"HALA runtime head mismatch: expected {expected_heads}, got {actual_heads}.")
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
 def _setup_adamole_tuning(
     config: "PretrainedConfig",
     model: "PreTrainedModel",
@@ -1781,6 +1935,10 @@ def init_adapter(
         )
     elif finetuning_args.finetuning_type == "hydralora":
         model = _setup_hydralora_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "hala":
+        model = _setup_hala_tuning(
             config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
         )
     elif finetuning_args.finetuning_type == "adamole":

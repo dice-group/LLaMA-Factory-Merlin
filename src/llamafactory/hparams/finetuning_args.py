@@ -462,7 +462,7 @@ class FinetuningArguments(
         metadata={"help": "Which stage will be performed in training."},
     )
     finetuning_type: Literal[
-        "lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"
+        "lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"
     ] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
@@ -591,6 +591,27 @@ class FinetuningArguments(
     hydralora_expert_lora_nums: Optional[str] = field(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HydraLoRA expert when MoE is enabled."},
+    )
+    hala_num_experts: int = field(
+        default=1,
+        metadata={"help": "Number of experts per HALA layer."},
+    )
+    hala_top_k: int = field(
+        default=1,
+        metadata={"help": "Top-k experts selected per token in HALA."},
+    )
+    hala_head_top_k: Optional[int] = field(
+        default=None,
+        metadata={"help": "Top-k heads selected per expert in HALA (None or <=0 keeps dense head mixing)."},
+    )
+    hala_debug: bool = field(default=False, metadata={"help": "Enable verbose HALA debugging output."})
+    hala_expert_lora_nums: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional comma-separated list overriding `lora_num` per HALA expert."},
+    )
+    hala_execution_mode: Literal["dense_expert_dense_head", "sparse_expert_dense_head"] = field(
+        default="dense_expert_dense_head",
+        metadata={"help": "HALA execution mode."},
     )
     mola_num_experts: int = field(default=4, metadata={"help": "Number of experts used by MoLA."})
     mola_top_k: int = field(default=2, metadata={"help": "Top-k experts routed to for each token in MoLA."})
@@ -968,6 +989,8 @@ class FinetuningArguments(
             self.cola_expert_num_B = self.cola_expert_num_B.strip() or None
         if isinstance(self.hydralora_expert_lora_nums, str):
             self.hydralora_expert_lora_nums = self.hydralora_expert_lora_nums.strip() or None
+        if isinstance(self.hala_expert_lora_nums, str):
+            self.hala_expert_lora_nums = self.hala_expert_lora_nums.strip() or None
         self.mixlora_moe_target_modules: Optional[list[str]] = split_arg(self.mixlora_moe_target_modules)
         if isinstance(self.mixlora_act_fn, str):
             self.mixlora_act_fn = self.mixlora_act_fn.strip() or None
@@ -980,7 +1003,7 @@ class FinetuningArguments(
         if self.cola_strategy == "random":
             self.cola_strategy = "random_ab"
 
-        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
         assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
@@ -1082,10 +1105,20 @@ class FinetuningArguments(
             if self.hmora_eta_b != 1.0 and self.loraplus_lr_ratio is not None:
                 raise ValueError("`hmora_eta_b` cannot be combined with `loraplus_lr_ratio`.")
 
+        if self.finetuning_type == "hala":
+            if self.hala_num_experts <= 0:
+                raise ValueError("`hala_num_experts` must be positive.")
+            if self.hala_top_k <= 0 or self.hala_top_k > self.hala_num_experts:
+                raise ValueError("`hala_top_k` must be in range [1, hala_num_experts].")
+            if self.hala_head_top_k is not None and self.hala_head_top_k <= 0:
+                self.hala_head_top_k = None
+            if self.hala_execution_mode not in {"dense_expert_dense_head", "sparse_expert_dense_head"}:
+                raise ValueError("`hala_execution_mode` must be either 'dense_expert_dense_head' or 'sparse_expert_dense_head'.")
+
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
 
-        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
+        lora_like = self.finetuning_type in ["lora", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
 
         if self.stage == "ppo" and self.reward_model_type == "lora" and not lora_like:
             raise ValueError("`reward_model_type` cannot be lora for Freeze/Full PPO training.")

@@ -24,6 +24,7 @@ from .cpt import CPTConfig, CPTEmbedding
 from .fourierft import FourierFTConfig, FourierFTModel
 from .hra import HRAConfig, HRAModel
 from .hmora import HMoRaConfig, HMoRaModel
+from .hala import HalaConfig, HalaModel
 from .hydralora import HydraLoraConfig, HydraLoraModel
 from .ia3 import IA3Config, IA3Model
 from .ln_tuning import LNTuningConfig, LNTuningModel
@@ -83,6 +84,8 @@ __all__ = [
     "HRAModel",
     "HMoRaConfig",
     "HMoRaModel",
+    "HalaConfig",
+    "HalaModel",
     "HydraLoraConfig",
     "HydraLoraModel",
     "IA3Config",
