@@ -275,7 +275,8 @@ class TokenRouter(nn.Module):
             routing_weight = task_weight.unsqueeze(-2).expand(hidden_states.shape[:-1] + (self.num_experts,))
             self.routing_weight = routing_weight
         else:
-            token_weight = F.softmax(self.mlp(hidden_states), dim=-1)
+            mlp_dtype = next(self.mlp.parameters()).dtype if self.mlp is not None else hidden_states.dtype
+            token_weight = F.softmax(self.mlp(hidden_states.to(mlp_dtype)), dim=-1)
             self.token_routing_weight = token_weight
             if self.task_router is not None:
                 task_weight = self.task_router.get_task_weight()
