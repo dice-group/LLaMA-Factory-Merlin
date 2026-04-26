@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from transformers.pytorch_utils import Conv1D
 
+from peft.metrics import record_hala_metrics
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from ..utils.language_routing import LANGUAGE_PAD_ID
 
@@ -162,6 +163,47 @@ class Linear(nn.Module, HalaLoraLayer):
         route_logits = self._apply_language_bias_heads(route_logits, head_targets)
         route_weight = self._head_router_weights(route_logits)
         route_weight = self._enforce_language_heads(route_weight, head_targets)
+        if self.track_router_metrics:
+            with torch.no_grad():
+                token_count = route_weight.numel() // route_weight.size(-1)
+                if token_count > 0:
+                    head_assign = torch.argmax(route_weight, dim=-1, keepdim=True)
+                    flat_assign = head_assign.reshape(-1)
+                    head_counts = torch.bincount(flat_assign, minlength=len(B_list)).to(torch.float32)
+                    mean_head = head_counts.mean().item()
+                    head_cv = float((head_counts.std(unbiased=False) / (mean_head + 1e-6)).item()) if mean_head > 0 else 0.0
+                    head_active = float((head_counts > 0).float().mean().item())
+                    head_entropy = float((-route_weight * torch.log(route_weight + 1e-8)).sum(dim=-1).mean().item())
+                    total_head_assign = head_counts.sum()
+                    if total_head_assign > 0:
+                        head_frac = head_counts / total_head_assign
+                        head_max = float(head_frac.max().item())
+                        head_min = float(head_frac.min().item())
+                    else:
+                        head_max = 0.0
+                        head_min = 0.0
+                    metrics = {
+                        "head_load_cv": head_cv,
+                        "head_active_frac": head_active,
+                        "head_router_entropy": head_entropy,
+                        "head_load_max_frac": head_max,
+                        "head_load_min_frac": head_min,
+                    }
+                    metrics_weight = float(token_count)
+                    coverage_metrics, target_metrics, target_weight = self._append_target_metrics(
+                        metrics=metrics,
+                        metrics_weight=metrics_weight,
+                        prefix="head",
+                        target_tensor=head_targets,
+                        selection=head_assign.squeeze(-1),
+                        probs=route_weight,
+                        language_ids=language_ids,
+                        expect_targets=use_head_guidance and self.language_list is not None,
+                    )
+                    metrics.update(coverage_metrics)
+                    record_hala_metrics(metrics, weight=metrics_weight)
+                    if target_metrics and target_weight > 0:
+                        record_hala_metrics(target_metrics, weight=target_weight)
 
         out = 0
         for i, B in enumerate(B_list):

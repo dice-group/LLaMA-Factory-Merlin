@@ -508,7 +508,7 @@ class HydraLoraLayer(BaseTunerLayer):
         probs: torch.Tensor,
         language_ids: Optional[torch.Tensor],
         expect_targets: bool,
-    ) -> float:
+    ) -> tuple[dict[str, float], dict[str, float], float]:
         return append_router_target_metrics(
             metrics,
             metrics_weight,

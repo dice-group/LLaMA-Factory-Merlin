@@ -14,6 +14,7 @@
 
 import os
 import re
+from collections import defaultdict
 from distutils.util import strtobool
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
@@ -78,6 +79,21 @@ def _build_language_metadata(language_map_spec: Optional[str]):
         language_to_subgroup_ids = None
     else:
         language_to_subgroup_ids = [language_to_subgroup.get(lang, -1) for lang in languages]
+
+    # Grouping JSONs without explicit `subgroups` still need deterministic
+    # per-language head targets for two-stage LPR. Assign subgroup ids by the
+    # language's sorted order within its expert/family bucket.
+    if language_to_subgroup_ids is None or not any(idx >= 0 for idx in language_to_subgroup_ids):
+        family_members: dict[str, list[str]] = defaultdict(list)
+        for lang in languages:
+            family_members[language_map[lang]].append(lang)
+        fallback_subgroups: dict[str, int] = {}
+        for family, members in family_members.items():
+            for subgroup_idx, lang in enumerate(sorted(members)):
+                fallback_subgroups[lang] = subgroup_idx
+        language_to_subgroup_ids = [fallback_subgroups.get(lang, -1) for lang in languages]
+        if subgroup_sizes is not None:
+            subgroup_sizes = [max(size, len(family_members[family])) for family, size in zip(families, subgroup_sizes)]
 
     return languages, families, language_to_family_ids, subgroup_sizes, language_to_subgroup_ids
 

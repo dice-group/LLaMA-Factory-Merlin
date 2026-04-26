@@ -59,7 +59,7 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
                         "head_load_min_frac": head_min,
                     }
                     metrics_weight = float(token_count)
-                    metrics_weight = layer._append_target_metrics(
+                    coverage_metrics, target_metrics, target_weight = layer._append_target_metrics(
                         metrics=metrics,
                         metrics_weight=metrics_weight,
                         prefix="head",
@@ -69,7 +69,10 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
                         language_ids=language_ids,
                         expect_targets=use_head_guidance and layer.language_list is not None,
                     )
+                    metrics.update(coverage_metrics)
                     record_hala_metrics(metrics, weight=metrics_weight)
+                    if target_metrics and target_weight > 0:
+                        record_hala_metrics(target_metrics, weight=target_weight)
 
         a_dot_x = lora_A(dropout(x_cast))
         if len(lora_B) == 1:
@@ -135,7 +138,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     metrics["expert_load_max_frac"] = 0.0
                     metrics["expert_load_min_frac"] = 0.0
                 metrics_weight = float(token_count)
-                metrics_weight = layer._append_target_metrics(
+                coverage_metrics, target_metrics, target_weight = layer._append_target_metrics(
                     metrics=metrics,
                     metrics_weight=metrics_weight,
                     prefix="expert",
@@ -145,7 +148,10 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     language_ids=language_ids,
                     expect_targets=use_expert_guidance and layer.language_list is not None,
                 )
+                metrics.update(coverage_metrics)
                 record_hala_metrics(metrics, weight=metrics_weight)
+                if target_metrics and target_weight > 0:
+                    record_hala_metrics(target_metrics, weight=target_weight)
 
     use_sparse = getattr(layer, "hala_execution_mode", "dense_expert_dense_head") == "sparse_expert_dense_head"
     use_sparse = use_sparse and layer.top_k < layer.num_experts
@@ -182,6 +188,47 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                 route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
                 route_weight = layer._head_router_weights(route_logits)
                 route_weight = layer._enforce_language_heads(route_weight, head_targets)
+                if layer.track_router_metrics:
+                    with torch.no_grad():
+                        token_count = route_weight.numel() // route_weight.size(-1)
+                        if token_count > 0:
+                            head_assign = torch.argmax(route_weight, dim=-1, keepdim=True)
+                            flat_assign = head_assign.reshape(-1)
+                            head_counts = torch.bincount(flat_assign, minlength=len(b_list)).to(torch.float32)
+                            mean_head = head_counts.mean().item()
+                            head_cv = float((head_counts.std(unbiased=False) / (mean_head + 1e-6)).item()) if mean_head > 0 else 0.0
+                            head_active = float((head_counts > 0).float().mean().item())
+                            head_entropy = float((-route_weight * torch.log(route_weight + 1e-8)).sum(dim=-1).mean().item())
+                            total_head_assign = head_counts.sum()
+                            if total_head_assign > 0:
+                                head_frac = head_counts / total_head_assign
+                                head_max = float(head_frac.max().item())
+                                head_min = float(head_frac.min().item())
+                            else:
+                                head_max = 0.0
+                                head_min = 0.0
+                            metrics = {
+                                "head_load_cv": head_cv,
+                                "head_active_frac": head_active,
+                                "head_router_entropy": head_entropy,
+                                "head_load_max_frac": head_max,
+                                "head_load_min_frac": head_min,
+                            }
+                            metrics_weight = float(token_count)
+                            coverage_metrics, target_metrics, target_weight = layer._append_target_metrics(
+                                metrics=metrics,
+                                metrics_weight=metrics_weight,
+                                prefix="head",
+                                target_tensor=head_targets,
+                                selection=head_assign.squeeze(-1),
+                                probs=route_weight,
+                                language_ids=language_ids,
+                                expect_targets=use_head_guidance and layer.language_list is not None,
+                            )
+                            metrics.update(coverage_metrics)
+                            record_hala_metrics(metrics, weight=metrics_weight)
+                            if target_metrics and target_weight > 0:
+                                record_hala_metrics(target_metrics, weight=target_weight)
                 route_weight_flat = route_weight.view(-1, route_weight.size(-1))
 
             mask = topi_flat == e

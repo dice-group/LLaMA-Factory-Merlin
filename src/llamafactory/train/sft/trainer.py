@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -99,6 +100,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._hmora_task_input_batches: List[torch.Tensor] = []
         self._hmora_task_attention_batches: List[torch.Tensor] = []
         self._hmora_task_id_batches: List[torch.Tensor] = []
+        self._pending_aux_log_sums: Dict[str, float] = {}
+        self._pending_aux_log_counts: Dict[str, float] = {}
 
         # Verify FP8 status after trainer initialization (accelerator should be available)
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
@@ -261,6 +264,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         is_train_log = any(key in logs for key in ("loss", "learning_rate")) or any(
             key.startswith("train/") for key in logs
         )
+        pending_aux = self._pop_pending_aux_logs()
+        if pending_aux:
+            phase_prefix = "train" if is_train_log else "eval"
+            for key, value in pending_aux.items():
+                scoped = key if key.startswith(("train/", "eval/", "test/")) else f"{phase_prefix}/{key}"
+                logs[scoped] = value
         extra = pop_tracked_metrics()
         if extra:
             phase_prefix = "train" if is_train_log else "eval"
@@ -272,6 +281,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         elif not is_train_log:
             clear_tracked_metrics()
         super().log(logs, *args, **kwargs)
+
+    def _stash_aux_logs(self, metrics: Dict[str, float]) -> None:
+        for key, value in metrics.items():
+            if value is None or not math.isfinite(float(value)):
+                continue
+            self._pending_aux_log_sums[key] = self._pending_aux_log_sums.get(key, 0.0) + float(value)
+            self._pending_aux_log_counts[key] = self._pending_aux_log_counts.get(key, 0.0) + 1.0
+
+    def _pop_pending_aux_logs(self) -> Dict[str, float]:
+        if not self._pending_aux_log_sums:
+            return {}
+        aggregated = {
+            key: self._pending_aux_log_sums[key] / max(self._pending_aux_log_counts.get(key, 1.0), 1.0)
+            for key in self._pending_aux_log_sums.keys()
+        }
+        self._pending_aux_log_sums.clear()
+        self._pending_aux_log_counts.clear()
+        return aggregated
 
     @override
     def prediction_step(
@@ -373,14 +400,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             "language_prior_router_state_count": float(state_count),
             "language_prior_valid_target_count": float(valid_target_count),
         }
+        namespace = self.finetuning_args.finetuning_type or "aux"
+        self._stash_aux_logs({f"{namespace}/{key}": value for key, value in metrics.items()})
         if self.finetuning_args.finetuning_type == "hydralora":
             record_hydralora_metrics(metrics, weight=1.0)
         elif self.finetuning_args.finetuning_type == "hala":
             record_hala_metrics(metrics, weight=1.0)
         else:
             record_cola_metrics(metrics, weight=1.0)
-        # Keep parity with other auxiliary losses so trainer_state captures this signal.
-        self.log(metrics)
         return aux
 
     def _compute_adamole_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:

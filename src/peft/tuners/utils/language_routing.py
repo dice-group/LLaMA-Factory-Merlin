@@ -126,11 +126,16 @@ def append_router_target_metrics(
     language_ids: Optional[torch.Tensor],
     expect_targets: bool,
     on_missing: Optional[Callable[[str], None]] = None,
-) -> float:
+) -> tuple[dict[str, float], dict[str, float], float]:
     key_prefix = f"{prefix}_target_"
+    coverage_metrics: dict[str, float] = {}
+    target_metrics: dict[str, float] = {}
     if target_tensor is not None and torch.is_tensor(target_tensor):
         valid_batch = target_tensor >= 0
         seq_len = probs.size(1)
+        total_tokens = probs.size(0) * seq_len
+        valid_tokens = int(seq_len * valid_batch.sum().item())
+        coverage_metrics[f"{key_prefix}token_frac"] = float(valid_tokens / max(total_tokens, 1))
         if valid_batch.any():
             expanded_targets = target_tensor[valid_batch].view(-1, 1).expand(-1, seq_len)
             top1 = selection[valid_batch]
@@ -139,39 +144,23 @@ def append_router_target_metrics(
                 -1,
                 target_tensor[valid_batch].view(-1, 1, 1).expand(-1, seq_len, 1),
             ).squeeze(-1)
-            valid_tokens = target_probs.numel()
             target_entropy = float((-torch.log(target_probs + 1e-8)).mean().item())
-            metrics.update(
+            target_metrics.update(
                 {
                     f"{key_prefix}hit_rate": float(target_hits.mean().item()),
                     f"{key_prefix}prob_mean": float(target_probs.mean().item()),
                     f"{key_prefix}neglogp": target_entropy,
-                    f"{key_prefix}token_frac": float(valid_tokens / max(seq_len * valid_batch.sum().item(), 1)),
                 }
             )
-            return float(valid_tokens if valid_tokens > 0 else metrics_weight)
+            return coverage_metrics, target_metrics, float(valid_tokens if valid_tokens > 0 else metrics_weight)
 
-        metrics.update(
-            {
-                f"{key_prefix}hit_rate": 0.0,
-                f"{key_prefix}prob_mean": 0.0,
-                f"{key_prefix}neglogp": 0.0,
-                f"{key_prefix}token_frac": 0.0,
-            }
-        )
         if expect_targets and on_missing is not None:
             on_missing("targets were all pad ids")
-        return metrics_weight
+        metrics.update(coverage_metrics)
+        return coverage_metrics, target_metrics, 0.0
 
     if expect_targets:
-        metrics.update(
-            {
-                f"{key_prefix}hit_rate": 0.0,
-                f"{key_prefix}prob_mean": 0.0,
-                f"{key_prefix}neglogp": 0.0,
-                f"{key_prefix}token_frac": 0.0,
-            }
-        )
+        coverage_metrics[f"{key_prefix}token_frac"] = 0.0
         if on_missing is not None:
             if language_ids is None:
                 reason = "no language_ids tensor provided"
@@ -180,4 +169,5 @@ def append_router_target_metrics(
             else:
                 reason = "language_ids contained only pad ids"
             on_missing(reason)
-    return metrics_weight
+    metrics.update(coverage_metrics)
+    return coverage_metrics, target_metrics, 0.0

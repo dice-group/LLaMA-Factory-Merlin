@@ -64,7 +64,7 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
                         "head_load_min_frac": head_min,
                     }
                     metrics_weight = float(token_count)
-                    metrics_weight = layer._append_target_metrics(
+                    coverage_metrics, target_metrics, target_weight = layer._append_target_metrics(
                         metrics=metrics,
                         metrics_weight=metrics_weight,
                         prefix="head",
@@ -74,7 +74,10 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
                         language_ids=language_ids,
                         expect_targets=use_head_guidance and layer.language_list is not None,
                     )
+                    metrics.update(coverage_metrics)
                     record_hydralora_metrics(metrics, weight=metrics_weight)
+                    if target_metrics and target_weight > 0:
+                        record_hydralora_metrics(target_metrics, weight=target_weight)
 
         a_dot_x = lora_A(dropout(x_cast))
         if len(lora_B) == 1:
@@ -142,7 +145,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     metrics["expert_load_max_frac"] = 0.0
                     metrics["expert_load_min_frac"] = 0.0
                 metrics_weight = float(token_count)
-                metrics_weight = layer._append_target_metrics(
+                coverage_metrics, target_metrics, target_weight = layer._append_target_metrics(
                     metrics=metrics,
                     metrics_weight=metrics_weight,
                     prefix="expert",
@@ -152,7 +155,10 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     language_ids=language_ids,
                     expect_targets=use_expert_guidance and layer.language_list is not None,
                 )
+                metrics.update(coverage_metrics)
                 record_hydralora_metrics(metrics, weight=metrics_weight)
+                if target_metrics and target_weight > 0:
+                    record_hydralora_metrics(target_metrics, weight=target_weight)
 
     use_sparse = layer.top_k < layer.num_experts
     if use_sparse:

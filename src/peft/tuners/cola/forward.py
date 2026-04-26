@@ -66,7 +66,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     "expert_load_min_frac": min_frac,
                 }
                 metrics_weight = float(token_count)
-                metrics_weight = layer._append_language_target_metrics(
+                coverage_metrics, target_metrics, target_weight = layer._append_language_target_metrics(
                     metrics=metrics,
                     metrics_weight=metrics_weight,
                     language_targets=language_targets,
@@ -74,7 +74,10 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     router_probs=router_probs,
                     top_indices=topi,
                 )
+                metrics.update(coverage_metrics)
                 record_cola_metrics(metrics, weight=metrics_weight)
+                if target_metrics and target_weight > 0:
+                    record_cola_metrics(target_metrics, weight=target_weight)
 
     use_sparse = layer.top_k < layer.num_experts
     if use_sparse:

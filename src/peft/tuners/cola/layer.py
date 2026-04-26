@@ -758,7 +758,7 @@ class ColaLayer(BaseTunerLayer):
         language_ids: Optional[torch.Tensor],
         router_probs: torch.Tensor,
         top_indices: torch.Tensor,
-    ) -> float:
+    ) -> tuple[dict[str, float], dict[str, float], float]:
         return append_router_target_metrics(
             metrics,
             metrics_weight,
