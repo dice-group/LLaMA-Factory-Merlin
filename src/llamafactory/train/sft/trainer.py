@@ -99,6 +99,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._hmora_task_input_batches: List[torch.Tensor] = []
         self._hmora_task_attention_batches: List[torch.Tensor] = []
         self._hmora_task_id_batches: List[torch.Tensor] = []
+        self._hmora_aux_loss_log_values: List[torch.Tensor] = []
+        self._adamole_aux_loss_log_values: List[torch.Tensor] = []
 
         # Verify FP8 status after trainer initialization (accelerator should be available)
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
@@ -277,6 +279,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         is_train_log = any(key in logs for key in ("loss", "learning_rate")) or any(
             key.startswith("train/") for key in logs
         )
+        if is_train_log and self._hmora_aux_loss_log_values:
+            logs["hmora_aux_loss"] = float(torch.stack(self._hmora_aux_loss_log_values).mean().cpu())
+            self._hmora_aux_loss_log_values.clear()
+        if is_train_log and self._adamole_aux_loss_log_values:
+            logs["adamole_aux_loss"] = float(torch.stack(self._adamole_aux_loss_log_values).mean().cpu())
+            self._adamole_aux_loss_log_values.clear()
+
         extra = pop_tracked_metrics()
         if extra:
             phase_prefix = "train" if is_train_log else "eval"
@@ -426,7 +435,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return None
 
         scaled = coef * aux
-        self.log({"adamole_aux_loss": float(scaled.detach().mean().cpu())})
+        self._adamole_aux_loss_log_values.append(scaled.detach().mean())
         return scaled
 
     def _compute_mola_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
@@ -540,7 +549,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         aux = aux_fn(include_task_router=True)
         if aux is not None and aux_scale > 0:
             scaled_aux = aux_scale * aux
-            self.log({"hmora_aux_loss": float(scaled_aux.detach().mean().cpu())})
+            self._hmora_aux_loss_log_values.append(scaled_aux.detach().mean())
             extra_terms.append(scaled_aux)
 
         if not extra_terms:
