@@ -93,6 +93,7 @@ def get_peft_model_state_dict(
         PeftType.ADAMOLE,
         PeftType.MIXLORA,
         PeftType.MOELORA,
+        PeftType.VANILLA_MOELORA,
         PeftType.MTLLORA,
         PeftType.MOVLORA,
         PeftType.HMORA,

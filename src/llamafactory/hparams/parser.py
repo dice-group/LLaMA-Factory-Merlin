@@ -144,6 +144,7 @@ def _verify_model_args(
         "adamole",
         "mixlora",
         "moelora",
+        "vanilla_moelora",
         "mtllora",
         "movlora",
         "hmora",
