@@ -899,6 +899,7 @@ def _setup_hydralora_tuning(
             expected_heads = list(expert_lora_nums)
         peft_kwargs.update(
             {
+                "expert_lora_nums": expert_lora_nums,
                 "language_map": language_map,
                 "language_list": language_list,
                 "family_list": family_list,

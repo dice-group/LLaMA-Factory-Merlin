@@ -19,9 +19,143 @@ def _apply_b_heads_packed(a_dot_x: torch.Tensor, b_list, route_weight: Optional[
     return (out_all * route_weight.to(out_all.dtype).unsqueeze(-1)).sum(dim=1)
 
 
+def _can_use_grouped_mm(x: torch.Tensor) -> bool:
+    if not x.is_cuda or not hasattr(torch.nn.functional, "grouped_mm"):
+        return False
+    try:
+        return torch.cuda.get_device_capability(x.device) >= (8, 0)
+    except RuntimeError:
+        return False
+
+
+def _pad_last_dim(x: torch.Tensor, size: int) -> torch.Tensor:
+    pad = size - x.size(-1)
+    if pad <= 0:
+        return x
+    return torch.nn.functional.pad(x, (0, pad))
+
+
+def _align_grouped_mm_k(k: int) -> int:
+    return ((int(k) + 7) // 8) * 8
+
+
 def _expert_gate_from_topk(topi: torch.Tensor, weights: torch.Tensor, num_experts: int) -> torch.Tensor:
     gate = torch.zeros(topi.shape[:-1] + (num_experts,), device=weights.device, dtype=weights.dtype)
     return gate.scatter_add(-1, topi, weights)
+
+
+def _apply_grouped_sparse_expert(
+    layer,
+    x: torch.Tensor,
+    topi: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    language_ids: Optional[torch.Tensor],
+    expert_targets: Optional[torch.Tensor],
+    result_dtype: torch.dtype,
+    output_size: int,
+) -> Optional[torch.Tensor]:
+    if not _can_use_grouped_mm(x):
+        return None
+
+    batch, seq_len, _ = x.size()
+    x_flat = x.reshape(-1, x.size(-1))
+    topi_flat = topi.reshape(-1)
+    weights_flat = weights.reshape(-1)
+    token_idx = torch.arange(x_flat.size(0), device=x.device).repeat_interleave(topi.size(-1))
+
+    order = torch.argsort(topi_flat, stable=True)
+    experts = topi_flat[order]
+    token_idx = token_idx[order]
+    weights_sorted = weights_flat[order].to(result_dtype)
+    counts = torch.bincount(experts, minlength=layer.num_experts).to(torch.int32)
+    if int(counts.sum().item()) == 0:
+        return torch.zeros((batch, seq_len, output_size), device=x.device, dtype=result_dtype)
+
+    expert_names = [f"expert_{e}" for e in range(layer.num_experts)]
+    b_counts = [len(layer.lora_B[name]) for name in expert_names]
+    if len(set(b_counts)) != 1 or b_counts[0] <= 0:
+        return None
+
+    rank = int(layer.lora_A[expert_names[0]].out_features)
+    if any(int(layer.lora_A[name].out_features) != rank for name in expert_names):
+        return None
+
+    padded_rank = _align_grouped_mm_k(rank)
+    a_weights = []
+    for name in expert_names:
+        a_weights.append(_pad_last_dim(layer.lora_A[name].weight.transpose(0, 1), padded_rank).transpose(0, 1))
+    a_weight = torch.stack(a_weights, dim=0).to(torch.bfloat16)
+    a_weight = a_weight.transpose(1, 2)
+    x_sel = x_flat[token_idx]
+    dropped = layer.lora_dropout[expert_names[0]](x_sel.to(torch.bfloat16))
+    offsets = counts.cumsum(0).to(torch.int32)
+    a_out = torch.nn.functional.grouped_mm(dropped, a_weight, offs=offsets)
+
+    num_heads = b_counts[0]
+    out_features = int(layer.lora_B[expert_names[0]][0].out_features)
+    b_weights = []
+    for name in expert_names:
+        packed = torch.cat([b.weight for b in layer.lora_B[name]], dim=0)
+        b_weights.append(_pad_last_dim(packed, padded_rank))
+    b_weight = torch.stack(b_weights, dim=0).to(torch.bfloat16).transpose(1, 2)
+    b_out = torch.nn.functional.grouped_mm(a_out, b_weight, offs=offsets)
+
+    if num_heads == 1:
+        out_sorted = b_out
+    else:
+        route_chunks = []
+        start = 0
+        for e, count_tensor in enumerate(counts):
+            count = int(count_tensor.item())
+            if count == 0:
+                continue
+            end = start + count
+            name = expert_names[e]
+            lora_route = layer.lora_route[name] if name in layer.lora_route else None
+            if lora_route is None:
+                route_chunks.append(torch.full((count, num_heads), 1.0 / num_heads, device=x.device, dtype=b_out.dtype))
+                start = end
+                continue
+
+            x_e = x_sel[start:end]
+            route_dtype = lora_route.weight.dtype
+            route_logits = lora_route(x_e.to(route_dtype)).to(x.dtype).unsqueeze(1)
+            head_targets: Optional[torch.Tensor] = None
+            language_ids_sel: Optional[torch.Tensor] = None
+            use_head_guidance = layer.language_guidance_scope == "all"
+            if use_head_guidance and language_ids is not None:
+                batch_idx = token_idx[start:end] // seq_len
+                language_ids_sel = language_ids[batch_idx]
+                head_targets = layer._language_head_targets(language_ids_sel, name)
+                if head_targets is not None and expert_targets is not None and torch.is_tensor(expert_targets):
+                    expert_targets_sel = expert_targets[batch_idx]
+                    mismatch = expert_targets_sel != int(e)
+                    if mismatch.any():
+                        head_targets = head_targets.clone()
+                        head_targets[mismatch] = LANGUAGE_PAD_ID
+                layer._cache_router_state(route_logits, language_ids_sel, f"hydra_head_{name}", head_targets)
+            route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
+            route_weight = layer._head_router_weights(route_logits)
+            route_weight = layer._enforce_language_heads(route_weight, head_targets).squeeze(1)
+            route_chunks.append(route_weight.to(b_out.dtype))
+            start = end
+
+        route_weight_sorted = torch.cat(route_chunks, dim=0)
+        b_out = b_out.view(b_out.size(0), num_heads, out_features)
+        out_sorted = (b_out * route_weight_sorted.unsqueeze(-1)).sum(dim=1)
+
+    scales = torch.tensor(
+        [float(layer.scaling[name]) for name in expert_names],
+        device=x.device,
+        dtype=out_sorted.dtype,
+    )
+    scale_sorted = torch.repeat_interleave(scales, counts.to(torch.long), dim=0).unsqueeze(-1)
+    out_sorted = out_sorted * scale_sorted * weights_sorted.to(out_sorted.dtype).unsqueeze(-1)
+
+    moe_out_flat = torch.zeros((x_flat.size(0), output_size), device=x.device, dtype=result_dtype)
+    moe_out_flat.index_add_(0, token_idx, out_sorted.to(result_dtype))
+    return moe_out_flat.view(batch, seq_len, output_size)
 
 
 def _apply_packed_dense_lowrank(
@@ -240,9 +374,28 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         result = result + moe_out
         return result.to(torch_result_dtype)
 
-    use_sparse = execution_mode in {"sparse_expert_dense_head", "packed_sparse_expert_dense_head"}
+    if execution_mode == "grouped_sparse_expert_dense_head":
+        moe_out = _apply_grouped_sparse_expert(
+            layer,
+            x,
+            topi,
+            weights,
+            language_ids=language_ids,
+            expert_targets=expert_targets,
+            result_dtype=result.dtype,
+            output_size=result.size(-1),
+        )
+        if moe_out is not None:
+            result = result + moe_out
+            return result.to(torch_result_dtype)
+
+    use_sparse = execution_mode in {
+        "sparse_expert_dense_head",
+        "packed_sparse_expert_dense_head",
+        "grouped_sparse_expert_dense_head",
+    }
     use_sparse = use_sparse and layer.top_k < layer.num_experts
-    use_packed_heads = execution_mode == "packed_sparse_expert_dense_head"
+    use_packed_heads = execution_mode in {"packed_sparse_expert_dense_head", "grouped_sparse_expert_dense_head"}
     if use_sparse:
         batch, seq_len, _ = x.size()
         x_flat = x.reshape(-1, x.size(-1))

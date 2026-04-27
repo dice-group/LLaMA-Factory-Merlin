@@ -22,6 +22,7 @@ class HalaLoraLayer(HydraLoraLayer):
         "dense_expert_dense_head",
         "sparse_expert_dense_head",
         "packed_sparse_expert_dense_head",
+        "grouped_sparse_expert_dense_head",
         "packed_dense_lowrank",
     }
 
@@ -121,6 +122,25 @@ class Linear(nn.Module, HalaLoraLayer):
         raise ValueError(
             f"HALA adapter '{adapter}' is routing-dependent and has no input-independent delta weight for merging."
         )
+
+    def pop_language_router_cache(self) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+        caches: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        head_keys = [
+            key for key in list(self._caches.keys()) if key.startswith("hydra_head_") and key.endswith("_router_logits")
+        ]
+        for key in head_keys:
+            logits = self._cache_pop(key)
+            targets = self._cache_pop(key.replace("_router_logits", "_router_targets"))
+            if logits is not None and targets is not None:
+                caches.append(("hala_head", logits, targets))
+            self._cache_pop(key.replace("_router_logits", "_router_language_ids"))
+
+        logits = self._cache_pop("hydra_expert_router_logits")
+        targets = self._cache_pop("hydra_expert_router_targets")
+        if logits is not None and targets is not None:
+            caches.append(("hala_expert", logits, targets))
+        self._cache_pop("hydra_expert_router_language_ids")
+        return caches
 
     def _adapter_delta(
         self,

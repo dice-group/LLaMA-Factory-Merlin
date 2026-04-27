@@ -14,6 +14,7 @@ class HalaConfig(HydraLoraConfig):
         "dense_expert_dense_head",
         "sparse_expert_dense_head",
         "packed_sparse_expert_dense_head",
+        "grouped_sparse_expert_dense_head",
         "packed_dense_lowrank",
     ] = field(
         default="dense_expert_dense_head",
@@ -22,6 +23,7 @@ class HalaConfig(HydraLoraConfig):
                 "HALA execution mode. `dense_expert_dense_head` keeps dense compute across both stages, "
                 "`sparse_expert_dense_head` keeps sparse expert dispatch with dense head mixing, and "
                 "`packed_sparse_expert_dense_head` also packs per-expert B-head projections. "
+                "`grouped_sparse_expert_dense_head` uses torch grouped GEMM when available. "
                 "`packed_dense_lowrank` applies HMoRA-style packed low-rank expert mixing."
             )
         },
@@ -34,6 +36,7 @@ class HalaConfig(HydraLoraConfig):
             "dense_expert_dense_head",
             "sparse_expert_dense_head",
             "packed_sparse_expert_dense_head",
+            "grouped_sparse_expert_dense_head",
             "packed_dense_lowrank",
         }:
             raise ValueError(f"Unsupported hala_execution_mode={self.hala_execution_mode!r}.")

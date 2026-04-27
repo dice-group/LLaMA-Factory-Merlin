@@ -613,6 +613,7 @@ class FinetuningArguments(
         "dense_expert_dense_head",
         "sparse_expert_dense_head",
         "packed_sparse_expert_dense_head",
+        "grouped_sparse_expert_dense_head",
         "packed_dense_lowrank",
     ] = field(
         default="dense_expert_dense_head",
@@ -1166,11 +1167,13 @@ class FinetuningArguments(
                 "dense_expert_dense_head",
                 "sparse_expert_dense_head",
                 "packed_sparse_expert_dense_head",
+                "grouped_sparse_expert_dense_head",
                 "packed_dense_lowrank",
             }:
                 raise ValueError(
                     "`hala_execution_mode` must be one of 'dense_expert_dense_head', "
-                    "'sparse_expert_dense_head', 'packed_sparse_expert_dense_head', or 'packed_dense_lowrank'."
+                    "'sparse_expert_dense_head', 'packed_sparse_expert_dense_head', "
+                    "'grouped_sparse_expert_dense_head', or 'packed_dense_lowrank'."
                 )
 
         if self.stage == "ppo" and self.reward_model is None:

@@ -21,6 +21,14 @@ from typing import Any, Dict, Optional, Tuple
 LANGUAGE_PAD_ID = -1
 
 
+def _sort_grouping_key(value: object) -> tuple[int, object]:
+    text = str(value)
+    try:
+        return (0, int(text))
+    except ValueError:
+        return (1, text)
+
+
 def load_language_map(spec: Optional[str]) -> Optional[Dict[str, str]]:
     r"""
     Loads a language->family mapping from either an inline JSON string or a file path.
@@ -96,10 +104,12 @@ def load_language_groupings(
     subgroup_sizes: Dict[str, int] = {}
     language_to_subgroup: Dict[str, int] = {}
 
-    for group_id, entry in sorted(data.items(), key=lambda kv: str(kv[0])):
+    family_order: list[str] = []
+    for group_id, entry in sorted(data.items(), key=lambda kv: _sort_grouping_key(kv[0])):
         if not isinstance(entry, dict):
             continue
         label = str(entry.get("group") or group_id)
+        family_order.append(label)
         languages = set(entry.get("languages") or entry.get("language") or [])
         subgroups = entry.get("subgroups") or {}
 
@@ -125,7 +135,13 @@ def load_language_groupings(
     if not language_map:
         return None, None, None, None
 
-    families = sorted(set(language_map.values()))
+    seen_families: set[str] = set()
+    families = []
+    for family in family_order:
+        if family in seen_families:
+            continue
+        seen_families.add(family)
+        families.append(family)
     subgroup_sizes_aligned = [subgroup_sizes.get(fam, 0) for fam in families]
     return language_map, families, subgroup_sizes_aligned, language_to_subgroup
 
