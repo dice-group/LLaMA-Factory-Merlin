@@ -18,10 +18,17 @@ from .forward import forward_flat as hala_forward_flat
 
 
 class HalaLoraLayer(HydraLoraLayer):
+    _VALID_EXECUTION_MODES = {
+        "dense_expert_dense_head",
+        "sparse_expert_dense_head",
+        "packed_sparse_expert_dense_head",
+        "packed_dense_lowrank",
+    }
+
     def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, hala_execution_mode: str = "dense_expert_dense_head", **kwargs) -> None:
         self.hala_execution_mode = hala_execution_mode
         super().__init__(base_layer, ephemeral_gpu_offload=ephemeral_gpu_offload, **kwargs)
-        if self.hala_execution_mode not in {"dense_expert_dense_head", "sparse_expert_dense_head"}:
+        if self.hala_execution_mode not in self._VALID_EXECUTION_MODES:
             raise ValueError(f"Unsupported hala_execution_mode={self.hala_execution_mode!r}.")
 
     def update_layer(

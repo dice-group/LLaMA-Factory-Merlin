@@ -7,6 +7,85 @@ from peft.metrics import record_hala_metrics
 from ..utils.language_routing import LANGUAGE_PAD_ID
 
 
+def _apply_b_heads_packed(a_dot_x: torch.Tensor, b_list, route_weight: Optional[torch.Tensor]) -> torch.Tensor:
+    if len(b_list) == 1:
+        return b_list[0](a_dot_x)
+
+    b_weight = torch.cat([b.weight for b in b_list], dim=0)
+    out_all = torch.nn.functional.linear(a_dot_x.to(b_weight.dtype), b_weight, bias=None)
+    out_all = out_all.view(a_dot_x.size(0), len(b_list), -1)
+    if route_weight is None:
+        return out_all.sum(dim=1)
+    return (out_all * route_weight.to(out_all.dtype).unsqueeze(-1)).sum(dim=1)
+
+
+def _expert_gate_from_topk(topi: torch.Tensor, weights: torch.Tensor, num_experts: int) -> torch.Tensor:
+    gate = torch.zeros(topi.shape[:-1] + (num_experts,), device=weights.device, dtype=weights.dtype)
+    return gate.scatter_add(-1, topi, weights)
+
+
+def _apply_packed_dense_lowrank(
+    layer,
+    x: torch.Tensor,
+    topi: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    language_ids: Optional[torch.Tensor],
+    expert_targets: Optional[torch.Tensor],
+    result_dtype: torch.dtype,
+) -> torch.Tensor:
+    expert_names = [f"expert_{e}" for e in range(layer.num_experts)]
+    first_a = layer.lora_A[expert_names[0]]
+    rank = int(first_a.out_features)
+    if any(int(layer.lora_A[name].out_features) != rank for name in expert_names):
+        raise ValueError("packed_dense_lowrank requires all HALA experts to use the same rank.")
+
+    x_cast = x.to(first_a.weight.dtype)
+    dropped = layer.lora_dropout[expert_names[0]](x_cast)
+    a_weight = torch.cat([layer.lora_A[name].weight for name in expert_names], dim=0)
+    a_all = torch.nn.functional.linear(dropped, a_weight).view(x.size(0), x.size(1), layer.num_experts, rank)
+
+    expert_gate = _expert_gate_from_topk(topi, weights, layer.num_experts).to(a_all.dtype)
+
+    lowrank_chunks = []
+    b_weights = []
+    for e, name in enumerate(expert_names):
+        b_list = layer.lora_B[name]
+        if not b_list:
+            continue
+
+        expert_lowrank = a_all[:, :, e, :] * expert_gate[:, :, e].unsqueeze(-1)
+        lora_route = layer.lora_route[name] if name in layer.lora_route else None
+        if lora_route is None or len(b_list) == 1:
+            lowrank_chunks.append(expert_lowrank * layer.scaling[name])
+            b_weights.append(b_list[0].weight)
+            continue
+
+        route_dtype = lora_route.weight.dtype
+        route_logits = lora_route(x.to(route_dtype)).to(x.dtype)
+        head_targets: Optional[torch.Tensor] = None
+        use_head_guidance = layer.language_guidance_scope == "all"
+        if use_head_guidance and language_ids is not None:
+            head_targets = layer._language_head_targets(language_ids, name)
+            if head_targets is not None and expert_targets is not None and torch.is_tensor(expert_targets):
+                mismatch = expert_targets != int(e)
+                if mismatch.any():
+                    head_targets = head_targets.clone()
+                    head_targets[mismatch] = LANGUAGE_PAD_ID
+            layer._cache_router_state(route_logits, language_ids, f"hydra_head_{name}", head_targets)
+
+        route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
+        route_weight = layer._head_router_weights(route_logits)
+        route_weight = layer._enforce_language_heads(route_weight, head_targets).to(expert_lowrank.dtype)
+        for i, b in enumerate(b_list):
+            lowrank_chunks.append(expert_lowrank * route_weight[:, :, i].unsqueeze(-1) * layer.scaling[name])
+            b_weights.append(b.weight)
+
+    packed_lowrank = torch.cat(lowrank_chunks, dim=-1)
+    packed_b = torch.cat(b_weights, dim=1)
+    return torch.nn.functional.linear(packed_lowrank.to(packed_b.dtype), packed_b, bias=None).to(result_dtype)
+
+
 def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
     result = layer.base_layer(x, *args, **kwargs)
     torch_result_dtype = result.dtype
@@ -147,8 +226,23 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                 )
                 record_hala_metrics(metrics, weight=metrics_weight)
 
-    use_sparse = getattr(layer, "hala_execution_mode", "dense_expert_dense_head") == "sparse_expert_dense_head"
+    execution_mode = getattr(layer, "hala_execution_mode", "dense_expert_dense_head")
+    if execution_mode == "packed_dense_lowrank":
+        moe_out = _apply_packed_dense_lowrank(
+            layer,
+            x,
+            topi,
+            weights,
+            language_ids=language_ids,
+            expert_targets=expert_targets,
+            result_dtype=result.dtype,
+        )
+        result = result + moe_out
+        return result.to(torch_result_dtype)
+
+    use_sparse = execution_mode in {"sparse_expert_dense_head", "packed_sparse_expert_dense_head"}
     use_sparse = use_sparse and layer.top_k < layer.num_experts
+    use_packed_heads = execution_mode == "packed_sparse_expert_dense_head"
     if use_sparse:
         batch, seq_len, _ = x.size()
         x_flat = x.reshape(-1, x.size(-1))
@@ -163,42 +257,51 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
             if not b_list:
                 continue
 
-            route_weight_flat = None
-            lora_route = layer.lora_route[name] if name in layer.lora_route else None
-            use_head_router = lora_route is not None and len(b_list) > 1
-            if use_head_router:
-                route_dtype = lora_route.weight.dtype
-                route_logits = lora_route(x.to(route_dtype)).to(x.dtype)
-                head_targets: Optional[torch.Tensor] = None
-                use_head_guidance = layer.language_guidance_scope == "all"
-                if use_head_guidance and language_ids is not None:
-                    head_targets = layer._language_head_targets(language_ids, name)
-                    if head_targets is not None and expert_targets is not None and torch.is_tensor(expert_targets):
-                        mismatch = expert_targets != int(e)
-                        if mismatch.any():
-                            head_targets = head_targets.clone()
-                            head_targets[mismatch] = LANGUAGE_PAD_ID
-                    layer._cache_router_state(route_logits, language_ids, f"hydra_head_{name}", head_targets)
-                route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
-                route_weight = layer._head_router_weights(route_logits)
-                route_weight = layer._enforce_language_heads(route_weight, head_targets)
-                route_weight_flat = route_weight.view(-1, route_weight.size(-1))
-
             mask = topi_flat == e
             if not mask.any():
                 continue
             token_idx, kth = torch.where(mask)
             x_sel = x_flat[token_idx]
 
+            route_weight_flat = None
+            lora_route = layer.lora_route[name] if name in layer.lora_route else None
+            use_head_router = lora_route is not None and len(b_list) > 1
+            if use_head_router:
+                route_dtype = lora_route.weight.dtype
+                # Sparse expert mode should only pay head-router cost for tokens
+                # that selected this expert. Keep a singleton sequence dimension so
+                # the existing language-bias/head-enforcement helpers still apply.
+                route_logits = lora_route(x_sel.to(route_dtype)).to(x.dtype).unsqueeze(1)
+                head_targets: Optional[torch.Tensor] = None
+                language_ids_sel: Optional[torch.Tensor] = None
+                use_head_guidance = layer.language_guidance_scope == "all"
+                if use_head_guidance and language_ids is not None:
+                    batch_idx = token_idx // seq_len
+                    language_ids_sel = language_ids[batch_idx]
+                    head_targets = layer._language_head_targets(language_ids_sel, name)
+                    if head_targets is not None and expert_targets is not None and torch.is_tensor(expert_targets):
+                        expert_targets_sel = expert_targets[batch_idx]
+                        mismatch = expert_targets_sel != int(e)
+                        if mismatch.any():
+                            head_targets = head_targets.clone()
+                            head_targets[mismatch] = LANGUAGE_PAD_ID
+                    layer._cache_router_state(route_logits, language_ids_sel, f"hydra_head_{name}", head_targets)
+                route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
+                route_weight = layer._head_router_weights(route_logits)
+                route_weight = layer._enforce_language_heads(route_weight, head_targets)
+                route_weight_flat = route_weight.squeeze(1)
+
             a = layer.lora_A[name]
             drop = layer.lora_dropout[name]
             scale = layer.scaling[name]
             a_dot_x = a(drop(x_sel.to(a.weight.dtype)))
 
-            if route_weight_flat is None or len(b_list) == 1:
+            if use_packed_heads:
+                out = _apply_b_heads_packed(a_dot_x, b_list, route_weight_flat)
+            elif route_weight_flat is None or len(b_list) == 1:
                 out = sum(b(a_dot_x) for b in b_list)
             else:
-                route_sel = route_weight_flat[token_idx].to(a_dot_x.dtype)
+                route_sel = route_weight_flat.to(a_dot_x.dtype)
                 out = 0
                 for i, b in enumerate(b_list):
                     out = out + b(a_dot_x) * route_sel[:, i].unsqueeze(-1)

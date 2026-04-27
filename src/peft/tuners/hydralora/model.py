@@ -215,6 +215,7 @@ class HydraLoraModel(BaseTuner):
             "language_head_router_mode": getattr(lora_config, "language_head_router_mode", None),
             "language_guidance_scope": lora_config.language_guidance_scope,
             "language_prior_weight": lora_config.language_prior_weight,
+            "track_router_metrics": getattr(lora_config, "track_router_metrics", None),
             "language_bias_value": lora_config.language_bias_value,
             "language_head_bias_value": getattr(lora_config, "language_head_bias_value", None),
         }

@@ -609,7 +609,12 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HALA expert."},
     )
-    hala_execution_mode: Literal["dense_expert_dense_head", "sparse_expert_dense_head"] = field(
+    hala_execution_mode: Literal[
+        "dense_expert_dense_head",
+        "sparse_expert_dense_head",
+        "packed_sparse_expert_dense_head",
+        "packed_dense_lowrank",
+    ] = field(
         default="dense_expert_dense_head",
         metadata={"help": "HALA execution mode."},
     )
@@ -966,6 +971,15 @@ class FinetuningArguments(
         default=0.0,
         metadata={"help": "Weight for the language-prior auxiliary loss (0 disables)."},
     )
+    track_router_metrics: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to record per-layer router load/entropy metrics. If unset, adapter defaults apply. "
+                "Set false to keep language-prior loss while reducing training overhead."
+            )
+        },
+    )
     language_bias_value: float = field(
         default=5.0,
         metadata={"help": "Logit bias value applied in 'bias' routing mode."},
@@ -984,6 +998,15 @@ class FinetuningArguments(
         def split_arg(arg):
             if isinstance(arg, str):
                 return [item.strip() for item in arg.split(",")]
+            return arg
+
+        def parse_optional_bool(arg):
+            if isinstance(arg, str):
+                value = arg.strip().lower()
+                if value in {"true", "1", "yes", "y"}:
+                    return True
+                if value in {"false", "0", "no", "n"}:
+                    return False
             return arg
 
         self.freeze_trainable_modules: list[str] = split_arg(self.freeze_trainable_modules)
@@ -1007,6 +1030,7 @@ class FinetuningArguments(
             self.hydralora_expert_lora_nums = self.hydralora_expert_lora_nums.strip() or None
         if isinstance(self.hala_expert_lora_nums, str):
             self.hala_expert_lora_nums = self.hala_expert_lora_nums.strip() or None
+        self.track_router_metrics = parse_optional_bool(self.track_router_metrics)
         self.mixlora_moe_target_modules: Optional[list[str]] = split_arg(self.mixlora_moe_target_modules)
         if isinstance(self.mixlora_act_fn, str):
             self.mixlora_act_fn = self.mixlora_act_fn.strip() or None
@@ -1138,8 +1162,16 @@ class FinetuningArguments(
                 raise ValueError("`hala_top_k` must be in range [1, hala_num_experts].")
             if self.hala_head_top_k is not None and self.hala_head_top_k <= 0:
                 self.hala_head_top_k = None
-            if self.hala_execution_mode not in {"dense_expert_dense_head", "sparse_expert_dense_head"}:
-                raise ValueError("`hala_execution_mode` must be either 'dense_expert_dense_head' or 'sparse_expert_dense_head'.")
+            if self.hala_execution_mode not in {
+                "dense_expert_dense_head",
+                "sparse_expert_dense_head",
+                "packed_sparse_expert_dense_head",
+                "packed_dense_lowrank",
+            }:
+                raise ValueError(
+                    "`hala_execution_mode` must be one of 'dense_expert_dense_head', "
+                    "'sparse_expert_dense_head', 'packed_sparse_expert_dense_head', or 'packed_dense_lowrank'."
+                )
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")

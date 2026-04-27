@@ -104,6 +104,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, model_args)
 
+    def _router_metrics_enabled(self) -> bool:
+        value = getattr(self.finetuning_args, "track_router_metrics", None)
+        if value is not None:
+            return bool(value)
+        return bool(
+            (getattr(self.finetuning_args, "language_prior_weight", 0.0) or 0.0) > 0
+            or getattr(self.finetuning_args, "language_router_mode", None) == "hard"
+        )
+
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -192,6 +201,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         **kwargs,
     ) -> "torch.Tensor":
         loss = super().training_step(model, inputs, *args, **kwargs)
+
+        if not self._router_metrics_enabled():
+            return loss
 
         if self.finetuning_args.finetuning_type == "cola":
             if not hasattr(self, "_cola_router_params"):
@@ -349,8 +361,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if not states:
             return None
 
-        raw_losses = []
-        state_count = 0
+        grouped_states: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         valid_target_count = 0
         for _, logits, targets in states:
             if logits is None or targets is None:
@@ -360,31 +371,44 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             valid = targets >= 0
             if not valid.any():
                 continue
-            raw_losses.append(F.cross_entropy(logits[valid], targets[valid], reduction="mean"))
-            state_count += 1
-            valid_target_count += int(valid.sum().item())
+            logits_valid = logits[valid]
+            targets_valid = targets[valid]
+            grouped_states.setdefault(int(logits_valid.size(-1)), []).append((logits_valid, targets_valid))
+            valid_target_count += int(targets_valid.numel())
 
-        if not raw_losses:
+        if not grouped_states:
             return None
 
-        raw = sum(raw_losses) / len(raw_losses)
+        raw_losses = []
+        state_count = 0
+        for grouped in grouped_states.values():
+            logits_cat = torch.cat([item[0] for item in grouped], dim=0)
+            targets_cat = torch.cat([item[1] for item in grouped], dim=0)
+            losses = F.cross_entropy(logits_cat, targets_cat, reduction="none")
+            offset = 0
+            for logits_valid, _targets_valid in grouped:
+                length = int(logits_valid.size(0))
+                raw_losses.append(losses[offset : offset + length].mean())
+                offset += length
+            state_count += len(grouped)
+
+        raw = torch.stack(raw_losses).mean()
         aux = weight * raw
-        language_prior_loss_raw = float(raw.detach().mean().cpu())
-        language_prior_loss = float(aux.detach().mean().cpu())
-        metrics = {
-            "language_prior_loss_raw": language_prior_loss_raw,
-            "language_prior_loss": language_prior_loss,
-            "language_prior_router_state_count": float(state_count),
-            "language_prior_valid_target_count": float(valid_target_count),
-        }
-        if self.finetuning_args.finetuning_type == "hydralora":
-            record_hydralora_metrics(metrics, weight=1.0)
-        elif self.finetuning_args.finetuning_type == "hala":
-            record_hala_metrics(metrics, weight=1.0)
-        else:
-            record_cola_metrics(metrics, weight=1.0)
-        # Keep parity with other auxiliary losses so trainer_state captures this signal.
-        self.log(metrics)
+        if self._router_metrics_enabled():
+            language_prior_loss_raw = float(raw.detach().mean().cpu())
+            language_prior_loss = float(aux.detach().mean().cpu())
+            metrics = {
+                "language_prior_loss_raw": language_prior_loss_raw,
+                "language_prior_loss": language_prior_loss,
+                "language_prior_router_state_count": float(state_count),
+                "language_prior_valid_target_count": float(valid_target_count),
+            }
+            if self.finetuning_args.finetuning_type == "hydralora":
+                record_hydralora_metrics(metrics, weight=1.0)
+            elif self.finetuning_args.finetuning_type == "hala":
+                record_hala_metrics(metrics, weight=1.0)
+            else:
+                record_cola_metrics(metrics, weight=1.0)
         return aux
 
     def _compute_adamole_aux_loss(self, model: "torch.nn.Module") -> Optional[torch.Tensor]:
@@ -701,7 +725,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     def _flush_language_router_cache(self) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
         caches: list[tuple[str, torch.Tensor, torch.Tensor]] = []
-        for module in self.model.modules():
+        modules = getattr(self, "_language_routed_modules", None)
+        if modules is None:
+            module = getattr(self.model, "module", self.model)
+            modules = [
+                submodule
+                for submodule in module.modules()
+                if hasattr(submodule, "language_guidance_scope") and hasattr(submodule, "base_layer")
+            ]
+            self._language_routed_modules = modules
+        for module in modules:
             pop_fn = getattr(module, "pop_language_router_cache", None)
             if callable(pop_fn):
                 caches.extend(pop_fn())

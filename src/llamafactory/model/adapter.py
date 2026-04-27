@@ -576,6 +576,7 @@ def _setup_cola_tuning(
                 "language_head_router_mode": finetuning_args.language_head_router_mode,
                 "language_guidance_scope": finetuning_args.language_guidance_scope,
                 "language_prior_weight": finetuning_args.language_prior_weight,
+                "track_router_metrics": finetuning_args.track_router_metrics,
                 "language_bias_value": finetuning_args.language_bias_value,
                 "language_head_bias_value": finetuning_args.language_head_bias_value,
             }
@@ -908,6 +909,7 @@ def _setup_hydralora_tuning(
                 "language_head_router_mode": finetuning_args.language_head_router_mode,
                 "language_guidance_scope": finetuning_args.language_guidance_scope,
                 "language_prior_weight": finetuning_args.language_prior_weight,
+                "track_router_metrics": finetuning_args.track_router_metrics,
                 "language_bias_value": finetuning_args.language_bias_value,
                 "language_head_bias_value": finetuning_args.language_head_bias_value,
             }
@@ -1091,6 +1093,7 @@ def _setup_hala_tuning(
                 "language_head_router_mode": finetuning_args.language_head_router_mode,
                 "language_guidance_scope": finetuning_args.language_guidance_scope,
                 "language_prior_weight": finetuning_args.language_prior_weight,
+                "track_router_metrics": finetuning_args.track_router_metrics,
                 "language_bias_value": finetuning_args.language_bias_value,
                 "language_head_bias_value": finetuning_args.language_head_bias_value,
             }
