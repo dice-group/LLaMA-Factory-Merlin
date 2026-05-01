@@ -18,7 +18,7 @@ class HalaModel(HydraLoraModel):
         parent,
         current_key,
     ):
-        current_mode = getattr(lora_config, "hala_execution_mode", "dense_expert_dense_head")
+        current_mode = getattr(lora_config, "hala_execution_mode", "grouped_sparse_expert_dense_head")
         previous_mode = getattr(lora_config, "_hala_execution_mode_runtime", None)
         lora_config._hala_execution_mode_runtime = current_mode
         try:
@@ -42,7 +42,9 @@ class HalaModel(HydraLoraModel):
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
         kwargs["hala_execution_mode"] = getattr(
-            lora_config, "_hala_execution_mode_runtime", getattr(lora_config, "hala_execution_mode", "dense_expert_dense_head")
+            lora_config,
+            "_hala_execution_mode_runtime",
+            getattr(lora_config, "hala_execution_mode", "grouped_sparse_expert_dense_head"),
         )
         dispatchers = []
         if lora_config._custom_modules:

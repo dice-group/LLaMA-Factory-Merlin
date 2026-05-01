@@ -601,8 +601,8 @@ class FinetuningArguments(
         metadata={"help": "Top-k experts selected per token in HALA."},
     )
     hala_head_top_k: Optional[int] = field(
-        default=None,
-        metadata={"help": "Top-k heads selected per expert in HALA (None or <=0 keeps dense head mixing)."},
+        default=1,
+        metadata={"help": "Top-k heads selected per expert in HALA. The exploration HALA path requires 1."},
     )
     hala_debug: bool = field(default=False, metadata={"help": "Enable verbose HALA debugging output."})
     hala_expert_lora_nums: Optional[str] = field(
@@ -610,14 +610,10 @@ class FinetuningArguments(
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HALA expert."},
     )
     hala_execution_mode: Literal[
-        "dense_expert_dense_head",
-        "sparse_expert_dense_head",
-        "packed_sparse_expert_dense_head",
         "grouped_sparse_expert_dense_head",
-        "packed_dense_lowrank",
     ] = field(
-        default="dense_expert_dense_head",
-        metadata={"help": "HALA execution mode."},
+        default="grouped_sparse_expert_dense_head",
+        metadata={"help": "HALA execution mode. The exploration branch only supports sparse expert plus sparse head."},
     )
     mola_num_experts: int = field(default=4, metadata={"help": "Number of experts used by MoLA."})
     mola_top_k: int = field(default=2, metadata={"help": "Top-k experts routed to for each token in MoLA."})
@@ -1159,22 +1155,19 @@ class FinetuningArguments(
         if self.finetuning_type == "hala":
             if self.hala_num_experts <= 0:
                 raise ValueError("`hala_num_experts` must be positive.")
-            if self.hala_top_k <= 0 or self.hala_top_k > self.hala_num_experts:
-                raise ValueError("`hala_top_k` must be in range [1, hala_num_experts].")
-            if self.hala_head_top_k is not None and self.hala_head_top_k <= 0:
-                self.hala_head_top_k = None
-            if self.hala_execution_mode not in {
-                "dense_expert_dense_head",
-                "sparse_expert_dense_head",
-                "packed_sparse_expert_dense_head",
-                "grouped_sparse_expert_dense_head",
-                "packed_dense_lowrank",
-            }:
+            if self.hala_top_k != 1:
+                raise ValueError("This HALA exploration branch only supports `hala_top_k=1`.")
+            if self.hala_head_top_k != 1:
+                raise ValueError("This HALA exploration branch only supports `hala_head_top_k=1`.")
+            if self.hala_execution_mode != "grouped_sparse_expert_dense_head":
                 raise ValueError(
-                    "`hala_execution_mode` must be one of 'dense_expert_dense_head', "
-                    "'sparse_expert_dense_head', 'packed_sparse_expert_dense_head', "
-                    "'grouped_sparse_expert_dense_head', or 'packed_dense_lowrank'."
+                    "This HALA exploration branch only supports "
+                    "`hala_execution_mode=grouped_sparse_expert_dense_head`."
                 )
+            if self.language_guidance_scope != "all":
+                raise ValueError("HALA requires `language_guidance_scope=all`.")
+            if self.language_prior_weight <= 0:
+                raise ValueError("HALA requires `language_prior_weight > 0` for LPR supervision.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")

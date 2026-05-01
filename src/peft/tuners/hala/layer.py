@@ -8,29 +8,52 @@ import torch.nn as nn
 from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
-from ..utils.language_routing import LANGUAGE_PAD_ID
 
 from ..hydralora.config import HydraLoraConfig
 from ..hydralora.layer import Embedding as HydraEmbedding
-from ..hydralora.layer import HydraLoraLayer, transpose
+from ..hydralora.layer import HydraLoraLayer, logger
 from .forward import forward_expert as hala_forward_expert
-from .forward import forward_flat as hala_forward_flat
 
 
 class HalaLoraLayer(HydraLoraLayer):
-    _VALID_EXECUTION_MODES = {
-        "dense_expert_dense_head",
-        "sparse_expert_dense_head",
-        "packed_sparse_expert_dense_head",
-        "grouped_sparse_expert_dense_head",
-        "packed_dense_lowrank",
-    }
+    _VALID_EXECUTION_MODES = {"grouped_sparse_expert_dense_head"}
+    _missing_language_warning_emitted_global: set[str] = set()
 
-    def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, hala_execution_mode: str = "dense_expert_dense_head", **kwargs) -> None:
+    def __init__(
+        self,
+        base_layer: nn.Module,
+        ephemeral_gpu_offload: bool = False,
+        hala_execution_mode: str = "grouped_sparse_expert_dense_head",
+        **kwargs,
+    ) -> None:
         self.hala_execution_mode = hala_execution_mode
         super().__init__(base_layer, ephemeral_gpu_offload=ephemeral_gpu_offload, **kwargs)
         if self.hala_execution_mode not in self._VALID_EXECUTION_MODES:
             raise ValueError(f"Unsupported hala_execution_mode={self.hala_execution_mode!r}.")
+        if not getattr(self, "use_hydralora_experts", False):
+            raise ValueError("HALA exploration branch requires expert routing.")
+        if int(getattr(self, "top_k", 0) or 0) != 1:
+            raise ValueError("HALA exploration branch requires sparse expert top_k=1.")
+        if int(getattr(self, "head_top_k", 0) or 0) != 1:
+            raise ValueError("HALA exploration branch requires sparse head head_top_k=1.")
+        if getattr(self, "language_guidance_scope", None) != "all":
+            raise ValueError("HALA requires language_guidance_scope='all'.")
+        if float(getattr(self, "language_prior_weight", 0.0) or 0.0) <= 0.0:
+            raise ValueError("HALA requires language_prior_weight > 0 for LPR supervision.")
+
+    def _log_missing_language_targets(self, prefix: str, reason: str) -> None:
+        key = f"{prefix}:{reason}"
+        if key in self._missing_language_warning_emitted_global:
+            return
+        column = self.language_column or "<unset>"
+        logger.warning(
+            "HALA layer '%s' missing %s routing metadata (%s). Verify dataset column '%s' and language_map.",
+            self.__class__.__name__,
+            prefix,
+            reason,
+            column,
+        )
+        self._missing_language_warning_emitted_global.add(key)
 
     def update_layer(
         self,
@@ -71,7 +94,7 @@ class Linear(nn.Module, HalaLoraLayer):
         init_lora_weights: Union[bool, str] = True,
         **kwargs,
     ) -> None:
-        hala_execution_mode = kwargs.pop("hala_execution_mode", "dense_expert_dense_head")
+        hala_execution_mode = kwargs.pop("hala_execution_mode", "grouped_sparse_expert_dense_head")
         super().__init__()
         HalaLoraLayer.__init__(self, base_layer, hala_execution_mode=hala_execution_mode, **kwargs)
         self.fan_in_fan_out = fan_in_fan_out
@@ -96,15 +119,16 @@ class Linear(nn.Module, HalaLoraLayer):
                 language_ids = language_ids.view(language_ids.size(0))
         else:
             language_ids = None
+
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
             return self.base_layer(x, *args, **kwargs)
         if self.merged:
             return self.base_layer(x, *args, **kwargs)
-        if getattr(self, "use_hydralora_experts", False):
-            return hala_forward_expert(self, x, *args, language_ids=language_ids, **kwargs)
-        return hala_forward_flat(self, x, *args, language_ids=language_ids, **kwargs)
+        if not getattr(self, "use_hydralora_experts", False):
+            raise ValueError("HALA exploration branch only supports expert routing.")
+        return hala_forward_expert(self, x, *args, language_ids=language_ids, **kwargs)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         adapter_names = check_adapters_to_merge(self, adapter_names)
@@ -114,7 +138,6 @@ class Linear(nn.Module, HalaLoraLayer):
 
     def unmerge(self) -> None:
         if not self.merged:
-            warnings.warn("Already unmerged. Nothing to do.")
             return
         raise ValueError("HALA adapters are routing-dependent and cannot be unmerged from base weights.")
 
@@ -141,60 +164,6 @@ class Linear(nn.Module, HalaLoraLayer):
             caches.append(("hala_expert", logits, targets))
         self._cache_pop("hydra_expert_router_language_ids")
         return caches
-
-    def _adapter_delta(
-        self,
-        x: torch.Tensor,
-        name: str,
-        *,
-        language_ids: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None,
-        expert_targets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        A = self.lora_A[name]
-        B_list = self.lora_B[name]
-        drop = self.lora_dropout[name]
-        scale = self.scaling[name]
-
-        if not B_list:
-            return torch.zeros_like(x, dtype=self.get_base_layer().weight.dtype)
-
-        intermediate = drop(x.to(A.weight.dtype))
-        a_dot_x = A(intermediate)
-
-        lora_route = self.lora_route[name] if name in self.lora_route else None
-        if lora_route is None or len(B_list) == 1:
-            out = sum(B(a_dot_x) for B in B_list)
-            return out * scale
-
-        route_dtype = lora_route.weight.dtype
-        route_logits = lora_route(x.to(route_dtype)).to(x.dtype)
-        head_targets: Optional[torch.Tensor] = None
-        use_head_guidance = self.language_guidance_scope == "all"
-        if use_head_guidance and language_ids is not None:
-            head_targets = self._language_head_targets(language_ids, name)
-            if (
-                head_targets is not None
-                and expert_id is not None
-                and expert_targets is not None
-                and torch.is_tensor(expert_targets)
-            ):
-                mismatch = expert_targets != int(expert_id)
-                if mismatch.any():
-                    head_targets = head_targets.clone()
-                    head_targets[mismatch] = LANGUAGE_PAD_ID
-
-            self._cache_router_state(route_logits, language_ids, f"hydra_head_{name}", head_targets)
-
-        route_logits = self._apply_language_bias_heads(route_logits, head_targets)
-        route_weight = self._head_router_weights(route_logits)
-        route_weight = self._enforce_language_heads(route_weight, head_targets)
-
-        out = 0
-        for i, B in enumerate(B_list):
-            out = out + torch.unsqueeze(route_weight[:, :, i], -1) * B(a_dot_x)
-
-        return out * scale
 
     def __repr__(self) -> str:
         return "lora." + super().__repr__()

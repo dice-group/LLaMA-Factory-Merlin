@@ -11,20 +11,13 @@ from ..hydralora.config import HydraLoraConfig
 @dataclass
 class HalaConfig(HydraLoraConfig):
     hala_execution_mode: Literal[
-        "dense_expert_dense_head",
-        "sparse_expert_dense_head",
-        "packed_sparse_expert_dense_head",
         "grouped_sparse_expert_dense_head",
-        "packed_dense_lowrank",
     ] = field(
-        default="dense_expert_dense_head",
+        default="grouped_sparse_expert_dense_head",
         metadata={
             "help": (
-                "HALA execution mode. `dense_expert_dense_head` keeps dense compute across both stages, "
-                "`sparse_expert_dense_head` keeps sparse expert dispatch with dense head mixing, and "
-                "`packed_sparse_expert_dense_head` also packs per-expert B-head projections. "
-                "`grouped_sparse_expert_dense_head` uses torch grouped GEMM when available. "
-                "`packed_dense_lowrank` applies HMoRA-style packed low-rank expert mixing."
+                "HALA exploration mode. The tuner only supports sparse expert top-1 routing followed by "
+                "sparse head top-1 routing inside the selected expert."
             )
         },
     )
@@ -32,11 +25,15 @@ class HalaConfig(HydraLoraConfig):
     def __post_init__(self):
         super().__post_init__()
         self.peft_type = PeftType.HALA
-        if self.hala_execution_mode not in {
-            "dense_expert_dense_head",
-            "sparse_expert_dense_head",
-            "packed_sparse_expert_dense_head",
-            "grouped_sparse_expert_dense_head",
-            "packed_dense_lowrank",
-        }:
+        if self.hala_execution_mode != "grouped_sparse_expert_dense_head":
             raise ValueError(f"Unsupported hala_execution_mode={self.hala_execution_mode!r}.")
+        if not self.use_hydralora_experts:
+            raise ValueError("HALA exploration branch requires use_hydralora_experts=True.")
+        if self.top_k != 1:
+            raise ValueError("HALA exploration branch requires top_k=1.")
+        if self.head_top_k != 1:
+            raise ValueError("HALA exploration branch requires head_top_k=1.")
+        if self.language_guidance_scope != "all":
+            raise ValueError("HALA requires language_guidance_scope='all'.")
+        if self.language_prior_weight <= 0:
+            raise ValueError("HALA requires language_prior_weight > 0 for LPR supervision.")
