@@ -1041,6 +1041,12 @@ def _setup_hala_tuning(
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
         expert_lora_nums = _parse_optional_int_list(finetuning_args.hala_expert_lora_nums)
+        layers_to_transform = None
+        if finetuning_args.hala_layers_to_transform is not None:
+            if finetuning_args.hala_layers_to_transform.lower() != "all":
+                layers_to_transform = [
+                    int(layer_id) for layer_id in finetuning_args.hala_layers_to_transform.split(",") if layer_id.strip()
+                ]
         peft_kwargs = {
             "r": finetuning_args.lora_rank,
             "target_modules": target_modules,
@@ -1056,6 +1062,8 @@ def _setup_hala_tuning(
             "hala_execution_mode": finetuning_args.hala_execution_mode,
             "modules_to_save": finetuning_args.additional_target,
         }
+        if layers_to_transform is not None:
+            peft_kwargs["layers_to_transform"] = layers_to_transform
         language_map = load_language_map(finetuning_args.language_map)
         language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
@@ -1113,10 +1121,11 @@ def _setup_hala_tuning(
                 count = int(sample_layer.lora_num.get(key, 0) or 0)
             actual_heads.append(count)
         logger.info_rank0(
-            "[HALA SETUP] mode=%s experts=%s heads_per_expert=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
+            "[HALA SETUP] mode=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
             finetuning_args.hala_execution_mode,
             actual_experts,
             actual_heads,
+            finetuning_args.hala_layers_to_transform or "all",
             finetuning_args.language_router_mode,
             finetuning_args.language_head_router_mode,
             finetuning_args.language_guidance_scope,

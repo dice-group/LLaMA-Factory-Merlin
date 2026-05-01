@@ -609,6 +609,10 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HALA expert."},
     )
+    hala_layers_to_transform: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated decoder layer ids to apply HALA adapters to (use 'all' for every layer)."},
+    )
     hala_execution_mode: Literal[
         "grouped_sparse_expert_dense_head",
     ] = field(
@@ -1027,6 +1031,8 @@ class FinetuningArguments(
             self.hydralora_expert_lora_nums = self.hydralora_expert_lora_nums.strip() or None
         if isinstance(self.hala_expert_lora_nums, str):
             self.hala_expert_lora_nums = self.hala_expert_lora_nums.strip() or None
+        if isinstance(self.hala_layers_to_transform, str):
+            self.hala_layers_to_transform = self.hala_layers_to_transform.strip() or None
         self.track_router_metrics = parse_optional_bool(self.track_router_metrics)
         self.mixlora_moe_target_modules: Optional[list[str]] = split_arg(self.mixlora_moe_target_modules)
         if isinstance(self.mixlora_act_fn, str):
