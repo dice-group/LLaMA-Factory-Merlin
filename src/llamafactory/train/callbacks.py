@@ -655,6 +655,82 @@ class JitCheckpointCallback(TrainerCallback):
             self._got_signal = False
 
 
+class TimedCheckpointCallback(TrainerCallback):
+    r"""Save one wall-clock checkpoint without stopping training."""
+
+    def __init__(self) -> None:
+        self._start_time: Optional[float] = None
+        self._pending = False
+        self._saved = False
+
+    @override
+    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        self._start_time = time.time()
+
+    @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        seconds = int(getattr(args, "timed_checkpoint_seconds", 0) or 0)
+        if seconds <= 0 or self._saved or self._pending or self._start_time is None:
+            return
+        elapsed = time.time() - self._start_time
+        if elapsed >= seconds:
+            logger.warning_rank0(
+                "Timed checkpoint: requesting checkpoint save at step=%s after %.1fs.",
+                state.global_step,
+                elapsed,
+            )
+            self._pending = True
+            control.should_save = True
+
+    @override
+    def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if self._start_time is None:
+            return
+
+        elapsed = time.time() - self._start_time
+        max_steps = int(getattr(state, "max_steps", 0) or 0)
+        if self._pending:
+            label = str(getattr(args, "timed_checkpoint_label", "compute_cut") or "compute_cut")
+            checkpoint_kind = "compute"
+            self._pending = False
+            self._saved = True
+        elif max_steps > 0:
+            pct = int(round(100.0 * float(state.global_step) / float(max_steps)))
+            label = f"token_cut_{pct:03d}"
+            checkpoint_kind = "token"
+        else:
+            label = "scheduled"
+            checkpoint_kind = "scheduled"
+
+        checkpoint_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+        metadata = {
+            "label": label,
+            "kind": checkpoint_kind,
+            "global_step": int(state.global_step),
+            "max_steps": max_steps,
+            "elapsed_seconds": elapsed,
+            "num_input_tokens_seen": getattr(state, "num_input_tokens_seen", None),
+        }
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        with open(os.path.join(checkpoint_dir, "hala_checkpoint_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
+
+        index_path = os.path.join(args.output_dir, "hala_checkpoint_metadata.json")
+        index: list[dict[str, Any]] = []
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    index = loaded
+            except Exception:
+                index = []
+        index = [entry for entry in index if entry.get("global_step") != metadata["global_step"] or entry.get("label") != label]
+        index.append(metadata)
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2, sort_keys=True)
+
+
 class ReporterCallback(TrainerCallback):
     r"""A callback for reporting training status to external logger."""
 

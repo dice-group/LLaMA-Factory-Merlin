@@ -103,6 +103,14 @@ class TrainingArguments(RayArguments, BaseTrainingArguments):
             )
         },
     )
+    timed_checkpoint_seconds: int = field(
+        default=0,
+        metadata={"help": "Save one non-stopping checkpoint after this many elapsed training seconds (0 disables)."},
+    )
+    timed_checkpoint_label: str = field(
+        default="compute_cut",
+        metadata={"help": "Label written to checkpoint metadata for the timed non-stopping checkpoint."},
+    )
 
     overwrite_output_dir: bool = field(
         default=False,

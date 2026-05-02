@@ -17,7 +17,7 @@ class HalaConfig(HydraLoraConfig):
         metadata={
             "help": (
                 "HALA exploration mode. The tuner only supports sparse expert top-1 routing followed by "
-                "sparse head top-1 routing inside the selected expert."
+                "sparse or dense head routing inside the selected expert."
             )
         },
     )
@@ -31,8 +31,8 @@ class HalaConfig(HydraLoraConfig):
             raise ValueError("HALA exploration branch requires use_hydralora_experts=True.")
         if self.top_k != 1:
             raise ValueError("HALA exploration branch requires top_k=1.")
-        if self.head_top_k != 1:
-            raise ValueError("HALA exploration branch requires head_top_k=1.")
+        if self.head_top_k is None or self.head_top_k not in (0, 1):
+            raise ValueError("HALA exploration branch requires head_top_k=1 for sparse heads or 0 for dense heads.")
         if self.language_guidance_scope != "all":
             raise ValueError("HALA requires language_guidance_scope='all'.")
         if self.language_prior_weight <= 0:

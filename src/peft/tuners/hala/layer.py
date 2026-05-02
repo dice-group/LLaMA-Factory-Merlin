@@ -34,8 +34,9 @@ class HalaLoraLayer(HydraLoraLayer):
             raise ValueError("HALA exploration branch requires expert routing.")
         if int(getattr(self, "top_k", 0) or 0) != 1:
             raise ValueError("HALA exploration branch requires sparse expert top_k=1.")
-        if int(getattr(self, "head_top_k", 0) or 0) != 1:
-            raise ValueError("HALA exploration branch requires sparse head head_top_k=1.")
+        head_top_k = getattr(self, "head_top_k", 1)
+        if head_top_k is not None and int(head_top_k) not in (0, 1):
+            raise ValueError("HALA exploration branch requires head_top_k=1 for sparse heads or 0 for dense heads.")
         if getattr(self, "language_guidance_scope", None) != "all":
             raise ValueError("HALA requires language_guidance_scope='all'.")
         if float(getattr(self, "language_prior_weight", 0.0) or 0.0) <= 0.0:

@@ -620,7 +620,7 @@ class FinetuningArguments(
     )
     hala_head_top_k: Optional[int] = field(
         default=1,
-        metadata={"help": "Top-k heads selected per expert in HALA. The exploration HALA path requires 1."},
+        metadata={"help": "Top-k heads selected per expert in HALA. Use 1 for sparse heads or 0 for dense heads."},
     )
     hala_debug: bool = field(default=False, metadata={"help": "Enable verbose HALA debugging output."})
     hala_expert_lora_nums: Optional[str] = field(
@@ -1182,8 +1182,8 @@ class FinetuningArguments(
                 raise ValueError("`hala_num_experts` must be positive.")
             if self.hala_top_k != 1:
                 raise ValueError("This HALA exploration branch only supports `hala_top_k=1`.")
-            if self.hala_head_top_k != 1:
-                raise ValueError("This HALA exploration branch only supports `hala_head_top_k=1`.")
+            if self.hala_head_top_k not in (0, 1):
+                raise ValueError("This HALA exploration branch supports `hala_head_top_k=1` or `hala_head_top_k=0`.")
             if self.hala_execution_mode != "grouped_sparse_expert_dense_head":
                 raise ValueError(
                     "This HALA exploration branch only supports "

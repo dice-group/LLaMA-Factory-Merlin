@@ -163,7 +163,15 @@ def _head_weights_for_selected_tokens(
 ) -> torch.Tensor:
     b_list = layer.lora_B[name]
     if len(b_list) <= 1:
-        raise ValueError(f"HALA requires at least two routed heads for {name}.")
+        route_weight = torch.ones((x_sel.size(0), 1), device=x_sel.device, dtype=x_sel.dtype)
+        _record_head_metrics(
+            layer,
+            route_weight,
+            None,
+            None,
+            expect_targets=False,
+        )
+        return route_weight
 
     lora_route = layer.lora_route[name] if name in layer.lora_route else None
     if lora_route is None:
@@ -200,8 +208,8 @@ def _head_weights_for_selected_tokens(
 def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
     if layer.top_k != 1:
         raise ValueError("HALA exploration branch only supports sparse expert top_k=1.")
-    if layer.head_top_k != 1:
-        raise ValueError("HALA exploration branch only supports sparse head head_top_k=1.")
+    if layer.head_top_k is not None and int(layer.head_top_k) not in (0, 1):
+        raise ValueError("HALA exploration branch supports head_top_k=1 for sparse heads or 0 for dense heads.")
     if x.dim() != 3:
         raise ValueError(f"HALA sparse routing expects [batch, seq, hidden] input, got shape={tuple(x.shape)}.")
     if layer.language_guidance_scope != "all":
@@ -270,12 +278,10 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         )
 
         out = torch.zeros((a_dot_x.size(0), result.size(-1)), device=result.device, dtype=result_dtype)
-        head_idx = torch.argmax(route_weight, dim=-1)
         for head_id, b in enumerate(b_list):
-            head_token_idx = torch.where(head_idx == head_id)[0]
-            if head_token_idx.numel() == 0:
-                continue
-            out[head_token_idx] = b(a_dot_x[head_token_idx]).to(result_dtype)
+            head_weight = route_weight[:, head_id].to(result_dtype).unsqueeze(-1)
+            if bool((head_weight != 0).any().item()):
+                out = out + b(a_dot_x).to(result_dtype) * head_weight
 
         out = out.to(result_dtype) * float(scale) * weights_flat[token_idx].to(result_dtype).unsqueeze(-1)
         moe_out_flat.index_add_(0, token_idx, out)
