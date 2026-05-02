@@ -98,6 +98,51 @@ def _parse_optional_int_list(value: Optional[Union[str, Sequence[int]]]) -> Opti
     return parsed
 
 
+def _resolve_trainable_token_setup(
+    finetuning_args: "FinetuningArguments",
+) -> tuple[Optional[list[str]], Optional[dict[str, list[int]]]]:
+    modules_to_save = finetuning_args.additional_target
+    token_range = getattr(finetuning_args, "trainable_token_range", None)
+    if token_range is None:
+        return modules_to_save, None
+
+    token_range = str(token_range).strip()
+    if not token_range:
+        return modules_to_save, None
+
+    sep = ":" if ":" in token_range else ","
+    parts = [part.strip() for part in token_range.split(sep) if part.strip()]
+    if len(parts) != 2:
+        raise ValueError("`trainable_token_range` must be formatted as start:end.")
+
+    start_id, end_id = (int(parts[0]), int(parts[1]))
+    if start_id < 0 or end_id <= start_id:
+        raise ValueError(f"`trainable_token_range` must be a non-empty positive range, got {token_range!r}.")
+
+    targets = getattr(finetuning_args, "trainable_token_targets", None) or ["embed_tokens"]
+    if isinstance(targets, str):
+        targets = [target.strip() for target in targets.split(",") if target.strip()]
+    else:
+        targets = [str(target).strip() for target in targets if str(target).strip()]
+    if not targets:
+        raise ValueError("`trainable_token_targets` must contain at least one target when trainable tokens are enabled.")
+
+    token_indices = list(range(start_id, end_id))
+    trainable_token_indices = {target: token_indices for target in targets}
+    if modules_to_save:
+        target_set = set(targets)
+        filtered_modules = [module for module in modules_to_save if module not in target_set]
+        if len(filtered_modules) != len(modules_to_save):
+            logger.info_rank0(
+                "Using trainable-token rows for %s; removed overlapping modules from `additional_target`.",
+                ",".join(targets),
+            )
+        modules_to_save = filtered_modules or None
+
+    logger.info_rank0("Using trainable-token rows [%s, %s) for %s.", start_id, end_id, ",".join(targets))
+    return modules_to_save, trainable_token_indices
+
+
 def _resolve_hmora_task_token_id(
     model_args: "ModelArguments",
     finetuning_args: "FinetuningArguments",
@@ -354,6 +399,8 @@ def _setup_lora_tuning(
             finetuning_args.additional_target = module_names
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+
         if finetuning_args.finetuning_type == "lora":
             peft_kwargs = {
                 "r": finetuning_args.lora_rank,
@@ -362,7 +409,8 @@ def _setup_lora_tuning(
                 "lora_dropout": finetuning_args.lora_dropout,
                 "use_rslora": finetuning_args.use_rslora,
                 "use_dora": finetuning_args.use_dora,
-                "modules_to_save": finetuning_args.additional_target,
+                "modules_to_save": modules_to_save,
+                "trainable_token_indices": trainable_token_indices,
             }
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
@@ -1040,6 +1088,7 @@ def _setup_hala_tuning(
             finetuning_args.additional_target = module_names
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
         expert_lora_nums = _parse_optional_int_list(finetuning_args.hala_expert_lora_nums)
         layers_to_transform = None
         if finetuning_args.hala_layers_to_transform is not None:
@@ -1060,7 +1109,8 @@ def _setup_hala_tuning(
             "head_top_k": finetuning_args.hala_head_top_k,
             "hydralora_debug": finetuning_args.hala_debug,
             "hala_execution_mode": finetuning_args.hala_execution_mode,
-            "modules_to_save": finetuning_args.additional_target,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
         }
         if layers_to_transform is not None:
             peft_kwargs["layers_to_transform"] = layers_to_transform

@@ -115,8 +115,9 @@ class TrainableTokensLayer(nn.Module, BaseTunerLayer):
         # thus re-initializing the new embeddings again with new random variables. If we would add/subtract deltas
         # onto the new values, we would get undefined behavior. By replacing the specific token values we always
         # get defined behavior.
-        weight = self.get_base_layer().weight
-        embed_dim = self.get_base_layer().embedding_dim
+        base_layer = self.get_base_layer()
+        weight = base_layer.weight
+        embed_dim = getattr(base_layer, "embedding_dim", weight.shape[1])
 
         if init_weights:
             if check_deepspeed_zero3_enabled():
@@ -200,6 +201,50 @@ class TrainableTokensLayer(nn.Module, BaseTunerLayer):
 
         return W
 
+    def _token_index_tensor(self, adapter_name: str, device: torch.device) -> torch.Tensor:
+        return torch.tensor(self.token_indices[adapter_name], device=device, dtype=torch.long)
+
+    def _apply_embedding_rows(self, result: torch.Tensor, input_ids: torch.Tensor, adapter_name: str) -> torch.Tensor:
+        index = self._token_index_tensor(adapter_name, input_ids.device)
+        if index.numel() == 0:
+            return result
+
+        values = self.trainable_tokens_delta[adapter_name].to(device=result.device, dtype=result.dtype)
+        start = int(index[0].item())
+        if torch.equal(index, torch.arange(start, start + index.numel(), device=index.device, dtype=index.dtype)):
+            mask = (input_ids >= start) & (input_ids < start + index.numel())
+            if torch.any(mask):
+                result = result.clone()
+                result[mask] = values[(input_ids[mask] - start).long()]
+            return result
+
+        matches = input_ids[..., None] == index
+        mask = matches.any(dim=-1)
+        if torch.any(mask):
+            positions = matches.float().argmax(dim=-1)[mask].long()
+            result = result.clone()
+            result[mask] = values[positions]
+        return result
+
+    def _apply_linear_rows(self, result: torch.Tensor, x: torch.Tensor, adapter_name: str) -> torch.Tensor:
+        index = self._token_index_tensor(adapter_name, result.device)
+        if index.numel() == 0:
+            return result
+
+        values = self.trainable_tokens_delta[adapter_name].to(device=result.device, dtype=result.dtype)
+        selected_logits = F.linear(input=x, weight=values)
+        return result.index_copy_(dim=-1, index=index, source=selected_logits)
+
+    def _zero_touch_trainable_tokens(self, result: torch.Tensor, active_adapters) -> torch.Tensor:
+        zero = None
+        for adapter_name in active_adapters:
+            delta = self.trainable_tokens_delta.get(adapter_name)
+            if delta is None or not delta.requires_grad or delta.numel() == 0:
+                continue
+            term = delta.reshape(-1)[0].to(device=result.device, dtype=result.dtype)
+            zero = term if zero is None else zero + term
+        return result if zero is None else result + zero * 0.0
+
     def forward_adapters(self, x: torch.Tensor, active_adapters, *args, **kwargs) -> torch.Tensor:
         if self.disable_adapters or not active_adapters:
             if self.merged:
@@ -210,8 +255,6 @@ class TrainableTokensLayer(nn.Module, BaseTunerLayer):
         else:
             self._check_overlapping_tokens(active_adapters)
 
-            W = self.get_merged_weights(active_adapters)
-
             # Normally it should be very clear that we're wrapping Embedding layers but there are cases, such as
             # tying weights with an LM head where the layer we wrap is a Linear layer. Therefore we must choose
             # accordingly.
@@ -219,26 +262,20 @@ class TrainableTokensLayer(nn.Module, BaseTunerLayer):
             # TODO: the isinstance checks, especially the one for nn.Linear, may not hold for quantized layers;
             # TODO: we may need to find a better way to detect quantized layers.
             if isinstance(self.base_layer, torch.nn.Embedding):
-                result = F.embedding(
-                    input=x,
-                    weight=W,
-                    padding_idx=self.base_layer.padding_idx,
-                    max_norm=self.base_layer.max_norm,
-                    norm_type=self.base_layer.norm_type,
-                    scale_grad_by_freq=self.base_layer.scale_grad_by_freq,
-                    sparse=self.base_layer.sparse,
-                )
+                result = self.base_layer(x, *args, **kwargs)
+                for adapter_name in active_adapters:
+                    result = self._apply_embedding_rows(result, x, adapter_name)
             elif isinstance(self.base_layer, torch.nn.Linear):
                 # Probably a tied adapter that wraps an LM head.
-                result = F.linear(
-                    input=x,
-                    weight=W,
-                )
+                result = self.base_layer(x, *args, **kwargs)
+                for adapter_name in active_adapters:
+                    result = self._apply_linear_rows(result, x, adapter_name)
             else:
                 raise ValueError(
                     "TrainableTokensLayer wraps an unknown layer type, maybe you are targeting the wrong layer?"
                 )
 
+        result = self._zero_touch_trainable_tokens(result, active_adapters)
         return result
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:

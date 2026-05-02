@@ -202,6 +202,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         *args,
         **kwargs,
     ) -> "torch.Tensor":
+        if (
+            os.environ.get("LLAMAFACTORY_DDP_STATIC_GRAPH", "").strip().lower() in {"1", "true", "yes"}
+            and not getattr(self, "_ddp_static_graph_set", False)
+        ):
+            set_static_graph = getattr(model, "_set_static_graph", None)
+            if callable(set_static_graph):
+                set_static_graph()
+                logger.info_rank0("[DDP] Enabled static graph mode for distributed training.")
+            self._ddp_static_graph_set = True
+
         loss = super().training_step(model, inputs, *args, **kwargs)
 
         if not self._router_metrics_enabled():

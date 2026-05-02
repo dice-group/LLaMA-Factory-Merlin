@@ -66,6 +66,24 @@ class LoraArguments:
             )
         },
     )
+    trainable_token_range: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional compact token id range for PEFT trainable-token tuning, formatted as start:end. "
+                "This fine-tunes only those rows instead of full embedding matrices."
+            )
+        },
+    )
+    trainable_token_targets: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Embedding/output module names to wrap with trainable-token tuning. "
+                "Use commas to separate multiple modules, e.g. embed_tokens,lm_head."
+            )
+        },
+    )
     lora_alpha: Optional[int] = field(
         default=None,
         metadata={"help": "The scale factor for LoRA fine-tuning (default: lora_rank * 2)."},
@@ -1014,6 +1032,7 @@ class FinetuningArguments(
         self.freeze_extra_modules: Optional[list[str]] = split_arg(self.freeze_extra_modules)
         self.lora_alpha: int = self.lora_alpha or self.lora_rank * 2
         self.lora_target: list[str] = split_arg(self.lora_target)
+        self.trainable_token_targets: Optional[list[str]] = split_arg(self.trainable_token_targets)
         self.oft_target: list[str] = split_arg(self.oft_target)
         self.additional_target: Optional[list[str]] = split_arg(self.additional_target)
         self.galore_target: list[str] = split_arg(self.galore_target)

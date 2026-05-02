@@ -7,6 +7,32 @@ from peft.metrics import record_hala_metrics
 from ..utils.language_routing import LANGUAGE_PAD_ID
 
 
+def _zero_touch_trainable_params(layer, *, dtype: torch.dtype, device: torch.device) -> Optional[torch.Tensor]:
+    zero: Optional[torch.Tensor] = None
+
+    modules = []
+    router = getattr(layer, "router", None)
+    if router is not None:
+        modules.append(router)
+    for name in ("lora_A", "lora_B", "lora_route"):
+        store = getattr(layer, name, None)
+        if store is None:
+            continue
+        modules.extend(store.values())
+
+    for module in modules:
+        parameters = getattr(module, "parameters", None)
+        if not callable(parameters):
+            continue
+        for param in parameters():
+            if not param.requires_grad or param.numel() == 0:
+                continue
+            term = param.reshape(-1)[0].to(device=device, dtype=dtype)
+            zero = term if zero is None else zero + term
+
+    return None if zero is None else zero * 0.0
+
+
 def _require_language_ids(language_ids: Optional[torch.Tensor], batch_size: int) -> torch.Tensor:
     if language_ids is None or not torch.is_tensor(language_ids):
         raise ValueError("HALA requires batch language_ids for expert and head routing.")
@@ -255,4 +281,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         moe_out_flat.index_add_(0, token_idx, out)
 
     result = result + moe_out_flat.view(batch, seq_len, -1)
+    ddp_touch = _zero_touch_trainable_params(layer, dtype=result.dtype, device=result.device)
+    if ddp_touch is not None:
+        result = result + ddp_touch
     return result.to(result_dtype)
