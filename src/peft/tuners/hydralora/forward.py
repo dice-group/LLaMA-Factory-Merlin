@@ -72,7 +72,7 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
                         selection=head_assign.squeeze(-1),
                         probs=route_weight,
                         language_ids=language_ids,
-                        expect_targets=use_head_guidance and layer.language_list is not None,
+                        expect_targets=use_head_guidance and language_ids is not None and layer.language_list is not None,
                     )
                     record_hydralora_metrics(metrics, weight=metrics_weight)
 
@@ -150,7 +150,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     selection=topi[:, :, 0],
                     probs=router_probs,
                     language_ids=language_ids,
-                    expect_targets=use_expert_guidance and layer.language_list is not None,
+                    expect_targets=use_expert_guidance and language_ids is not None and layer.language_list is not None,
                 )
                 record_hydralora_metrics(metrics, weight=metrics_weight)
 

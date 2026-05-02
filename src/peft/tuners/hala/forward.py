@@ -180,17 +180,16 @@ def _head_weights_for_selected_tokens(
     route_dtype = lora_route.weight.dtype
     route_logits = lora_route(x_sel.to(route_dtype)).to(x_sel.dtype).unsqueeze(1)
     batch_idx = token_idx // seq_len
-    if language_ids is None or not torch.is_tensor(language_ids):
-        raise ValueError("HALA requires batch language_ids for head routing.")
-    language_ids_sel = language_ids[batch_idx]
-    head_targets = _require_targets(layer._language_head_targets(language_ids_sel, name), "head")
-    expert_targets_sel = _require_targets(expert_targets, "expert")[batch_idx]
-    mismatch = expert_targets_sel != int(expert_id)
-    if mismatch.any():
-        head_targets = head_targets.clone()
-        head_targets[mismatch] = LANGUAGE_PAD_ID
-
-    layer._cache_router_state(route_logits, language_ids_sel, f"hydra_head_{name}", head_targets)
+    language_ids_sel = language_ids[batch_idx] if language_ids is not None and torch.is_tensor(language_ids) else None
+    head_targets = None
+    if language_ids_sel is not None:
+        head_targets = _require_targets(layer._language_head_targets(language_ids_sel, name), "head")
+        expert_targets_sel = _require_targets(expert_targets, "expert")[batch_idx]
+        mismatch = expert_targets_sel != int(expert_id)
+        if mismatch.any():
+            head_targets = head_targets.clone()
+            head_targets[mismatch] = LANGUAGE_PAD_ID
+        layer._cache_router_state(route_logits, language_ids_sel, f"hydra_head_{name}", head_targets)
 
     route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
     route_weight = layer._head_router_weights(route_logits)
@@ -200,7 +199,7 @@ def _head_weights_for_selected_tokens(
         route_weight,
         head_targets,
         language_ids_sel,
-        expect_targets=bool((head_targets >= 0).any().item()),
+        expect_targets=bool(head_targets is not None and (head_targets >= 0).any().item()),
     )
     return route_weight
 
@@ -217,13 +216,16 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
 
     result = layer.base_layer(x, *args, **kwargs)
     result_dtype = result.dtype
-    language_ids = _require_language_ids(language_ids, x.size(0))
+    if layer.training or language_ids is not None or torch.is_tensor(language_ids):
+        language_ids = _require_language_ids(language_ids, x.size(0))
 
     router_dtype = getattr(layer.router.weight, "dtype", torch.float32)
     logits = layer.router(x.to(router_dtype)).to(x.dtype)
 
-    expert_targets = _require_targets(layer._language_expert_targets(language_ids), "expert")
-    layer._cache_router_state(logits, language_ids, "hydra_expert", expert_targets)
+    expert_targets = None
+    if language_ids is not None:
+        expert_targets = _require_targets(layer._language_expert_targets(language_ids), "expert")
+        layer._cache_router_state(logits, language_ids, "hydra_expert", expert_targets)
     logits = layer._apply_language_bias_experts(logits, expert_targets)
 
     topv, topi = torch.topk(logits, 1, dim=-1)
@@ -241,7 +243,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         weights,
         expert_targets,
         language_ids,
-        expect_targets=True,
+        expect_targets=expert_targets is not None,
     )
 
     batch, seq_len, _ = x.size()
