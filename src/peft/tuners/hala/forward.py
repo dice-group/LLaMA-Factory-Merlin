@@ -53,6 +53,45 @@ def _require_targets(targets: Optional[torch.Tensor], stage: str) -> torch.Tenso
     return targets
 
 
+def _needs_language_prior_cache(layer) -> bool:
+    return float(getattr(layer, "language_prior_weight", 0.0) or 0.0) > 0.0
+
+
+def _cache_expert_prior(layer, logits: torch.Tensor, language_ids: torch.Tensor, expert_targets: torch.Tensor) -> None:
+    logits_for_loss = logits.mean(dim=1) if logits.dim() > 2 else logits
+    layer._cache_router_state(logits_for_loss, language_ids, "hydra_expert", expert_targets)
+
+
+def _cache_head_prior_for_selected_expert(
+    layer,
+    route_logits: torch.Tensor,
+    topi_flat: torch.Tensor,
+    batch_idx: torch.Tensor,
+    expert_id: int,
+    expert_name: str,
+    language_ids: torch.Tensor,
+    targets_by_batch: torch.Tensor,
+) -> None:
+    valid_token = (topi_flat == expert_id) & (targets_by_batch[batch_idx] >= 0)
+    if not bool(valid_token.any().item()):
+        return
+
+    batch_size = int(language_ids.size(0))
+    sums = torch.zeros((batch_size, route_logits.size(-1)), device=route_logits.device, dtype=route_logits.dtype)
+    counts = torch.zeros((batch_size, 1), device=route_logits.device, dtype=route_logits.dtype)
+    valid_batches = batch_idx[valid_token]
+    sums.index_add_(0, valid_batches, route_logits[valid_token, expert_id])
+    counts.index_add_(0, valid_batches, torch.ones((valid_batches.numel(), 1), device=route_logits.device, dtype=route_logits.dtype))
+
+    has_tokens = counts.squeeze(-1) > 0
+    layer._cache_router_state(
+        sums[has_tokens] / counts[has_tokens].clamp_min(1),
+        language_ids[has_tokens],
+        f"hydra_head_{expert_name}",
+        targets_by_batch[has_tokens],
+    )
+
+
 def _record_expert_metrics(
     layer,
     x: torch.Tensor,
@@ -189,7 +228,8 @@ def _head_weights_for_selected_tokens(
         if mismatch.any():
             head_targets = head_targets.clone()
             head_targets[mismatch] = LANGUAGE_PAD_ID
-        layer._cache_router_state(route_logits, language_ids_sel, f"hydra_head_{name}", head_targets)
+        if _needs_language_prior_cache(layer):
+            layer._cache_router_state(route_logits.mean(dim=1), language_ids_sel, f"hydra_head_{name}", head_targets)
 
     route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
     route_weight = layer._head_router_weights(route_logits)
@@ -256,24 +296,40 @@ def _packed_uniform_head_weights(
     expert_gate.scatter_(1, topi_flat.unsqueeze(1), weights_flat.to(route_probs.dtype).unsqueeze(1))
     scales = torch.tensor([float(layer.scaling[name]) for name in expert_names], device=x_flat.device, dtype=route_probs.dtype)
 
-    if language_ids_flat is not None and head_targets is not None:
+    needs_prior_cache = _needs_language_prior_cache(layer)
+    if language_ids_flat is not None and head_targets is not None and (needs_prior_cache or layer.track_router_metrics):
+        batch_size = int(language_ids.size(0)) if language_ids is not None else 0
         for expert_id, name in enumerate(expert_names):
             token_idx = torch.where(topi_flat == expert_id)[0]
             if token_idx.numel() == 0:
                 continue
-            layer._cache_router_state(
-                route_logits[token_idx, expert_id].unsqueeze(1),
-                language_ids_flat[token_idx],
-                f"hydra_head_{name}",
-                head_targets[token_idx, expert_id],
-            )
-            _record_head_metrics(
-                layer,
-                route_probs[token_idx, expert_id],
-                head_targets[token_idx, expert_id],
-                language_ids_flat[token_idx],
-                expect_targets=bool((head_targets[token_idx, expert_id] >= 0).any().item()),
-            )
+            if layer.track_router_metrics:
+                if needs_prior_cache:
+                    layer._cache_router_state(
+                        route_logits[token_idx, expert_id].unsqueeze(1),
+                        language_ids_flat[token_idx],
+                        f"hydra_head_{name}",
+                        head_targets[token_idx, expert_id],
+                    )
+                _record_head_metrics(
+                    layer,
+                    route_probs[token_idx, expert_id],
+                    head_targets[token_idx, expert_id],
+                    language_ids_flat[token_idx],
+                    expect_targets=bool((head_targets[token_idx, expert_id] >= 0).any().item()),
+                )
+            elif needs_prior_cache and batch_size > 0:
+                targets_by_batch = head_targets[torch.arange(batch_size, device=head_targets.device) * seq_len, expert_id]
+                _cache_head_prior_for_selected_expert(
+                    layer,
+                    route_logits,
+                    topi_flat,
+                    batch_idx,
+                    expert_id,
+                    name,
+                    language_ids,
+                    targets_by_batch,
+                )
 
     return route_probs * expert_gate.unsqueeze(-1) * scales.view(1, -1, 1), True
 
@@ -299,7 +355,8 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
     expert_targets = None
     if language_ids is not None:
         expert_targets = _require_targets(layer._language_expert_targets(language_ids), "expert")
-        layer._cache_router_state(logits, language_ids, "hydra_expert", expert_targets)
+        if _needs_language_prior_cache(layer):
+            _cache_expert_prior(layer, logits, language_ids, expert_targets)
     logits = layer._apply_language_bias_experts(logits, expert_targets)
 
     topv, topi = torch.topk(logits, 1, dim=-1)
