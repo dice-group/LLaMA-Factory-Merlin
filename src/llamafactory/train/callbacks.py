@@ -340,6 +340,46 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
         self._save_adapter(kwargs.pop("model"), output_dir, _safe_serialization_enabled(args))
 
 
+_FULL_CHECKPOINT_WEIGHT_FILES = (
+    WEIGHTS_NAME,
+    SAFE_WEIGHTS_NAME,
+    "pytorch_model.bin.index.json",
+    "model.safetensors.index.json",
+)
+
+
+def prune_full_checkpoint_weights(output_dir: str) -> None:
+    if not is_env_enabled("LLAMAFACTORY_PRUNE_FULL_CHECKPOINT_WEIGHTS"):
+        return
+    for name in _FULL_CHECKPOINT_WEIGHT_FILES:
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info_rank0("Pruned full checkpoint weight file: %s", path)
+
+
+class PruneFullCheckpointWeightsCallback(TrainerCallback):
+    r"""Remove full model weight files when adapter checkpoints are saved separately."""
+
+    def __init__(self) -> None:
+        self.enabled = is_env_enabled("LLAMAFACTORY_PRUNE_FULL_CHECKPOINT_WEIGHTS")
+
+    def _prune(self, output_dir: str) -> None:
+        if not self.enabled:
+            return
+        prune_full_checkpoint_weights(output_dir)
+
+    @override
+    def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if args.should_save and state.is_world_process_zero:
+            self._prune(os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"))
+
+    @override
+    def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if args.should_save and state.is_world_process_zero:
+            self._prune(args.output_dir)
+
+
 class SaveAdapterMilestoneCallback(TrainerCallback):
     r"""Copy adapter checkpoints to a milestones folder at fixed step intervals."""
 

@@ -213,6 +213,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self._ddp_static_graph_set = True
 
         loss = super().training_step(model, inputs, *args, **kwargs)
+        # Gradient checkpointing recomputes routed layers during backward and can
+        # repopulate LPR caches after compute_loss has consumed them.
+        self._flush_language_router_cache()
 
         if not self._router_metrics_enabled():
             return loss

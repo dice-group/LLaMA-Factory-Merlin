@@ -31,6 +31,7 @@ from .callbacks import (
     LogCallback,
     JitCheckpointCallback,
     PissaConvertCallback,
+    PruneFullCheckpointWeightsCallback,
     ReporterCallback,
     SaveAdapterCheckpointCallback,
     SaveAdapterMilestoneCallback,
@@ -82,6 +83,7 @@ def _training_function(config: dict[str, Any]) -> None:
         "moelpr",
     ]:
         callbacks.append(SaveAdapterCheckpointCallback())
+        callbacks.append(PruneFullCheckpointWeightsCallback())
         if os.environ.get("LLAMAFACTORY_ADAPTER_MILESTONE_STEPS"):
             callbacks.append(SaveAdapterMilestoneCallback())
 
