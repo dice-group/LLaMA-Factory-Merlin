@@ -194,6 +194,18 @@ def record_hala_metrics(metrics: Dict[str, float], weight: float) -> None:
     _SCALAR_STORE.update("hala", metrics, weight)
 
 
+def record_soft_moe_metrics(metrics: Dict[str, float], weight: float) -> None:
+    _SCALAR_STORE.update("soft_moe", metrics, weight)
+
+
+def record_grad_iso_metrics(metrics: Dict[str, float], weight: float) -> None:
+    _SCALAR_STORE.update("grad_iso", metrics, weight)
+
+
+def record_lang_gate_metrics(metrics: Dict[str, float], weight: float) -> None:
+    _SCALAR_STORE.update("lang_gate", metrics, weight)
+
+
 def record_movlora_metrics(metrics: Dict[str, float], weight: float) -> None:
     _SCALAR_STORE.update("movlora", metrics, weight)
 

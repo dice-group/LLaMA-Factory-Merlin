@@ -586,12 +586,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return mask
 
     def _inject_language_router_inputs(self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"]) -> None:
-        if self.finetuning_args.finetuning_type not in {"cola", "hydralora", "hala"}:
+        if self.finetuning_args.finetuning_type not in {"cola", "hydralora", "hala", "soft_moe", "grad_iso", "lang_gate"}:
             return
 
         language_ids = inputs.get("language_ids")
-        if self.finetuning_args.finetuning_type == "hala" and language_ids is None:
-            raise ValueError("HALA training requires tokenized batches to contain language_ids.")
+        if self.finetuning_args.finetuning_type in {"hala", "soft_moe", "grad_iso", "lang_gate"} and language_ids is None:
+            raise ValueError(f"{self.finetuning_args.finetuning_type} training requires tokenized batches to contain language_ids.")
         module = getattr(model, "module", model)
         routed_modules = getattr(self, "_language_routed_modules", None)
         if routed_modules is None:

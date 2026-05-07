@@ -480,7 +480,7 @@ class FinetuningArguments(
         metadata={"help": "Which stage will be performed in training."},
     )
     finetuning_type: Literal[
-        "lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"
+        "lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr", "soft_moe", "grad_iso", "lang_gate"
     ] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
@@ -706,6 +706,33 @@ class FinetuningArguments(
     adamole_debug_mode: bool = field(
         default=False,
         metadata={"help": "Enable verbose AdaMoLE routing diagnostics."},
+    )
+    # --- Soft MoE LoRA ---
+    soft_moe_num_experts: int = field(
+        default=3,
+        metadata={"help": "Number of experts for Soft MoE LoRA."},
+    )
+    soft_moe_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Softmax temperature for Soft MoE expert mixing (higher = more uniform)."},
+    )
+    # --- Gradient-Isolated LoRA ---
+    grad_iso_num_partitions: int = field(
+        default=3,
+        metadata={"help": "Number of gradient-isolated LoRA partitions (one per language)."},
+    )
+    grad_iso_inference_mode: str = field(
+        default="mean",
+        metadata={"help": "Partition combination at inference: 'mean' or 'weighted'."},
+    )
+    # --- Language-Gated LoRA ---
+    lang_gate_type: str = field(
+        default="sigmoid",
+        metadata={"help": "Gate activation: 'sigmoid' (independent dims) or 'softmax' (competitive)."},
+    )
+    lang_gate_init: str = field(
+        default="ones",
+        metadata={"help": "Gate initialization: 'ones' (start shared) or 'identity' (start separated)."},
     )
     mixlora_num_experts: int = field(
         default=8,
@@ -1065,7 +1092,7 @@ class FinetuningArguments(
         if self.cola_strategy == "random":
             self.cola_strategy = "random_ab"
 
-        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr", "soft_moe", "grad_iso", "lang_gate"]
         assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."

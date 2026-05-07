@@ -21,9 +21,11 @@ import torch
 from peft import (
     AdaMoleConfig,
     ColaConfig,
+    GradIsoConfig,
     HMoRaConfig,
     HalaConfig,
     HydraLoraConfig,
+    LangGateConfig,
     LoraConfig,
     LoraModel,
     MixLoraConfig,
@@ -34,6 +36,7 @@ from peft import (
     MolaConfig,
     OFTConfig,
     PeftModel,
+    SoftMoeConfig,
     TaskType,
     VanillaMoELoraConfig,
     get_peft_model,
@@ -2060,6 +2063,168 @@ def _setup_moelpr_tuning(
     return model
 
 
+def _setup_soft_moe_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: Soft MoE LoRA")
+
+    if is_trainable:
+        target_modules = finetuning_args.lora_target if not (len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all") else None
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+        num_experts = finetuning_args.soft_moe_num_experts
+        if family_list and len(family_list) != num_experts:
+            raise ValueError(f"soft_moe_num_experts={num_experts} but language_map defines {len(family_list)} groups.")
+
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "lora_num": 1,
+            "use_hydralora_experts": True,
+            "num_experts": num_experts,
+            "top_k": 1,
+            "soft_moe_temperature": finetuning_args.soft_moe_temperature,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
+            "language_map": language_map,
+            "language_list": language_list,
+            "family_list": family_list,
+            "language_to_family_ids": language_to_family,
+            "language_to_subgroup_ids": language_to_subgroup_ids,
+            "language_column": finetuning_args.language_column,
+            "language_router_mode": finetuning_args.language_router_mode,
+            "language_guidance_scope": "all",
+            "language_prior_weight": finetuning_args.language_prior_weight,
+            "track_router_metrics": finetuning_args.track_router_metrics,
+            "language_bias_value": finetuning_args.language_bias_value,
+        }
+        soft_moe_config = SoftMoeConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+        model = get_peft_model(model, soft_moe_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _setup_grad_iso_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: Gradient-Isolated LoRA")
+
+    if is_trainable:
+        target_modules = finetuning_args.lora_target if not (len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all") else None
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+        num_partitions = finetuning_args.grad_iso_num_partitions
+        if family_list and len(family_list) != num_partitions:
+            raise ValueError(f"grad_iso_num_partitions={num_partitions} but language_map defines {len(family_list)} groups.")
+
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "use_hydralora_experts": False,
+            "grad_iso_num_partitions": num_partitions,
+            "grad_iso_inference_mode": finetuning_args.grad_iso_inference_mode,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
+            "language_map": language_map,
+            "language_list": language_list,
+            "family_list": family_list,
+            "language_to_family_ids": language_to_family,
+            "language_column": finetuning_args.language_column,
+            "language_guidance_scope": "all",
+            "track_router_metrics": finetuning_args.track_router_metrics,
+        }
+        grad_iso_config = GradIsoConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+        model = get_peft_model(model, grad_iso_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _setup_lang_gate_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: Language-Gated LoRA")
+
+    if is_trainable:
+        target_modules = finetuning_args.lora_target if not (len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all") else None
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "use_hydralora_experts": False,
+            "lang_gate_type": finetuning_args.lang_gate_type,
+            "lang_gate_init": finetuning_args.lang_gate_init,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
+            "language_map": language_map,
+            "language_list": language_list,
+            "family_list": family_list,
+            "language_to_family_ids": language_to_family,
+            "language_column": finetuning_args.language_column,
+            "language_guidance_scope": "all",
+            "track_router_metrics": finetuning_args.track_router_metrics,
+        }
+        lang_gate_config = LangGateConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+        model = get_peft_model(model, lang_gate_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
 def init_adapter(
     config: "PretrainedConfig",
     model: "PreTrainedModel",
@@ -2148,6 +2313,18 @@ def init_adapter(
         )
     elif finetuning_args.finetuning_type == "moelpr":
         model = _setup_moelpr_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "soft_moe":
+        model = _setup_soft_moe_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "grad_iso":
+        model = _setup_grad_iso_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "lang_gate":
+        model = _setup_lang_gate_tuning(
             config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
         )
     else:

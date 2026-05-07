@@ -26,6 +26,9 @@ from .hra import HRAConfig, HRAModel
 from .hmora import HMoRaConfig, HMoRaModel
 from .hala import HalaConfig, HalaModel
 from .hydralora import HydraLoraConfig, HydraLoraModel
+from .soft_moe import SoftMoeConfig, SoftMoeModel
+from .grad_iso import GradIsoConfig, GradIsoModel
+from .lang_gate import LangGateConfig, LangGateModel
 from .ia3 import IA3Config, IA3Model
 from .ln_tuning import LNTuningConfig, LNTuningModel
 from .loha import LoHaConfig, LoHaModel
@@ -89,6 +92,12 @@ __all__ = [
     "HalaModel",
     "HydraLoraConfig",
     "HydraLoraModel",
+    "SoftMoeConfig",
+    "SoftMoeModel",
+    "GradIsoConfig",
+    "GradIsoModel",
+    "LangGateConfig",
+    "LangGateModel",
     "IA3Config",
     "IA3Model",
     "LNTuningConfig",
