@@ -415,6 +415,11 @@ def _setup_lora_tuning(
                 "modules_to_save": modules_to_save,
                 "trainable_token_indices": trainable_token_indices,
             }
+            if finetuning_args.lora_layers_to_transform is not None:
+                if finetuning_args.lora_layers_to_transform.lower() != "all":
+                    peft_kwargs["layers_to_transform"] = [
+                        int(layer_id) for layer_id in finetuning_args.lora_layers_to_transform.split(",") if layer_id.strip()
+                    ]
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
                 "r": finetuning_args.oft_rank,
@@ -602,8 +607,6 @@ def _setup_cola_tuning(
                     f"cola_num_experts={finetuning_args.cola_num_experts} "
                     f"but language_map defines {expected_experts} groups."
                 )
-        if expert_num_B is None and subgroup_sizes and any(size > 0 for size in subgroup_sizes):
-            expert_num_B = subgroup_sizes
         if expert_num_B is None and finetuning_args.use_cola_experts and expected_experts:
             expert_num_B = [finetuning_args.num_B] * expected_experts
         if finetuning_args.use_cola_experts and expert_num_B is not None and expected_experts:
@@ -615,6 +618,7 @@ def _setup_cola_tuning(
             if any(count <= 0 for count in expert_num_B):
                 raise ValueError("CoLA expert head config contains non-positive counts.")
             expected_heads = list(expert_num_B)
+            peft_kwargs["expert_num_B"] = expected_heads
         peft_kwargs.update(
             {
                 "language_map": language_map,
@@ -649,7 +653,8 @@ def _setup_cola_tuning(
             elif lowered == "pissa" and finetuning_args.pissa_iter != -1:
                 init_lora_weights = f"pissa_niter_{finetuning_args.pissa_iter}"
         peft_kwargs["init_lora_weights"] = init_lora_weights
-        logger.info_rank0(f"CoLA adapter initialization method: {init_lora_weights}.")
+        init_label = "default_lora" if init_lora_weights is True else init_lora_weights
+        logger.info_rank0(f"CoLA adapter initialization method: {init_label}.")
 
         cola_config = ColaConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -1112,6 +1117,7 @@ def _setup_hala_tuning(
             "head_top_k": finetuning_args.hala_head_top_k,
             "hydralora_debug": finetuning_args.hala_debug,
             "hala_execution_mode": finetuning_args.hala_execution_mode,
+            "hala_shared_residual": finetuning_args.hala_shared_residual,
             "modules_to_save": modules_to_save,
             "trainable_token_indices": trainable_token_indices,
         }
@@ -1174,8 +1180,9 @@ def _setup_hala_tuning(
                 count = int(sample_layer.lora_num.get(key, 0) or 0)
             actual_heads.append(count)
         logger.info_rank0(
-            "[HALA SETUP] mode=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
+            "[HALA SETUP] mode=%s shared_residual=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
             finetuning_args.hala_execution_mode,
+            finetuning_args.hala_shared_residual,
             actual_experts,
             actual_heads,
             finetuning_args.hala_layers_to_transform or "all",

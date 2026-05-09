@@ -21,6 +21,15 @@ class HalaConfig(HydraLoraConfig):
             )
         },
     )
+    hala_shared_residual: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Add one shared LoRA residual branch before the language-routed HALA expert delta. "
+                "This preserves a shared transfer path while keeping the existing routed specialization branch."
+            )
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -33,7 +42,7 @@ class HalaConfig(HydraLoraConfig):
             raise ValueError("HALA exploration branch requires top_k=1.")
         if self.head_top_k is None or self.head_top_k not in (0, 1):
             raise ValueError("HALA exploration branch requires head_top_k=1 for sparse heads or 0 for dense heads.")
-        if self.language_guidance_scope != "all":
-            raise ValueError("HALA requires language_guidance_scope='all'.")
-        if self.language_prior_weight <= 0:
-            raise ValueError("HALA requires language_prior_weight > 0 for LPR supervision.")
+        if self.language_guidance_scope not in {"all", "expert_only"}:
+            raise ValueError("HALA requires language_guidance_scope='all' or 'expert_only'.")
+        if self.language_prior_weight <= 0 and self.language_router_mode != "hard":
+            raise ValueError("HALA requires language_prior_weight > 0 unless language_router_mode='hard'.")

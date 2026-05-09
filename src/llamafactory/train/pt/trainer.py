@@ -19,6 +19,7 @@ import torch
 from transformers import Trainer
 from typing_extensions import override
 
+from ...extras import logging
 from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, verify_fp8_status
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
     from ...hparams import FinetuningArguments, ModelArguments
+
+
+logger = logging.get_logger(__name__)
 
 
 class CustomTrainer(Trainer):
@@ -88,6 +92,32 @@ class CustomTrainer(Trainer):
 
         return super()._get_train_sampler(*args, **kwargs)
 
+    def _inject_language_router_inputs(self, model: "torch.nn.Module", inputs: dict[str, "torch.Tensor"]) -> None:
+        if self.finetuning_args.finetuning_type not in {"cola", "hydralora", "hala"}:
+            return
+
+        language_ids = inputs.get("language_ids")
+        if self.finetuning_args.finetuning_type == "hala" and language_ids is None:
+            raise ValueError("HALA training requires tokenized batches to contain language_ids.")
+
+        module = getattr(model, "module", model)
+        routed_modules = getattr(self, "_language_routed_modules", None)
+        if routed_modules is None:
+            routed_modules = [
+                submodule
+                for submodule in module.modules()
+                if hasattr(submodule, "language_guidance_scope") and hasattr(submodule, "base_layer")
+            ]
+            self._language_routed_modules = routed_modules
+            if routed_modules:
+                logger.info_rank0(
+                    f"[LPR] Found {len(routed_modules)} language-routed adapter layers; injecting language_ids per batch."
+                )
+
+        for routed_module in routed_modules:
+            setattr(routed_module, "language_ids", language_ids)
+
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
+        self._inject_language_router_inputs(model, inputs)
         return super().compute_loss(model, inputs, *args, **kwargs)

@@ -106,6 +106,15 @@ class LoraArguments:
             )
         },
     )
+    lora_layers_to_transform: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated transformer layer indices to apply plain LoRA to. "
+                "Use `all` or leave unset to transform all matching layers."
+            )
+        },
+    )
     loraplus_lr_ratio: Optional[float] = field(
         default=None,
         metadata={"help": "LoRA plus learning rate ratio (lr_B / lr_A)."},
@@ -623,6 +632,12 @@ class FinetuningArguments(
         metadata={"help": "Top-k heads selected per expert in HALA. Use 1 for sparse heads or 0 for dense heads."},
     )
     hala_debug: bool = field(default=False, metadata={"help": "Enable verbose HALA debugging output."})
+    hala_shared_residual: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable a shared LoRA residual branch in HALA before the routed expert residual."
+        },
+    )
     hala_expert_lora_nums: Optional[str] = field(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HALA expert."},
@@ -1059,6 +1074,8 @@ class FinetuningArguments(
         self.freeze_extra_modules: Optional[list[str]] = split_arg(self.freeze_extra_modules)
         self.lora_alpha: int = self.lora_alpha or self.lora_rank * 2
         self.lora_target: list[str] = split_arg(self.lora_target)
+        if isinstance(self.lora_layers_to_transform, str):
+            self.lora_layers_to_transform = self.lora_layers_to_transform.strip() or None
         self.trainable_token_targets: Optional[list[str]] = split_arg(self.trainable_token_targets)
         self.oft_target: list[str] = split_arg(self.oft_target)
         self.additional_target: Optional[list[str]] = split_arg(self.additional_target)
@@ -1216,10 +1233,10 @@ class FinetuningArguments(
                     "This HALA exploration branch only supports "
                     "`hala_execution_mode=grouped_sparse_expert_dense_head`."
                 )
-            if self.language_guidance_scope != "all":
-                raise ValueError("HALA requires `language_guidance_scope=all`.")
-            if self.language_prior_weight <= 0:
-                raise ValueError("HALA requires `language_prior_weight > 0` for LPR supervision.")
+            if self.language_guidance_scope not in {"all", "expert_only"}:
+                raise ValueError("HALA requires `language_guidance_scope` to be 'all' or 'expert_only'.")
+            if self.language_prior_weight <= 0 and self.language_router_mode != "hard":
+                raise ValueError("HALA requires `language_prior_weight > 0` unless `language_router_mode=hard`.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")

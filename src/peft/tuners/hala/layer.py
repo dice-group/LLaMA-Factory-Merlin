@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import math
 from typing import Any, Optional, Union
 
 import torch
@@ -27,6 +28,8 @@ class HalaLoraLayer(HydraLoraLayer):
         **kwargs,
     ) -> None:
         self.hala_execution_mode = hala_execution_mode
+        self.hala_shared_residual = bool(kwargs.pop("hala_shared_residual", False))
+        self.hala_shared_adapter_name = "hala_shared"
         super().__init__(base_layer, ephemeral_gpu_offload=ephemeral_gpu_offload, **kwargs)
         if self.hala_execution_mode not in self._VALID_EXECUTION_MODES:
             raise ValueError(f"Unsupported hala_execution_mode={self.hala_execution_mode!r}.")
@@ -37,10 +40,13 @@ class HalaLoraLayer(HydraLoraLayer):
         head_top_k = getattr(self, "head_top_k", 1)
         if head_top_k is not None and int(head_top_k) not in (0, 1):
             raise ValueError("HALA exploration branch requires head_top_k=1 for sparse heads or 0 for dense heads.")
-        if getattr(self, "language_guidance_scope", None) != "all":
-            raise ValueError("HALA requires language_guidance_scope='all'.")
-        if float(getattr(self, "language_prior_weight", 0.0) or 0.0) <= 0.0:
-            raise ValueError("HALA requires language_prior_weight > 0 for LPR supervision.")
+        if getattr(self, "language_guidance_scope", None) not in {"all", "expert_only"}:
+            raise ValueError("HALA requires language_guidance_scope='all' or 'expert_only'.")
+        if (
+            float(getattr(self, "language_prior_weight", 0.0) or 0.0) <= 0.0
+            and getattr(self, "language_router_mode", None) != "hard"
+        ):
+            raise ValueError("HALA requires language_prior_weight > 0 unless language_router_mode='hard'.")
 
     def _log_missing_language_targets(self, prefix: str, reason: str) -> None:
         key = f"{prefix}:{reason}"
@@ -70,7 +76,7 @@ class HalaLoraLayer(HydraLoraLayer):
     ):
         if use_rslora or use_dora:
             raise ValueError("HALA does not support rsLoRA or DoRA adapters.")
-        return HydraLoraLayer.update_layer(
+        HydraLoraLayer.update_layer(
             self,
             adapter_name,
             r,
@@ -79,6 +85,34 @@ class HalaLoraLayer(HydraLoraLayer):
             lora_num=lora_num,
             init_lora_weights=init_lora_weights,
         )
+        if not self.hala_shared_residual:
+            return
+
+        name = self.hala_shared_adapter_name
+        if name in self.lora_A:
+            return
+
+        self.r[name] = r
+        self.lora_alpha[name] = lora_alpha
+        self.lora_num[name] = 1
+        self.scaling[name] = lora_alpha / r
+        self.lora_dropout[name] = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
+        self.lora_A[name] = nn.Linear(self.in_features, r, bias=False)
+        self.lora_B[name] = nn.ModuleList([nn.Linear(r, self.out_features, bias=False)])
+
+        if init_lora_weights is True:
+            nn.init.kaiming_uniform_(self.lora_A[name].weight, a=math.sqrt(5))
+        elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "gaussian":
+            nn.init.normal_(self.lora_A[name].weight, std=1 / r)
+        elif init_lora_weights is not False:
+            raise ValueError(f"Unknown initialization init_lora_weights={init_lora_weights!r}")
+        nn.init.zeros_(self.lora_B[name][0].weight)
+
+        self._move_adapter_to_device_of_base_layer(name)
+        children = self._hydra_parent_children.setdefault(adapter_name, [])
+        if name not in children:
+            children.append(name)
+        self.set_adapter(adapter_name)
 
 
 class Linear(nn.Module, HalaLoraLayer):

@@ -144,6 +144,31 @@ def _record_expert_metrics(
         record_hala_metrics(metrics, weight=metrics_weight)
 
 
+def _hard_language_expert_routing(
+    layer,
+    x: torch.Tensor,
+    expert_targets: Optional[torch.Tensor],
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if layer.language_router_mode != "hard" or expert_targets is None:
+        return None
+    if expert_targets.dim() != 1 or expert_targets.size(0) != x.size(0):
+        return None
+    if (expert_targets < 0).any():
+        return None
+
+    batch, seq_len, _ = x.size()
+    topi = expert_targets.view(batch, 1, 1).expand(batch, seq_len, 1).clone()
+    weights = torch.ones((batch, seq_len, 1), device=x.device, dtype=x.dtype)
+    logits = torch.full(
+        (batch, seq_len, layer.num_experts),
+        -30.0,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    logits.scatter_(-1, topi, 30.0)
+    return logits, topi, weights
+
+
 def _record_head_metrics(
     layer,
     route_weight: torch.Tensor,
@@ -203,13 +228,6 @@ def _head_weights_for_selected_tokens(
     b_list = layer.lora_B[name]
     if len(b_list) <= 1:
         route_weight = torch.ones((x_sel.size(0), 1), device=x_sel.device, dtype=x_sel.dtype)
-        _record_head_metrics(
-            layer,
-            route_weight,
-            None,
-            None,
-            expect_targets=False,
-        )
         return route_weight
 
     lora_route = layer.lora_route[name] if name in layer.lora_route else None
@@ -257,6 +275,11 @@ def _packed_uniform_head_weights(
     head_count = len(layer.lora_B[expert_names[0]])
     if any(len(layer.lora_B[name]) != head_count for name in expert_names):
         return torch.empty(0, device=x_flat.device), False
+    if head_count <= 1:
+        expert_gate = torch.zeros((x_flat.size(0), layer.num_experts), device=x_flat.device, dtype=x_flat.dtype)
+        expert_gate.scatter_(1, topi_flat.unsqueeze(1), weights_flat.to(x_flat.dtype).unsqueeze(1))
+        scales = torch.tensor([float(layer.scaling[name]) for name in expert_names], device=x_flat.device, dtype=x_flat.dtype)
+        return expert_gate.unsqueeze(-1) * scales.view(1, -1, 1), True
     if any(name not in layer.lora_route for name in expert_names):
         return torch.empty(0, device=x_flat.device), False
 
@@ -270,7 +293,7 @@ def _packed_uniform_head_weights(
     expert_targets_flat = _require_targets(expert_targets, "expert")[batch_idx] if expert_targets is not None else None
 
     head_targets = None
-    if language_ids_flat is not None:
+    if language_ids_flat is not None and layer.language_guidance_scope == "all":
         per_expert_targets = []
         for expert_id, name in enumerate(expert_names):
             target = _require_targets(layer._language_head_targets(language_ids_flat, name), "head")
@@ -341,27 +364,41 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         raise ValueError("HALA exploration branch supports head_top_k=1 for sparse heads or 0 for dense heads.")
     if x.dim() != 3:
         raise ValueError(f"HALA sparse routing expects [batch, seq, hidden] input, got shape={tuple(x.shape)}.")
-    if layer.language_guidance_scope != "all":
-        raise ValueError("HALA requires language_guidance_scope='all' for expert and head LPR.")
+    if layer.language_guidance_scope not in {"all", "expert_only"}:
+        raise ValueError("HALA requires language_guidance_scope='all' or 'expert_only'.")
 
     result = layer.base_layer(x, *args, **kwargs)
     result_dtype = result.dtype
+    shared_name = getattr(layer, "hala_shared_adapter_name", None)
+    if getattr(layer, "hala_shared_residual", False) and shared_name in layer.lora_A:
+        shared_a = layer.lora_A[shared_name]
+        shared_b = layer.lora_B[shared_name][0]
+        shared_x = layer.lora_dropout[shared_name](x.to(shared_a.weight.dtype))
+        shared_out = shared_b(shared_a(shared_x)) * float(layer.scaling[shared_name])
+        result = result + shared_out.to(result_dtype)
+
     if layer.training or language_ids is not None or torch.is_tensor(language_ids):
         language_ids = _require_language_ids(language_ids, x.size(0))
-
-    router_dtype = getattr(layer.router.weight, "dtype", torch.float32)
-    logits = layer.router(x.to(router_dtype)).to(x.dtype)
 
     expert_targets = None
     if language_ids is not None:
         expert_targets = _require_targets(layer._language_expert_targets(language_ids), "expert")
-        if _needs_language_prior_cache(layer):
-            _cache_expert_prior(layer, logits, language_ids, expert_targets)
-    logits = layer._apply_language_bias_experts(logits, expert_targets)
 
-    topv, topi = torch.topk(logits, 1, dim=-1)
-    weights = torch.softmax(topv.to(torch.float32), dim=-1).to(x.dtype)
-    topi, weights = layer._enforce_language_experts(topi, weights, expert_targets)
+    hard_routing = _hard_language_expert_routing(layer, x, expert_targets)
+    if hard_routing is not None:
+        logits, topi, weights = hard_routing
+        if _needs_language_prior_cache(layer) and language_ids is not None and expert_targets is not None:
+            _cache_expert_prior(layer, logits, language_ids, expert_targets)
+    else:
+        router_dtype = getattr(layer.router.weight, "dtype", torch.float32)
+        logits = layer.router(x.to(router_dtype)).to(x.dtype)
+        if language_ids is not None and _needs_language_prior_cache(layer):
+            _cache_expert_prior(layer, logits, language_ids, expert_targets)
+        logits = layer._apply_language_bias_experts(logits, expert_targets)
+
+        topv, topi = torch.topk(logits, 1, dim=-1)
+        weights = torch.softmax(topv.to(torch.float32), dim=-1).to(x.dtype)
+        topi, weights = layer._enforce_language_experts(topi, weights, expert_targets)
 
     if layer._should_debug_routing():
         layer._debug_routing_sample(x, language_ids, expert_targets, topi, weights)
