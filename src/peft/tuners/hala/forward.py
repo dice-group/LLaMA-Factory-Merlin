@@ -240,9 +240,13 @@ def _head_weights_for_selected_tokens(
     language_ids_sel = language_ids[batch_idx] if language_ids is not None and torch.is_tensor(language_ids) else None
     head_targets = None
     if language_ids_sel is not None:
-        head_targets = _require_targets(layer._language_head_targets(language_ids_sel, name), "head")
+        head_targets = layer._language_head_targets(language_ids_sel, name)
+        if head_targets is None or not torch.is_tensor(head_targets) or head_targets.numel() == 0:
+            raise ValueError("HALA could not resolve head targets from language_ids.")
         expert_targets_sel = _require_targets(expert_targets, "expert")[batch_idx]
         mismatch = expert_targets_sel != int(expert_id)
+        if ((head_targets < 0) & ~mismatch).any():
+            raise ValueError("HALA could not map every language_id to a head target.")
         if mismatch.any():
             head_targets = head_targets.clone()
             head_targets[mismatch] = LANGUAGE_PAD_ID
@@ -296,9 +300,16 @@ def _packed_uniform_head_weights(
     if language_ids_flat is not None and layer.language_guidance_scope == "all":
         per_expert_targets = []
         for expert_id, name in enumerate(expert_names):
-            target = _require_targets(layer._language_head_targets(language_ids_flat, name), "head")
+            target = layer._language_head_targets(language_ids_flat, name)
+            if target is None or not torch.is_tensor(target) or target.numel() == 0:
+                raise ValueError("HALA could not resolve head targets from language_ids.")
             if expert_targets_flat is not None:
-                target = target.masked_fill(expert_targets_flat != int(expert_id), LANGUAGE_PAD_ID)
+                mismatch = expert_targets_flat != int(expert_id)
+                if ((target < 0) & ~mismatch).any():
+                    raise ValueError("HALA could not map every language_id to a head target.")
+                target = target.masked_fill(mismatch, LANGUAGE_PAD_ID)
+            elif (target < 0).any():
+                raise ValueError("HALA could not map every language_id to a head target.")
             per_expert_targets.append(target)
         head_targets = torch.stack(per_expert_targets, dim=1)
 
