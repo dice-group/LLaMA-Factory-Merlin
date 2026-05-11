@@ -619,6 +619,10 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HydraLoRA expert when MoE is enabled."},
     )
+    hydralora_layers_to_transform: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated decoder layer ids to apply HydraLoRA adapters to (use 'all' for every layer)."},
+    )
     hala_num_experts: int = field(
         default=1,
         metadata={"help": "Number of experts per HALA layer."},
@@ -637,6 +641,26 @@ class FinetuningArguments(
         metadata={
             "help": "Enable a shared LoRA residual branch in HALA before the routed expert residual."
         },
+    )
+    hala_gated_shared_capacity: bool = field(
+        default=False,
+        metadata={"help": "Enable the default-disabled HALA gated shared-capacity branch."},
+    )
+    hala_gated_shared_init_bias: float = field(
+        default=-4.0,
+        metadata={"help": "Initial bias for the HALA gated shared-capacity scalar gate."},
+    )
+    hala_balance_loss_coef: float = field(
+        default=0.0,
+        metadata={"help": "Weight for the HALA router load-balance auxiliary loss (0 disables)."},
+    )
+    hala_balance_loss_kind: Literal["none", "uniform_importance"] = field(
+        default="none",
+        metadata={"help": "HALA balance objective kind. 'none' disables; 'uniform_importance' balances mean expert probabilities."},
+    )
+    hala_balance_target: Literal["expert"] = field(
+        default="expert",
+        metadata={"help": "HALA balance target. The initial implementation supports expert router balance only."},
     )
     hala_expert_lora_nums: Optional[str] = field(
         default=None,
@@ -1224,8 +1248,16 @@ class FinetuningArguments(
         if self.finetuning_type == "hala":
             if self.hala_num_experts <= 0:
                 raise ValueError("`hala_num_experts` must be positive.")
-            if self.hala_top_k != 1:
-                raise ValueError("This HALA exploration branch only supports `hala_top_k=1`.")
+            if self.hala_gated_shared_capacity and self.hala_gated_shared_init_bias > 0:
+                raise ValueError("`hala_gated_shared_init_bias` should be non-positive for conservative gated starts.")
+            if self.hala_balance_loss_coef < 0:
+                raise ValueError("`hala_balance_loss_coef` must be non-negative.")
+            if self.hala_balance_loss_coef > 0 and self.hala_balance_loss_kind == "none":
+                raise ValueError("`hala_balance_loss_kind` must not be 'none' when `hala_balance_loss_coef > 0`.")
+            if self.hala_balance_loss_kind != "none" and self.hala_balance_target != "expert":
+                raise ValueError("The initial HALA balance objective only supports `hala_balance_target=expert`.")
+            if self.hala_top_k not in (1, 2):
+                raise ValueError("This HALA exploration branch supports expert `hala_top_k=1` or `hala_top_k=2`.")
             if self.hala_head_top_k not in (0, 1):
                 raise ValueError("This HALA exploration branch supports `hala_head_top_k=1` or `hala_head_top_k=0`.")
             if self.hala_execution_mode != "grouped_sparse_expert_dense_head":

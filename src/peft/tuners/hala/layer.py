@@ -29,17 +29,29 @@ class HalaLoraLayer(HydraLoraLayer):
     ) -> None:
         self.hala_execution_mode = hala_execution_mode
         self.hala_shared_residual = bool(kwargs.pop("hala_shared_residual", False))
+        self.hala_gated_shared_capacity = bool(kwargs.pop("hala_gated_shared_capacity", False))
+        self.hala_gated_shared_init_bias = float(kwargs.pop("hala_gated_shared_init_bias", -4.0))
+        self.hala_gated_shared_adapter_name = "hala_gated_shared"
+        self.hala_balance_loss_coef = float(kwargs.pop("hala_balance_loss_coef", 0.0) or 0.0)
+        self.hala_balance_loss_kind = kwargs.pop("hala_balance_loss_kind", "none")
+        self.hala_balance_target = kwargs.pop("hala_balance_target", "expert")
         self.hala_shared_adapter_name = "hala_shared"
         super().__init__(base_layer, ephemeral_gpu_offload=ephemeral_gpu_offload, **kwargs)
         if self.hala_execution_mode not in self._VALID_EXECUTION_MODES:
             raise ValueError(f"Unsupported hala_execution_mode={self.hala_execution_mode!r}.")
         if not getattr(self, "use_hydralora_experts", False):
             raise ValueError("HALA exploration branch requires expert routing.")
-        if int(getattr(self, "top_k", 0) or 0) != 1:
-            raise ValueError("HALA exploration branch requires sparse expert top_k=1.")
+        if int(getattr(self, "top_k", 0) or 0) not in (1, 2):
+            raise ValueError("HALA exploration branch requires sparse expert top_k=1 or top_k=2.")
         head_top_k = getattr(self, "head_top_k", 1)
         if head_top_k is not None and int(head_top_k) not in (0, 1):
             raise ValueError("HALA exploration branch requires head_top_k=1 for sparse heads or 0 for dense heads.")
+        if self.hala_balance_loss_coef < 0:
+            raise ValueError("HALA balance loss coefficient must be non-negative.")
+        if self.hala_balance_loss_coef > 0 and self.hala_balance_loss_kind == "none":
+            raise ValueError("HALA balance loss kind must not be 'none' when coefficient is positive.")
+        if self.hala_balance_loss_kind != "none" and self.hala_balance_target != "expert":
+            raise ValueError("HALA balance objective currently supports expert target only.")
         if getattr(self, "language_guidance_scope", None) not in {"all", "expert_only"}:
             raise ValueError("HALA requires language_guidance_scope='all' or 'expert_only'.")
         if (
@@ -85,10 +97,38 @@ class HalaLoraLayer(HydraLoraLayer):
             lora_num=lora_num,
             init_lora_weights=init_lora_weights,
         )
-        if not self.hala_shared_residual:
-            return
+        if self.hala_shared_residual:
+            self._add_shared_capacity_branch(
+                adapter_name=adapter_name,
+                name=self.hala_shared_adapter_name,
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                init_lora_weights=init_lora_weights,
+                gated=False,
+            )
+        if self.hala_gated_shared_capacity:
+            self._add_shared_capacity_branch(
+                adapter_name=adapter_name,
+                name=self.hala_gated_shared_adapter_name,
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                init_lora_weights=init_lora_weights,
+                gated=True,
+            )
 
-        name = self.hala_shared_adapter_name
+    def _add_shared_capacity_branch(
+        self,
+        *,
+        adapter_name: str,
+        name: str,
+        r: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        init_lora_weights: Union[bool, str],
+        gated: bool,
+    ) -> None:
         if name in self.lora_A:
             return
 
@@ -99,6 +139,8 @@ class HalaLoraLayer(HydraLoraLayer):
         self.lora_dropout[name] = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
         self.lora_A[name] = nn.Linear(self.in_features, r, bias=False)
         self.lora_B[name] = nn.ModuleList([nn.Linear(r, self.out_features, bias=False)])
+        if gated:
+            self.lora_route[name] = nn.Linear(self.in_features, 1, bias=True)
 
         if init_lora_weights is True:
             nn.init.kaiming_uniform_(self.lora_A[name].weight, a=math.sqrt(5))
@@ -107,6 +149,9 @@ class HalaLoraLayer(HydraLoraLayer):
         elif init_lora_weights is not False:
             raise ValueError(f"Unknown initialization init_lora_weights={init_lora_weights!r}")
         nn.init.zeros_(self.lora_B[name][0].weight)
+        if gated:
+            nn.init.zeros_(self.lora_route[name].weight)
+            nn.init.constant_(self.lora_route[name].bias, self.hala_gated_shared_init_bias)
 
         self._move_adapter_to_device_of_base_layer(name)
         children = self._hydra_parent_children.setdefault(adapter_name, [])
@@ -198,6 +243,13 @@ class Linear(nn.Module, HalaLoraLayer):
         if logits is not None and targets is not None:
             caches.append(("hala_expert", logits, targets))
         self._cache_pop("hydra_expert_router_language_ids")
+        return caches
+
+    def pop_hala_balance_router_cache(self) -> list[tuple[str, torch.Tensor]]:
+        caches: list[tuple[str, torch.Tensor]] = []
+        logits = self._cache_pop("hala_balance_expert_router_logits")
+        if logits is not None:
+            caches.append(("hala_expert", logits))
         return caches
 
     def __repr__(self) -> str:

@@ -128,10 +128,27 @@ def get_peft_model_state_dict(
         else:
             raise NotImplementedError
         if include_expert_keys:
+            include_hala_shared_residual = (
+                config.peft_type == PeftType.HALA and getattr(config, "hala_shared_residual", False)
+            )
+            include_hala_gated_shared = (
+                config.peft_type == PeftType.HALA and getattr(config, "hala_gated_shared_capacity", False)
+            )
             to_return = {
                 k: v
                 for k, v in to_return.items()
-                if (("lora_" in k and (adapter_name in k or ".expert_" in k)) or ("bias" in k))
+                if (
+                    (
+                        "lora_" in k
+                        and (
+                            adapter_name in k
+                            or ".expert_" in k
+                            or (include_hala_shared_residual and ".hala_shared." in k)
+                            or (include_hala_gated_shared and ".hala_gated_shared." in k)
+                        )
+                    )
+                    or ("bias" in k)
+                )
             }
         else:
             to_return = {

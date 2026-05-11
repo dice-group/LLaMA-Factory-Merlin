@@ -594,6 +594,14 @@ def _setup_cola_tuning(
             "cola_strategy": finetuning_args.cola_strategy,
             "modules_to_save": finetuning_args.additional_target,
         }
+        hydralora_layers_to_transform = getattr(finetuning_args, "hydralora_layers_to_transform", None)
+        if hydralora_layers_to_transform is None:
+            hydralora_layers_to_transform = finetuning_args.lora_layers_to_transform
+        if hydralora_layers_to_transform is not None:
+            if str(hydralora_layers_to_transform).lower() != "all":
+                peft_kwargs["layers_to_transform"] = [
+                    int(layer_id) for layer_id in str(hydralora_layers_to_transform).split(",") if layer_id.strip()
+                ]
         language_map = load_language_map(finetuning_args.language_map)
         language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
@@ -1118,6 +1126,11 @@ def _setup_hala_tuning(
             "hydralora_debug": finetuning_args.hala_debug,
             "hala_execution_mode": finetuning_args.hala_execution_mode,
             "hala_shared_residual": finetuning_args.hala_shared_residual,
+            "hala_gated_shared_capacity": finetuning_args.hala_gated_shared_capacity,
+            "hala_gated_shared_init_bias": finetuning_args.hala_gated_shared_init_bias,
+            "hala_balance_loss_coef": finetuning_args.hala_balance_loss_coef,
+            "hala_balance_loss_kind": finetuning_args.hala_balance_loss_kind,
+            "hala_balance_target": finetuning_args.hala_balance_target,
             "modules_to_save": modules_to_save,
             "trainable_token_indices": trainable_token_indices,
         }
@@ -1180,9 +1193,10 @@ def _setup_hala_tuning(
                 count = int(sample_layer.lora_num.get(key, 0) or 0)
             actual_heads.append(count)
         logger.info_rank0(
-            "[HALA SETUP] mode=%s shared_residual=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
+            "[HALA SETUP] mode=%s shared_residual=%s gated_shared_capacity=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
             finetuning_args.hala_execution_mode,
             finetuning_args.hala_shared_residual,
+            finetuning_args.hala_gated_shared_capacity,
             actual_experts,
             actual_heads,
             finetuning_args.hala_layers_to_transform or "all",

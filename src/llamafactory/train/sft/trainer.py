@@ -112,6 +112,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return bool(value)
         return bool(
             (getattr(self.finetuning_args, "language_prior_weight", 0.0) or 0.0) > 0
+            or (getattr(self.finetuning_args, "hala_balance_loss_coef", 0.0) or 0.0) > 0
             or getattr(self.finetuning_args, "language_router_mode", None) == "hard"
         )
 
@@ -158,6 +159,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         language_loss = self._compute_language_prior_loss()
         if language_loss is not None:
             extra_losses.append(language_loss)
+
+        hala_balance_loss = self._compute_hala_balance_loss()
+        if hala_balance_loss is not None:
+            extra_losses.append(hala_balance_loss)
 
         adamole_loss = self._compute_adamole_aux_loss(model)
         if adamole_loss is not None:
@@ -214,8 +219,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         loss = super().training_step(model, inputs, *args, **kwargs)
         # Gradient checkpointing recomputes routed layers during backward and can
-        # repopulate LPR caches after compute_loss has consumed them.
+        # repopulate routed auxiliary caches after compute_loss has consumed them.
         self._flush_language_router_cache()
+        self._flush_hala_balance_router_cache()
 
         if not self._router_metrics_enabled():
             return loss
@@ -541,6 +547,56 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.log({"moelpr_aux_loss": float(aux.detach().mean().cpu())})
         return aux
 
+    def _compute_hala_balance_loss(self) -> Optional[torch.Tensor]:
+        if self.finetuning_args.finetuning_type != "hala":
+            self._flush_hala_balance_router_cache()
+            return None
+
+        coef = float(getattr(self.finetuning_args, "hala_balance_loss_coef", 0.0) or 0.0)
+        kind = getattr(self.finetuning_args, "hala_balance_loss_kind", "none")
+        target = getattr(self.finetuning_args, "hala_balance_target", "expert")
+        if coef <= 0 or kind == "none":
+            self._flush_hala_balance_router_cache()
+            return None
+        if kind != "uniform_importance" or target != "expert":
+            raise ValueError("Unsupported HALA balance objective; use uniform_importance/expert.")
+
+        states = self._flush_hala_balance_router_cache()
+        if not states:
+            return None
+
+        raw_losses = []
+        token_count = 0
+        for _name, logits in states:
+            if logits is None or logits.numel() == 0:
+                continue
+            if logits.dim() > 2:
+                logits = logits.mean(dim=1)
+            probs = torch.softmax(logits.to(torch.float32), dim=-1)
+            if probs.size(-1) <= 0:
+                continue
+            importance = probs.mean(dim=0)
+            target_importance = torch.full_like(importance, 1.0 / float(probs.size(-1)))
+            raw_losses.append(F.mse_loss(importance, target_importance, reduction="mean") * float(probs.size(-1)))
+            token_count += int(probs.size(0))
+
+        if not raw_losses:
+            return None
+
+        raw = torch.stack(raw_losses).mean()
+        aux = coef * raw
+        if self._router_metrics_enabled():
+            record_hala_metrics(
+                {
+                    "hala_balance_loss_raw": float(raw.detach().mean().cpu()),
+                    "hala_balance_loss": float(aux.detach().mean().cpu()),
+                    "hala_balance_router_state_count": float(len(raw_losses)),
+                    "hala_balance_token_count": float(token_count),
+                },
+                weight=1.0,
+            )
+        return aux
+
     def _compute_hmora_aux_loss(
         self, model: "torch.nn.Module", base_loss: "torch.Tensor"
     ) -> Optional[torch.Tensor]:
@@ -760,6 +816,23 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self._language_routed_modules = modules
         for module in modules:
             pop_fn = getattr(module, "pop_language_router_cache", None)
+            if callable(pop_fn):
+                caches.extend(pop_fn())
+        return caches
+
+    def _flush_hala_balance_router_cache(self) -> list[tuple[str, torch.Tensor]]:
+        caches: list[tuple[str, torch.Tensor]] = []
+        modules = getattr(self, "_language_routed_modules", None)
+        if modules is None:
+            module = getattr(self.model, "module", self.model)
+            modules = [
+                submodule
+                for submodule in module.modules()
+                if hasattr(submodule, "language_guidance_scope") and hasattr(submodule, "base_layer")
+            ]
+            self._language_routed_modules = modules
+        for module in modules:
+            pop_fn = getattr(module, "pop_hala_balance_router_cache", None)
             if callable(pop_fn):
                 caches.extend(pop_fn())
         return caches

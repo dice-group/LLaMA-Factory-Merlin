@@ -57,9 +57,22 @@ def _needs_language_prior_cache(layer) -> bool:
     return float(getattr(layer, "language_prior_weight", 0.0) or 0.0) > 0.0
 
 
+def _needs_balance_cache(layer) -> bool:
+    return (
+        float(getattr(layer, "hala_balance_loss_coef", 0.0) or 0.0) > 0.0
+        and getattr(layer, "hala_balance_loss_kind", "none") != "none"
+        and getattr(layer, "hala_balance_target", "expert") == "expert"
+    )
+
+
 def _cache_expert_prior(layer, logits: torch.Tensor, language_ids: torch.Tensor, expert_targets: torch.Tensor) -> None:
     logits_for_loss = logits.mean(dim=1) if logits.dim() > 2 else logits
     layer._cache_router_state(logits_for_loss, language_ids, "hydra_expert", expert_targets)
+
+
+def _cache_expert_balance(layer, logits: torch.Tensor) -> None:
+    logits_for_loss = logits.mean(dim=1) if logits.dim() > 2 else logits
+    layer._cache_store("hala_balance_expert_router_logits", logits_for_loss)
 
 
 def _cache_head_prior_for_selected_expert(
@@ -276,6 +289,9 @@ def _packed_uniform_head_weights(
     language_ids: Optional[torch.Tensor],
     expert_targets: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, bool]:
+    if topi_flat.dim() != 1 or weights_flat.dim() != 1:
+        return torch.empty(0, device=x_flat.device), False
+
     head_count = len(layer.lora_B[expert_names[0]])
     if any(len(layer.lora_B[name]) != head_count for name in expert_names):
         return torch.empty(0, device=x_flat.device), False
@@ -369,8 +385,8 @@ def _packed_uniform_head_weights(
 
 
 def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
-    if layer.top_k != 1:
-        raise ValueError("HALA exploration branch only supports sparse expert top_k=1.")
+    if int(layer.top_k) not in (1, 2):
+        raise ValueError("HALA exploration branch supports sparse expert top_k=1 or top_k=2.")
     if layer.head_top_k is not None and int(layer.head_top_k) not in (0, 1):
         raise ValueError("HALA exploration branch supports head_top_k=1 for sparse heads or 0 for dense heads.")
     if x.dim() != 3:
@@ -388,6 +404,26 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         shared_out = shared_b(shared_a(shared_x)) * float(layer.scaling[shared_name])
         result = result + shared_out.to(result_dtype)
 
+    gated_name = getattr(layer, "hala_gated_shared_adapter_name", None)
+    if getattr(layer, "hala_gated_shared_capacity", False) and gated_name in layer.lora_A:
+        gated_a = layer.lora_A[gated_name]
+        gated_b = layer.lora_B[gated_name][0]
+        gated_x = layer.lora_dropout[gated_name](x.to(gated_a.weight.dtype))
+        shared_delta = gated_b(gated_a(gated_x)) * float(layer.scaling[gated_name])
+        gate_layer = layer.lora_route[gated_name]
+        gate = torch.sigmoid(gate_layer(x.to(gate_layer.weight.dtype))).to(shared_delta.dtype)
+        result = result + (shared_delta * gate).to(result_dtype)
+        if getattr(layer, "track_router_metrics", False):
+            with torch.no_grad():
+                record_hala_metrics(
+                    {
+                        "gated_shared_gate_mean": float(gate.to(torch.float32).mean().item()),
+                        "gated_shared_gate_max": float(gate.to(torch.float32).max().item()),
+                        "gated_shared_delta_norm_mean": float(shared_delta.to(torch.float32).norm(dim=-1).mean().item()),
+                    },
+                    weight=float(gate.numel()),
+                )
+
     if layer.training or language_ids is not None or torch.is_tensor(language_ids):
         language_ids = _require_language_ids(language_ids, x.size(0))
 
@@ -400,14 +436,18 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         logits, topi, weights = hard_routing
         if _needs_language_prior_cache(layer) and language_ids is not None and expert_targets is not None:
             _cache_expert_prior(layer, logits, language_ids, expert_targets)
+        if _needs_balance_cache(layer):
+            _cache_expert_balance(layer, logits)
     else:
         router_dtype = getattr(layer.router.weight, "dtype", torch.float32)
         logits = layer.router(x.to(router_dtype)).to(x.dtype)
         if language_ids is not None and _needs_language_prior_cache(layer):
             _cache_expert_prior(layer, logits, language_ids, expert_targets)
+        if _needs_balance_cache(layer):
+            _cache_expert_balance(layer, logits)
         logits = layer._apply_language_bias_experts(logits, expert_targets)
 
-        topv, topi = torch.topk(logits, 1, dim=-1)
+        topv, topi = torch.topk(logits, int(layer.top_k), dim=-1)
         weights = torch.softmax(topv.to(torch.float32), dim=-1).to(x.dtype)
         topi, weights = layer._enforce_language_experts(topi, weights, expert_targets)
 
@@ -427,8 +467,8 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
 
     batch, seq_len, _ = x.size()
     x_flat = x.reshape(-1, x.size(-1))
-    topi_flat = topi.reshape(-1)
-    weights_flat = weights.reshape(-1)
+    topi_flat = topi.reshape(-1, topi.size(-1))
+    weights_flat = weights.reshape(-1, weights.size(-1))
     expert_names = [f"expert_{idx}" for idx in range(layer.num_experts)]
     active_experts = [name for name in expert_names if name in layer.lora_A]
     dense_param_graph = False
@@ -443,8 +483,8 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         route_mask, dense_param_graph = _packed_uniform_head_weights(
             layer,
             x_flat,
-            topi_flat,
-            weights_flat,
+            topi_flat.squeeze(-1) if topi_flat.size(-1) == 1 else topi_flat,
+            weights_flat.squeeze(-1) if weights_flat.size(-1) == 1 else weights_flat,
             seq_len,
             expert_names,
             language_ids,
@@ -457,9 +497,14 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                 dtype=a_all.dtype,
             )
             for expert_id, name in enumerate(expert_names):
-                token_idx = torch.where(topi_flat == expert_id)[0]
+                token_idx, kth = torch.where(topi_flat == expert_id)
                 if token_idx.numel() == 0:
                     continue
+                nonzero = weights_flat[token_idx, kth] != 0
+                if not bool(nonzero.any().item()):
+                    continue
+                token_idx = token_idx[nonzero]
+                kth = kth[nonzero]
                 route_weight = _head_weights_for_selected_tokens(
                     layer,
                     x_flat[token_idx],
@@ -470,7 +515,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     language_ids,
                     expert_targets,
                 )
-                scale = float(layer.scaling[name]) * weights_flat[token_idx].to(a_all.dtype)
+                scale = float(layer.scaling[name]) * weights_flat[token_idx, kth].to(a_all.dtype)
                 route_mask[token_idx, expert_id, : route_weight.size(-1)] = route_weight.to(a_all.dtype) * scale.unsqueeze(-1)
 
         b_columns = []
