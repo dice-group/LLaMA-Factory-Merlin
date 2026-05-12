@@ -52,6 +52,58 @@ class _ScalarAccumulator:
 
 
 @dataclass
+class _RoutingLoadAccumulator:
+    counts: Counter = field(default_factory=Counter)
+    total: float = 0.0
+    num_routes: int = 0
+
+    def update(self, selected: torch.Tensor, num_routes: int) -> None:
+        if selected is None or selected.numel() == 0 or num_routes <= 0:
+            return
+
+        flat = selected.detach().to(torch.long).reshape(-1).cpu()
+        valid = (flat >= 0) & (flat < int(num_routes))
+        if not bool(valid.any().item()):
+            return
+
+        self.num_routes = max(self.num_routes, int(num_routes))
+        route_counts = torch.bincount(flat[valid], minlength=int(num_routes)).to(torch.float32)
+        for idx, count in enumerate(route_counts.tolist()):
+            if count <= 0:
+                continue
+            self.counts[int(idx)] += float(count)
+            self.total += float(count)
+
+    def pop(self, *, namespace: str, prefix: str) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        if self.num_routes <= 0 or self.total <= 0:
+            self.reset()
+            return metrics
+
+        values = [float(self.counts.get(idx, 0.0)) for idx in range(self.num_routes)]
+        mean = self.total / float(self.num_routes)
+        variance = sum((value - mean) ** 2 for value in values) / float(self.num_routes)
+        cv = math.sqrt(variance) / (mean + 1e-6)
+        fractions = [value / self.total for value in values]
+
+        key = f"{namespace}/{prefix}_global"
+        metrics[f"{key}_load_cv"] = cv
+        metrics[f"{key}_active_frac"] = sum(1 for value in values if value > 0.0) / float(self.num_routes)
+        metrics[f"{key}_load_max_frac"] = max(fractions)
+        metrics[f"{key}_load_min_frac"] = min(fractions)
+        for idx, frac in enumerate(fractions):
+            metrics[f"{key}_load_frac_{idx}"] = frac
+
+        self.reset()
+        return metrics
+
+    def reset(self) -> None:
+        self.counts = Counter()
+        self.total = 0.0
+        self.num_routes = 0
+
+
+@dataclass
 class _MoelprRoutingAccumulator:
     expert_language: Dict[int, Counter] = field(default_factory=lambda: defaultdict(Counter))
     expert_totals: Counter = field(default_factory=Counter)
@@ -168,6 +220,8 @@ class _MoelprRoutingAccumulator:
 
 _SCALAR_STORE = _ScalarAccumulator()
 _MOELPR_ROUTING = _MoelprRoutingAccumulator()
+_HALA_EXPERT_LOAD = _RoutingLoadAccumulator()
+_HALA_HEAD_LOAD = _RoutingLoadAccumulator()
 
 
 def record_mola_metrics(metrics: Dict[str, float], weight: float) -> None:
@@ -192,6 +246,14 @@ def record_hydralora_metrics(metrics: Dict[str, float], weight: float) -> None:
 
 def record_hala_metrics(metrics: Dict[str, float], weight: float) -> None:
     _SCALAR_STORE.update("hala", metrics, weight)
+
+
+def record_hala_expert_load(selected_experts: torch.Tensor, num_experts: int) -> None:
+    _HALA_EXPERT_LOAD.update(selected_experts, num_experts)
+
+
+def record_hala_head_load(selected_heads: torch.Tensor, num_heads: int) -> None:
+    _HALA_HEAD_LOAD.update(selected_heads, num_heads)
 
 
 def record_soft_moe_metrics(metrics: Dict[str, float], weight: float) -> None:
@@ -264,9 +326,13 @@ def pop_tracked_metrics() -> Dict[str, float]:
     metrics = _SCALAR_STORE.pop()
     routing_metrics = _MOELPR_ROUTING.pop()
     metrics.update(routing_metrics)
+    metrics.update(_HALA_EXPERT_LOAD.pop(namespace="hala", prefix="expert"))
+    metrics.update(_HALA_HEAD_LOAD.pop(namespace="hala", prefix="head"))
     return metrics
 
 
 def clear_tracked_metrics() -> None:
     _SCALAR_STORE.pop()
     _MOELPR_ROUTING.pop()
+    _HALA_EXPERT_LOAD.reset()
+    _HALA_HEAD_LOAD.reset()

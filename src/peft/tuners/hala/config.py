@@ -47,7 +47,7 @@ class HalaConfig(HydraLoraConfig):
         default=0.0,
         metadata={"help": "Weight for the HALA expert-router balance auxiliary loss (0 disables)."},
     )
-    hala_balance_loss_kind: Literal["none", "uniform_importance"] = field(
+    hala_balance_loss_kind: Literal["none", "uniform_importance", "target_distribution_importance"] = field(
         default="none",
         metadata={"help": "HALA balance objective kind."},
     )

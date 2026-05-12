@@ -140,6 +140,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def compute_loss(
         self, model: "torch.nn.Module", inputs: Dict[str, "torch.Tensor"], return_outputs: bool = False, **kwargs
     ) -> Union["torch.Tensor", Tuple["torch.Tensor", Any]]:
+        language_loss_weight = inputs.pop("language_loss_weight", None)
         self._inject_language_router_inputs(model, inputs)
         self._inject_hmora_task_inputs(model, inputs)
 
@@ -152,7 +153,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             if mask is not None:
                 inputs["lang_mask"] = mask
 
-        base = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        if getattr(self.finetuning_args, "use_language_loss_weights", False):
+            base = self._compute_weighted_supervised_loss(
+                model,
+                inputs,
+                language_loss_weight=language_loss_weight,
+                return_outputs=return_outputs,
+                **kwargs,
+            )
+        else:
+            base = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
         base_loss = base[0] if return_outputs else base
         extra_losses = []
 
@@ -198,6 +208,48 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return loss, outputs
 
         return base + added
+
+    def _compute_weighted_supervised_loss(
+        self,
+        model: "torch.nn.Module",
+        inputs: Dict[str, "torch.Tensor"],
+        language_loss_weight: Optional["torch.Tensor"],
+        return_outputs: bool = False,
+        **kwargs,
+    ) -> Union["torch.Tensor", Tuple["torch.Tensor", Any]]:
+        labels = inputs.get("labels")
+        if labels is None:
+            raise ValueError("`use_language_loss_weights` requires `labels` in the training batch.")
+        if language_loss_weight is None:
+            raise ValueError("`use_language_loss_weights` requires `language_loss_weight` in the training batch.")
+        if labels.dim() != 2:
+            raise ValueError("`use_language_loss_weights` currently expects 2D supervised-token labels.")
+
+        outputs = model(**inputs)
+        logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+        labels = labels.to(device=logits.device)
+        if logits.size(1) != labels.size(1):
+            raise ValueError("`logits` and `labels` must have matching sequence length for weighted SFT loss.")
+
+        weights = language_loss_weight.to(device=labels.device, dtype=logits.dtype).view(-1)
+        if weights.numel() != labels.size(0):
+            raise ValueError("`language_loss_weight` must contain one scalar per batch row.")
+        if torch.any(weights < 0):
+            raise ValueError("`language_loss_weight` values must be non-negative.")
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        token_losses = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=IGNORE_INDEX,
+            reduction="none",
+        ).view_as(shift_labels)
+        token_mask = shift_labels.ne(IGNORE_INDEX).to(dtype=logits.dtype)
+        row_weights = weights.view(-1, 1)
+        normalizer = (token_mask * row_weights).sum().clamp_min(torch.finfo(logits.dtype).eps)
+        loss = (token_losses * token_mask * row_weights).sum() / normalizer
+        return (loss, outputs) if return_outputs else loss
 
     @override
     def training_step(
@@ -558,8 +610,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if coef <= 0 or kind == "none":
             self._flush_hala_balance_router_cache()
             return None
-        if kind != "uniform_importance" or target != "expert":
-            raise ValueError("Unsupported HALA balance objective; use uniform_importance/expert.")
+        if kind not in {"uniform_importance", "target_distribution_importance"} or target != "expert":
+            raise ValueError(
+                "Unsupported HALA balance objective; use uniform_importance/expert "
+                "or target_distribution_importance/expert."
+            )
 
         states = self._flush_hala_balance_router_cache()
         if not states:
@@ -567,7 +622,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         raw_losses = []
         token_count = 0
-        for _name, logits in states:
+        for state in states:
+            _name, logits, targets = (state[0], state[1], state[2] if len(state) > 2 else None)
             if logits is None or logits.numel() == 0:
                 continue
             if logits.dim() > 2:
@@ -576,7 +632,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             if probs.size(-1) <= 0:
                 continue
             importance = probs.mean(dim=0)
-            target_importance = torch.full_like(importance, 1.0 / float(probs.size(-1)))
+            if kind == "target_distribution_importance":
+                if targets is None or not torch.is_tensor(targets):
+                    continue
+                targets = targets.to(device=probs.device, dtype=torch.long).reshape(-1)
+                if targets.numel() != probs.size(0):
+                    continue
+                valid = (targets >= 0) & (targets < probs.size(-1))
+                if not valid.any():
+                    continue
+                counts = torch.bincount(targets[valid], minlength=probs.size(-1)).to(probs.dtype)
+                target_importance = counts / counts.sum().clamp_min(1.0)
+            else:
+                target_importance = torch.full_like(importance, 1.0 / float(probs.size(-1)))
             raw_losses.append(F.mse_loss(importance, target_importance, reduction="mean") * float(probs.size(-1)))
             token_count += int(probs.size(0))
 
@@ -820,8 +888,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 caches.extend(pop_fn())
         return caches
 
-    def _flush_hala_balance_router_cache(self) -> list[tuple[str, torch.Tensor]]:
-        caches: list[tuple[str, torch.Tensor]] = []
+    def _flush_hala_balance_router_cache(self) -> list[tuple]:
+        caches: list[tuple] = []
         modules = getattr(self, "_language_routed_modules", None)
         if modules is None:
             module = getattr(self.model, "module", self.model)

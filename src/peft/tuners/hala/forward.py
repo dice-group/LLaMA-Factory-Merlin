@@ -2,7 +2,7 @@ from typing import Any, Optional
 
 import torch
 
-from peft.metrics import record_hala_metrics
+from peft.metrics import record_hala_expert_load, record_hala_head_load, record_hala_metrics
 
 from ..utils.language_routing import LANGUAGE_PAD_ID
 
@@ -70,9 +70,11 @@ def _cache_expert_prior(layer, logits: torch.Tensor, language_ids: torch.Tensor,
     layer._cache_router_state(logits_for_loss, language_ids, "hydra_expert", expert_targets)
 
 
-def _cache_expert_balance(layer, logits: torch.Tensor) -> None:
+def _cache_expert_balance(layer, logits: torch.Tensor, expert_targets: Optional[torch.Tensor] = None) -> None:
     logits_for_loss = logits.mean(dim=1) if logits.dim() > 2 else logits
     layer._cache_store("hala_balance_expert_router_logits", logits_for_loss)
+    if expert_targets is not None and torch.is_tensor(expert_targets):
+        layer._cache_store("hala_balance_expert_router_targets", expert_targets)
 
 
 def _cache_head_prior_for_selected_expert(
@@ -144,6 +146,7 @@ def _record_expert_metrics(
             metrics["expert_load_max_frac"] = 0.0
             metrics["expert_load_min_frac"] = 0.0
 
+        record_hala_expert_load(flat_indices, layer.num_experts)
         metrics_weight = layer._append_target_metrics(
             metrics=metrics,
             metrics_weight=float(token_count),
@@ -215,6 +218,7 @@ def _record_head_metrics(
             metrics["head_load_max_frac"] = 0.0
             metrics["head_load_min_frac"] = 0.0
 
+        record_hala_head_load(head_assign, head_count)
         metrics_weight = layer._append_target_metrics(
             metrics=metrics,
             metrics_weight=float(token_count),
@@ -437,14 +441,14 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         if _needs_language_prior_cache(layer) and language_ids is not None and expert_targets is not None:
             _cache_expert_prior(layer, logits, language_ids, expert_targets)
         if _needs_balance_cache(layer):
-            _cache_expert_balance(layer, logits)
+            _cache_expert_balance(layer, logits, expert_targets)
     else:
         router_dtype = getattr(layer.router.weight, "dtype", torch.float32)
         logits = layer.router(x.to(router_dtype)).to(x.dtype)
         if language_ids is not None and _needs_language_prior_cache(layer):
             _cache_expert_prior(layer, logits, language_ids, expert_targets)
         if _needs_balance_cache(layer):
-            _cache_expert_balance(layer, logits)
+            _cache_expert_balance(layer, logits, expert_targets)
         logits = layer._apply_language_bias_experts(logits, expert_targets)
 
         topv, topi = torch.topk(logits, int(layer.top_k), dim=-1)

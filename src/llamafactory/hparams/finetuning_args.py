@@ -539,6 +539,15 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},
     )
+    use_language_loss_weights: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply per-example `language_loss_weight` values to supervised SFT tokens. "
+                "Default-disabled; requires the batch/data collator to provide language_loss_weight."
+            )
+        },
+    )
     early_stopping_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Number of steps to stop training if the `metric_for_best_model` does not improve."},
@@ -654,9 +663,14 @@ class FinetuningArguments(
         default=0.0,
         metadata={"help": "Weight for the HALA router load-balance auxiliary loss (0 disables)."},
     )
-    hala_balance_loss_kind: Literal["none", "uniform_importance"] = field(
+    hala_balance_loss_kind: Literal["none", "uniform_importance", "target_distribution_importance"] = field(
         default="none",
-        metadata={"help": "HALA balance objective kind. 'none' disables; 'uniform_importance' balances mean expert probabilities."},
+        metadata={
+            "help": (
+                "HALA balance objective kind. 'uniform_importance' balances mean expert probabilities against "
+                "a uniform prior; 'target_distribution_importance' matches the batch language-target distribution."
+            )
+        },
     )
     hala_balance_target: Literal["expert"] = field(
         default="expert",

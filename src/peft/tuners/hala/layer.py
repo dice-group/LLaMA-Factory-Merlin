@@ -245,11 +245,12 @@ class Linear(nn.Module, HalaLoraLayer):
         self._cache_pop("hydra_expert_router_language_ids")
         return caches
 
-    def pop_hala_balance_router_cache(self) -> list[tuple[str, torch.Tensor]]:
-        caches: list[tuple[str, torch.Tensor]] = []
+    def pop_hala_balance_router_cache(self) -> list[tuple[str, torch.Tensor, Optional[torch.Tensor]]]:
+        caches: list[tuple[str, torch.Tensor, Optional[torch.Tensor]]] = []
         logits = self._cache_pop("hala_balance_expert_router_logits")
+        targets = self._cache_pop("hala_balance_expert_router_targets")
         if logits is not None:
-            caches.append(("hala_expert", logits))
+            caches.append(("hala_expert", logits, targets))
         return caches
 
     def __repr__(self) -> str:
