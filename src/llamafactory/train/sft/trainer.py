@@ -225,7 +225,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if labels.dim() != 2:
             raise ValueError("`use_language_loss_weights` currently expects 2D supervised-token labels.")
 
-        outputs = model(**inputs)
+        model_inputs = {key: value for key, value in inputs.items() if key != "labels"}
+        forward_model = model
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is not None:
+            try:
+                forward_model = accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+            except Exception:
+                forward_model = model
+        outputs = forward_model(**model_inputs)
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         labels = labels.to(device=logits.device)
         if logits.size(1) != labels.size(1):
