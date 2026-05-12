@@ -69,8 +69,8 @@ class AdaMoeLayer(nn.Module):
         Forward propagation
         """
         flattened_inputs = inputs.view((-1, inputs.shape[-1]))
-        gate_logits = F.softmax(self.gate(flattened_inputs), dim=-1)
-        thresholds = torch.sigmoid(self.threshold_fn(flattened_inputs)) * self.max_threshold
+        gate_logits = F.softmax(self.gate(flattened_inputs), dim=-1).to(flattened_inputs.dtype)
+        thresholds = (torch.sigmoid(self.threshold_fn(flattened_inputs)) * self.max_threshold).to(flattened_inputs.dtype)
         adapted_gate_logits = gate_logits - thresholds
         selected_experts = torch.ge(adapted_gate_logits, 0).to(torch.float)
         weights = adapted_gate_logits * selected_experts
