@@ -696,28 +696,50 @@ class JitCheckpointCallback(TrainerCallback):
 
 
 class TimedCheckpointCallback(TrainerCallback):
-    r"""Save one wall-clock checkpoint without stopping training."""
+    r"""Save wall-clock checkpoints without stopping training."""
 
     def __init__(self) -> None:
         self._start_time: Optional[float] = None
+        self._schedule_seconds: list[int] = []
+        self._next_index = 0
         self._pending = False
-        self._saved = False
 
     @override
     def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         self._start_time = time.time()
+        schedule_raw = str(getattr(args, "timed_checkpoint_schedule_seconds", "") or "").strip()
+        schedule: list[int] = []
+        if schedule_raw:
+            for item in schedule_raw.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                try:
+                    seconds = int(float(item))
+                except ValueError:
+                    logger.warning_rank0("Ignoring invalid timed checkpoint schedule item: %s", item)
+                    continue
+                if seconds > 0:
+                    schedule.append(seconds)
+        else:
+            seconds = int(getattr(args, "timed_checkpoint_seconds", 0) or 0)
+            if seconds > 0:
+                schedule.append(seconds)
+        self._schedule_seconds = sorted(set(schedule))
+        self._next_index = 0
 
     @override
     def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
-        seconds = int(getattr(args, "timed_checkpoint_seconds", 0) or 0)
-        if seconds <= 0 or self._saved or self._pending or self._start_time is None:
+        if self._pending or self._start_time is None or self._next_index >= len(self._schedule_seconds):
             return
         elapsed = time.time() - self._start_time
+        seconds = self._schedule_seconds[self._next_index]
         if elapsed >= seconds:
             logger.warning_rank0(
-                "Timed checkpoint: requesting checkpoint save at step=%s after %.1fs.",
+                "Timed checkpoint: requesting checkpoint save at step=%s after %.1fs (target=%ss).",
                 state.global_step,
                 elapsed,
+                seconds,
             )
             self._pending = True
             control.should_save = True
@@ -730,10 +752,20 @@ class TimedCheckpointCallback(TrainerCallback):
         elapsed = time.time() - self._start_time
         max_steps = int(getattr(state, "max_steps", 0) or 0)
         if self._pending:
-            label = str(getattr(args, "timed_checkpoint_label", "compute_cut") or "compute_cut")
+            target_seconds = (
+                self._schedule_seconds[self._next_index]
+                if self._next_index < len(self._schedule_seconds)
+                else int(elapsed)
+            )
+            label_prefix = str(getattr(args, "timed_checkpoint_label", "compute_cut") or "compute_cut")
+            target_hours = target_seconds / 3600.0
+            if target_seconds >= 3600 and abs(target_hours - round(target_hours)) < 1e-6:
+                label = f"{label_prefix}_{int(round(target_hours)):03d}h"
+            else:
+                label = f"{label_prefix}_{target_seconds}s"
             checkpoint_kind = "compute"
             self._pending = False
-            self._saved = True
+            self._next_index += 1
         elif max_steps > 0:
             pct = int(round(100.0 * float(state.global_step) / float(max_steps)))
             label = f"token_cut_{pct:03d}"

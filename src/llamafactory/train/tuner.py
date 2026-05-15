@@ -60,7 +60,10 @@ def _training_function(config: dict[str, Any]) -> None:
     callbacks.append(LogCallback())
     if getattr(training_args, "enable_jit_checkpoint", False):
         callbacks.append(JitCheckpointCallback())
-    if int(getattr(training_args, "timed_checkpoint_seconds", 0) or 0) > 0:
+    if (
+        int(getattr(training_args, "timed_checkpoint_seconds", 0) or 0) > 0
+        or str(getattr(training_args, "timed_checkpoint_schedule_seconds", "") or "").strip()
+    ):
         callbacks.append(TimedCheckpointCallback())
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())

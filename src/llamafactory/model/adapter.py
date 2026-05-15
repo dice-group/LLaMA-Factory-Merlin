@@ -862,21 +862,11 @@ def _setup_hydralora_tuning(
     expected_heads: Optional[list[int]] = None
 
     if model_args.adapter_name_or_path is not None:
-        is_mergeable = True
-        if getattr(model, "quantization_method", None):
-            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
-            is_mergeable = False
-
-        if is_deepspeed_zero3_enabled():
-            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
-            is_mergeable = False
-
-        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
-            adapter_to_merge = model_args.adapter_name_or_path[:-1]
-            adapter_to_resume = model_args.adapter_name_or_path[-1]
-        else:
-            adapter_to_merge = model_args.adapter_name_or_path
-
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("HydraLoRA adapters are non-mergeable; only a single adapter_name_or_path is supported.")
+        if is_trainable and finetuning_args.create_new_adapter:
+            raise ValueError("HydraLoRA does not support create_new_adapter on top of an existing routed adapter.")
+        adapter_to_resume = model_args.adapter_name_or_path[-1]
         init_kwargs = {
             "subfolder": model_args.adapter_folder,
             "offload_folder": model_args.offload_folder,
@@ -884,16 +874,7 @@ def _setup_hydralora_tuning(
             "revision": model_args.model_revision,
             "token": model_args.hf_hub_token,
         }
-        for adapter in adapter_to_merge:
-            model: "LoraModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
-            model = model.merge_and_unload()
-
-        if len(adapter_to_merge) > 0:
-            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
-
-        if adapter_to_resume is not None:
-            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
-
+        model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
     if is_trainable and adapter_to_resume is None:
