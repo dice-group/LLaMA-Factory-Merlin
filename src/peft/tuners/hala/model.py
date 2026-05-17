@@ -47,6 +47,9 @@ class HalaModel(HydraLoraModel):
             getattr(lora_config, "hala_execution_mode", "grouped_sparse_expert_dense_head"),
         )
         kwargs["hala_shared_residual"] = bool(getattr(lora_config, "hala_shared_residual", False))
+        kwargs["hala_shared_expert_head_residual"] = bool(
+            getattr(lora_config, "hala_shared_expert_head_residual", False)
+        )
         kwargs["hala_gated_shared_capacity"] = bool(getattr(lora_config, "hala_gated_shared_capacity", False))
         kwargs["hala_gated_shared_init_bias"] = float(getattr(lora_config, "hala_gated_shared_init_bias", -4.0))
         kwargs["hala_balance_loss_coef"] = float(getattr(lora_config, "hala_balance_loss_coef", 0.0) or 0.0)

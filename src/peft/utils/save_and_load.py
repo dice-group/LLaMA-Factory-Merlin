@@ -131,6 +131,9 @@ def get_peft_model_state_dict(
             include_hala_shared_residual = (
                 config.peft_type == PeftType.HALA and getattr(config, "hala_shared_residual", False)
             )
+            include_hala_shared_expert_head = (
+                config.peft_type == PeftType.HALA and getattr(config, "hala_shared_expert_head_residual", False)
+            )
             include_hala_gated_shared = (
                 config.peft_type == PeftType.HALA and getattr(config, "hala_gated_shared_capacity", False)
             )
@@ -144,6 +147,7 @@ def get_peft_model_state_dict(
                             adapter_name in k
                             or ".expert_" in k
                             or (include_hala_shared_residual and ".hala_shared." in k)
+                            or (include_hala_shared_expert_head and ".lora_shared_expert_B." in k)
                             or (include_hala_gated_shared and ".hala_gated_shared." in k)
                         )
                     )

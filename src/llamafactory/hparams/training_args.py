@@ -103,6 +103,10 @@ class TrainingArguments(RayArguments, BaseTrainingArguments):
             )
         },
     )
+    save_safetensors: bool = field(
+        default=False,
+        metadata={"help": "Save trainer checkpoints with safetensors when supported."},
+    )
     timed_checkpoint_seconds: int = field(
         default=0,
         metadata={"help": "Save one non-stopping checkpoint after this many elapsed training seconds (0 disables)."},

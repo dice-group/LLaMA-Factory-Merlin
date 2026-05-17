@@ -14,7 +14,7 @@ def _zero_touch_trainable_params(layer, *, dtype: torch.dtype, device: torch.dev
     router = getattr(layer, "router", None)
     if router is not None:
         modules.append(router)
-    for name in ("lora_A", "lora_B", "lora_route"):
+    for name in ("lora_A", "lora_B", "lora_route", "lora_shared_expert_B"):
         store = getattr(layer, name, None)
         if store is None:
             continue
@@ -388,6 +388,41 @@ def _packed_uniform_head_weights(
     return route_probs * expert_gate.unsqueeze(-1) * scales.view(1, -1, 1), True
 
 
+def _shared_expert_head_out(
+    layer,
+    a_all: torch.Tensor,
+    topi_flat: torch.Tensor,
+    weights_flat: torch.Tensor,
+    expert_names: list[str],
+    *,
+    result_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    shared_store = getattr(layer, "lora_shared_expert_B", None)
+    if not getattr(layer, "hala_shared_expert_head_residual", False) or shared_store is None:
+        return torch.zeros((a_all.size(0), out_features), device=a_all.device, dtype=result_dtype)
+
+    shared_out = torch.zeros((a_all.size(0), out_features), device=a_all.device, dtype=result_dtype)
+    for expert_id, name in enumerate(expert_names):
+        if name not in shared_store:
+            continue
+        token_idx, kth = torch.where(topi_flat == expert_id)
+        if token_idx.numel() == 0:
+            continue
+        expert_weight = weights_flat[token_idx, kth]
+        nonzero = expert_weight != 0
+        if not bool(nonzero.any().item()):
+            continue
+        token_idx = token_idx[nonzero]
+        expert_weight = expert_weight[nonzero]
+        b_layer = shared_store[name]
+        delta = b_layer(a_all[token_idx, expert_id].to(b_layer.weight.dtype)).to(result_dtype)
+        scale = float(layer.scaling[name]) * expert_weight.to(result_dtype)
+        shared_out.index_add_(0, token_idx, delta * scale.unsqueeze(-1))
+
+    return shared_out
+
+
 def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
     if int(layer.top_k) not in (1, 2):
         raise ValueError("HALA exploration branch supports sparse expert top_k=1 or top_k=2.")
@@ -533,6 +568,15 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         b_weight = torch.cat(b_columns, dim=1)
         hidden = (a_all.unsqueeze(2) * route_mask.unsqueeze(-1)).reshape(x_flat.size(0), -1)
         moe_out_flat = torch.nn.functional.linear(hidden.to(b_weight.dtype), b_weight).to(result_dtype)
+        moe_out_flat = moe_out_flat + _shared_expert_head_out(
+            layer,
+            a_all,
+            topi_flat,
+            weights_flat,
+            expert_names,
+            result_dtype=result_dtype,
+            out_features=result.size(-1),
+        )
     else:
         moe_out_flat = torch.zeros((x_flat.size(0), result.size(-1)), device=result.device, dtype=result_dtype)
 

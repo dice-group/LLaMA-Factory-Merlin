@@ -651,6 +651,12 @@ class FinetuningArguments(
             "help": "Enable a shared LoRA residual branch in HALA before the routed expert residual."
         },
     )
+    hala_shared_expert_head_residual: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable one always-on shared B head per selected HALA expert, reusing that expert's A projection."
+        },
+    )
     hala_gated_shared_capacity: bool = field(
         default=False,
         metadata={"help": "Enable the default-disabled HALA gated shared-capacity branch."},

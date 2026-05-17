@@ -1107,6 +1107,7 @@ def _setup_hala_tuning(
             "hydralora_debug": finetuning_args.hala_debug,
             "hala_execution_mode": finetuning_args.hala_execution_mode,
             "hala_shared_residual": finetuning_args.hala_shared_residual,
+            "hala_shared_expert_head_residual": finetuning_args.hala_shared_expert_head_residual,
             "hala_gated_shared_capacity": finetuning_args.hala_gated_shared_capacity,
             "hala_gated_shared_init_bias": finetuning_args.hala_gated_shared_init_bias,
             "hala_balance_loss_coef": finetuning_args.hala_balance_loss_coef,
@@ -1174,9 +1175,10 @@ def _setup_hala_tuning(
                 count = int(sample_layer.lora_num.get(key, 0) or 0)
             actual_heads.append(count)
         logger.info_rank0(
-            "[HALA SETUP] mode=%s shared_residual=%s gated_shared_capacity=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
+            "[HALA SETUP] mode=%s shared_residual=%s shared_expert_head=%s gated_shared_capacity=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
             finetuning_args.hala_execution_mode,
             finetuning_args.hala_shared_residual,
+            finetuning_args.hala_shared_expert_head_residual,
             finetuning_args.hala_gated_shared_capacity,
             actual_experts,
             actual_heads,

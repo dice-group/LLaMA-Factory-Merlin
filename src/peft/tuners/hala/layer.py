@@ -19,6 +19,7 @@ from .forward import forward_expert as hala_forward_expert
 class HalaLoraLayer(HydraLoraLayer):
     _VALID_EXECUTION_MODES = {"grouped_sparse_expert_dense_head"}
     _missing_language_warning_emitted_global: set[str] = set()
+    adapter_layer_names = HydraLoraLayer.adapter_layer_names + ("lora_shared_expert_B",)
 
     def __init__(
         self,
@@ -29,6 +30,7 @@ class HalaLoraLayer(HydraLoraLayer):
     ) -> None:
         self.hala_execution_mode = hala_execution_mode
         self.hala_shared_residual = bool(kwargs.pop("hala_shared_residual", False))
+        self.hala_shared_expert_head_residual = bool(kwargs.pop("hala_shared_expert_head_residual", False))
         self.hala_gated_shared_capacity = bool(kwargs.pop("hala_gated_shared_capacity", False))
         self.hala_gated_shared_init_bias = float(kwargs.pop("hala_gated_shared_init_bias", -4.0))
         self.hala_gated_shared_adapter_name = "hala_gated_shared"
@@ -37,6 +39,7 @@ class HalaLoraLayer(HydraLoraLayer):
         self.hala_balance_target = kwargs.pop("hala_balance_target", "expert")
         self.hala_shared_adapter_name = "hala_shared"
         super().__init__(base_layer, ephemeral_gpu_offload=ephemeral_gpu_offload, **kwargs)
+        self.lora_shared_expert_B = nn.ModuleDict({})
         if self.hala_execution_mode not in self._VALID_EXECUTION_MODES:
             raise ValueError(f"Unsupported hala_execution_mode={self.hala_execution_mode!r}.")
         if not getattr(self, "use_hydralora_experts", False):
@@ -117,6 +120,8 @@ class HalaLoraLayer(HydraLoraLayer):
                 init_lora_weights=init_lora_weights,
                 gated=True,
             )
+        if self.hala_shared_expert_head_residual:
+            self._add_shared_expert_head_branch(adapter_name=adapter_name, r=r)
 
     def _add_shared_capacity_branch(
         self,
@@ -157,6 +162,31 @@ class HalaLoraLayer(HydraLoraLayer):
         children = self._hydra_parent_children.setdefault(adapter_name, [])
         if name not in children:
             children.append(name)
+        self.set_adapter(adapter_name)
+
+    def _add_shared_expert_head_branch(self, *, adapter_name: str, r: int) -> None:
+        base_layer = self.get_base_layer()
+        weight = getattr(base_layer, "weight", None)
+        device = weight.device if weight is not None else None
+        dtype = weight.dtype if weight is not None and weight.is_floating_point() else None
+
+        for expert_id in range(self.num_experts):
+            name = f"expert_{expert_id}"
+            if name in self.lora_shared_expert_B:
+                continue
+            self.lora_shared_expert_B[name] = nn.Linear(r, self.out_features, bias=False)
+            nn.init.zeros_(self.lora_shared_expert_B[name].weight)
+            if device is not None:
+                if dtype is not None:
+                    self.lora_shared_expert_B[name].to(device=device, dtype=dtype)
+                else:
+                    self.lora_shared_expert_B[name].to(device=device)
+
+        children = self._hydra_parent_children.setdefault(adapter_name, [])
+        for expert_id in range(self.num_experts):
+            name = f"expert_{expert_id}"
+            if name not in children:
+                children.append(name)
         self.set_adapter(adapter_name)
 
 

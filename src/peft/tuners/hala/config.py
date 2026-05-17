@@ -30,6 +30,15 @@ class HalaConfig(HydraLoraConfig):
             )
         },
     )
+    hala_shared_expert_head_residual: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Add one always-on shared B head per selected HALA expert, reusing that expert's A projection and "
+                "expert-router weight. The existing routed expert/head branch remains unchanged."
+            )
+        },
+    )
     hala_gated_shared_capacity: bool = field(
         default=False,
         metadata={
