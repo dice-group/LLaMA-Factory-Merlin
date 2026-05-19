@@ -117,7 +117,22 @@ class CustomTrainer(Trainer):
         for routed_module in routed_modules:
             setattr(routed_module, "language_ids", language_ids)
 
+    def _flush_unused_language_router_cache(self, model: "torch.nn.Module") -> None:
+        routed_modules = getattr(self, "_language_routed_modules", None)
+        if routed_modules is None:
+            return
+
+        for routed_module in routed_modules:
+            pop_fn = getattr(routed_module, "pop_language_router_cache", None)
+            if callable(pop_fn):
+                pop_fn()
+            balance_pop_fn = getattr(routed_module, "pop_hala_balance_router_cache", None)
+            if callable(balance_pop_fn):
+                balance_pop_fn()
+
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
         self._inject_language_router_inputs(model, inputs)
-        return super().compute_loss(model, inputs, *args, **kwargs)
+        loss = super().compute_loss(model, inputs, *args, **kwargs)
+        self._flush_unused_language_router_cache(model)
+        return loss
