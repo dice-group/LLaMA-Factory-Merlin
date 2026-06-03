@@ -17,6 +17,7 @@
 
 import json
 import os
+import contextlib
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -78,6 +79,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.model_accepts_loss_kwargs = False
 
         self.finetuning_args = finetuning_args
+        if (
+            getattr(self, "is_fsdp_enabled", False)
+            and getattr(self.args, "gradient_accumulation_steps", 1) > 1
+            and getattr(finetuning_args, "finetuning_type", None) in {"moelora", "hmora"}
+        ):
+            def _sync_each_batch_no_sync(_accelerator, model):
+                return contextlib.nullcontext()
+
+            self.accelerator.no_sync = MethodType(_sync_each_batch_no_sync, self.accelerator)
+            logger.info_rank0(
+                "Disabled FSDP no_sync during gradient accumulation for %s to avoid unsynced gradient memory spikes.",
+                finetuning_args.finetuning_type,
+            )
+
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs

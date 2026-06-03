@@ -125,6 +125,21 @@ class TrainingArguments(RayArguments, BaseTrainingArguments):
         metadata={"help": "Label written to checkpoint metadata for the timed non-stopping checkpoint."},
     )
 
+    jit_checkpoint_adapter_only: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When enable_jit_checkpoint is set for PEFT training, save only the adapter checkpoint on signal "
+                "instead of requesting a generic Trainer checkpoint."
+            )
+        },
+    )
+
+    skip_final_save: bool = field(
+        default=False,
+        metadata={"help": "Skip trainer.save_model() after training; intended for calibration probes."},
+    )
+
     overwrite_output_dir: bool = field(
         default=False,
         metadata={"help": "deprecated"},

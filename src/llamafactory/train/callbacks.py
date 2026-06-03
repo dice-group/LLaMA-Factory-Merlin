@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import transformers
 from peft import PeftModel
+from peft.utils.constants import SAFETENSORS_WEIGHTS_NAME as PEFT_SAFE_WEIGHTS_NAME
+from peft.utils.constants import WEIGHTS_NAME as PEFT_WEIGHTS_NAME
 from transformers import PreTrainedModel, ProcessorMixin, TrainerCallback
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, has_length
 from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
@@ -147,6 +149,64 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
     def set_accelerator(self, accelerator: Any) -> None:
         self.accelerator = accelerator
 
+    @staticmethod
+    def _strip_adapter_key(key: str) -> str:
+        if key.startswith("_fsdp_wrapped_module."):
+            key = key.removeprefix("_fsdp_wrapped_module.")
+        if key.startswith("model."):
+            key = key.removeprefix("model.")
+        return key.replace(".default", "")
+
+    @staticmethod
+    def _is_adapter_tensor_key(key: str) -> bool:
+        adapter_markers = (
+            "lora_",
+            ".lora_",
+            ".lora_A.",
+            ".lora_B.",
+            ".lora_task_embedding.",
+            ".lora_gate.",
+            ".lora_router_pool.",
+            ".lora_task_encoder.",
+        )
+        return any(key.startswith(marker) or marker in key for marker in adapter_markers)
+
+    def _save_adapter_state_direct(
+        self,
+        unwrapped: PeftModel,
+        adapter_dir: str,
+        adapter_state: dict[str, torch.Tensor],
+        *,
+        safe_serialization: bool,
+    ) -> None:
+        os.makedirs(adapter_dir, exist_ok=True)
+        raw_key_count = len(adapter_state or {})
+        adapter_state = {
+            stripped_key: tensor.detach().cpu().contiguous()
+            for key, tensor in adapter_state.items()
+            for stripped_key in (self._strip_adapter_key(key),)
+            if torch.is_tensor(tensor)
+            and self._is_adapter_tensor_key(key)
+            and self._is_adapter_tensor_key(stripped_key)
+        }
+        if not adapter_state:
+            raise RuntimeError("adapter state is empty after tensor filtering")
+        logger.info_rank0(
+            "Adapter direct save filtered tensors: raw_keys=%s kept_keys=%s dropped_keys=%s",
+            raw_key_count,
+            len(adapter_state),
+            raw_key_count - len(adapter_state),
+        )
+
+        unwrapped.peft_config["default"].save_pretrained(adapter_dir)
+        if is_safetensors_available():
+            save_file(adapter_state, os.path.join(adapter_dir, PEFT_SAFE_WEIGHTS_NAME), metadata={"format": "pt"})
+        else:
+            torch.save(adapter_state, os.path.join(adapter_dir, PEFT_WEIGHTS_NAME))
+
+        with open(os.path.join(adapter_dir, ".adapter_direct_save_complete"), "w", encoding="utf-8") as marker:
+            marker.write("ok\n")
+
     def _save_adapter(self, model: torch.nn.Module, output_dir: str, safe_serialization: bool) -> None:
         unwrapped = getattr(model, "module", model)
         if not isinstance(unwrapped, PeftModel):
@@ -167,18 +227,22 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                 try:
                     import inspect
                     from accelerate.utils.fsdp_utils import save_fsdp_model
-                    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+                    from torch.distributed.fsdp import FullOptimStateDictConfig, FullStateDictConfig, StateDictType
 
                     if "adapter_only" in inspect.signature(save_fsdp_model).parameters:
                         os.makedirs(adapter_dir, exist_ok=True)
                         orig_state_dict_type = fsdp_plugin.state_dict_type
                         orig_state_dict_config = fsdp_plugin.state_dict_config
+                        orig_optim_state_dict_config = fsdp_plugin.optim_state_dict_config
                         orig_offload = getattr(fsdp_plugin.state_dict_config, "offload_to_cpu", None)
                         orig_rank0 = getattr(fsdp_plugin.state_dict_config, "rank0_only", None)
                         try:
                             fsdp_plugin.state_dict_type = StateDictType.FULL_STATE_DICT
                             is_multi = self.accelerator.num_processes > 1
                             fsdp_plugin.state_dict_config = FullStateDictConfig(
+                                offload_to_cpu=is_multi, rank0_only=is_multi
+                            )
+                            fsdp_plugin.optim_state_dict_config = FullOptimStateDictConfig(
                                 offload_to_cpu=is_multi, rank0_only=is_multi
                             )
                             save_start = time.monotonic()
@@ -193,6 +257,7 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                         finally:
                             fsdp_plugin.state_dict_type = orig_state_dict_type
                             fsdp_plugin.state_dict_config = orig_state_dict_config
+                            fsdp_plugin.optim_state_dict_config = orig_optim_state_dict_config
                             if orig_offload is not None:
                                 fsdp_plugin.state_dict_config.offload_to_cpu = orig_offload
                             if orig_rank0 is not None:
@@ -215,15 +280,18 @@ class SaveAdapterCheckpointCallback(TrainerCallback):
                                     save_end - save_start,
                                     load_end - load_start,
                                 )
-                                unwrapped.save_pretrained(
+                                direct_start = time.monotonic()
+                                self._save_adapter_state_direct(
+                                    unwrapped,
                                     adapter_dir,
-                                    state_dict=adapter_state,
+                                    adapter_state,
                                     safe_serialization=safe_serialization,
                                 )
                                 os.remove(fsdp_path)
                                 logger.info_rank0(
-                                    "Adapter checkpoint saved at: %s (adapter_only fsdp total_s=%.2f)",
+                                    "Adapter checkpoint saved at: %s (adapter_only fsdp direct_save_s=%.2f total_s=%.2f)",
                                     adapter_dir,
+                                    time.monotonic() - direct_start,
                                     time.monotonic() - start_time,
                                 )
                         if torch.distributed.is_initialized():
@@ -641,10 +709,32 @@ class JitCheckpointCallback(TrainerCallback):
     We convert that signal into: "save a checkpoint at the next step end" + "stop training".
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        adapter_callback: Optional[SaveAdapterCheckpointCallback] = None,
+        adapter_only: bool = True,
+    ) -> None:
         self._got_signal = False
         self._prev_handler = None
         self._prev_usr1_handler = None
+        self._adapter_callback = adapter_callback
+        self._adapter_only = adapter_only
+
+    def set_adapter_checkpoint_callback(self, callback: SaveAdapterCheckpointCallback) -> None:
+        self._adapter_callback = callback
+
+    def _signal_seen_across_ranks(self) -> bool:
+        if not torch.distributed.is_initialized():
+            return self._got_signal
+
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        signal_tensor = torch.tensor([1 if self._got_signal else 0], device=device, dtype=torch.int32)
+        try:
+            torch.distributed.all_reduce(signal_tensor, op=torch.distributed.ReduceOp.MAX)
+            return bool(signal_tensor.item())
+        except Exception as exc:
+            logger.warning_rank0("Signal sync across ranks failed; using local signal state: %s", exc)
+            return self._got_signal
 
     def _handle_signal(self, signum, frame) -> None:
         # Extra diagnostics: helps confirm signal delivery + timing under Slurm.
@@ -679,11 +769,28 @@ class JitCheckpointCallback(TrainerCallback):
 
     @override
     def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
-        if self._got_signal:
-            # Request a checkpoint save at the next safe point.
-            logger.warning_rank0("Signal: requesting checkpoint save at step=%s.", state.global_step)
-            control.should_save = True
-            # Do not stop here; some Trainer loops check `should_training_stop` before saving.
+        if not self._signal_seen_across_ranks():
+            return
+
+        if self._adapter_only and self._adapter_callback is not None:
+            model = kwargs.get("model")
+            if model is None:
+                raise RuntimeError("Signal-triggered adapter-only checkpoint requested but callback model is missing.")
+
+            output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+            logger.warning_rank0(
+                "Signal: saving adapter-only checkpoint at step=%s and stopping training.", state.global_step
+            )
+            self._adapter_callback._save_adapter(model, output_dir, _safe_serialization_enabled(args))
+            setattr(args, "jit_checkpoint_signal_stop", True)
+            control.should_epoch_stop = True
+            control.should_training_stop = True
+            self._got_signal = False
+            return
+
+        logger.warning_rank0("Signal: requesting generic checkpoint save at step=%s.", state.global_step)
+        control.should_save = True
+        # Do not stop here; some Trainer loops check `should_training_stop` before saving.
 
     @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):

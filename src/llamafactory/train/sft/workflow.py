@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
@@ -25,7 +26,7 @@ from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
-from ..callbacks import SaveAdapterCheckpointCallback, prune_full_checkpoint_weights
+from ..callbacks import SaveAdapterCheckpointCallback, _safe_serialization_enabled, prune_full_checkpoint_weights
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
 
@@ -37,6 +38,16 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+def _save_final_adapter_checkpoint(trainer: "CustomSeq2SeqTrainer", training_args: "Seq2SeqTrainingArguments") -> bool:
+    for callback in trainer.callback_handler.callbacks:
+        if not isinstance(callback, SaveAdapterCheckpointCallback):
+            continue
+        checkpoint_dir = os.path.join(training_args.output_dir, f"checkpoint-{trainer.state.global_step}")
+        callback._save_adapter(trainer.model, checkpoint_dir, _safe_serialization_enabled(training_args))
+        return True
+    return False
 
 
 def _infer_hmora_num_task_embeddings(train_dataset) -> int:
@@ -238,14 +249,32 @@ def run_sft(
             if "train_loss" in final_metrics and "loss" not in final_metrics:
                 final_metrics["loss"] = final_metrics["train_loss"]
             trainer.log(final_metrics)
+        skip_final_save = bool(getattr(training_args, "skip_final_save", False))
         if signal_checkpoint_stop:
             logger.warning_rank0("Skipping final save_model after signal-triggered checkpoint save.")
+        elif skip_final_save:
+            logger.warning_rank0("Skipping final save_model because skip_final_save=true.")
         else:
-            trainer.save_model()
-            if trainer.is_world_process_zero():
-                prune_full_checkpoint_weights(training_args.output_dir)
+            adapter_saved = _save_final_adapter_checkpoint(trainer, training_args)
+            if adapter_saved:
+                logger.info_rank0("Saved final adapter checkpoint directly; skipping generic save_model.")
+            else:
+                trainer.save_model()
+                if trainer.is_world_process_zero():
+                    prune_full_checkpoint_weights(training_args.output_dir)
         if signal_checkpoint_stop:
-            logger.warning_rank0("Skipping post-train metric/state/modelcard work after signal-triggered checkpoint save.")
+            logger.warning_rank0(
+                "Skipping post-train modelcard work after signal-triggered checkpoint save; "
+                "saving train metrics/state for pipeline checks."
+            )
+            trainer.log_metrics("train", train_result.metrics)
+            trainer.save_metrics("train", train_result.metrics)
+            trainer.save_state()
+            return
+        if skip_final_save:
+            logger.warning_rank0("Skipping post-train state/modelcard work because skip_final_save=true.")
+            trainer.log_metrics("train", train_result.metrics)
+            trainer.save_metrics("train", train_result.metrics)
             return
         if finetuning_args.include_effective_tokens_per_second:
             train_result.metrics["effective_tokens_per_sec"] = calculate_tps(

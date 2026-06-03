@@ -58,8 +58,12 @@ def _training_function(config: dict[str, Any]) -> None:
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
 
     callbacks.append(LogCallback())
+    jit_checkpoint_callback = None
     if getattr(training_args, "enable_jit_checkpoint", False):
-        callbacks.append(JitCheckpointCallback())
+        jit_checkpoint_callback = JitCheckpointCallback(
+            adapter_only=bool(getattr(training_args, "jit_checkpoint_adapter_only", True))
+        )
+        callbacks.append(jit_checkpoint_callback)
     if (
         int(getattr(training_args, "timed_checkpoint_seconds", 0) or 0) > 0
         or str(getattr(training_args, "timed_checkpoint_schedule_seconds", "") or "").strip()
@@ -85,7 +89,10 @@ def _training_function(config: dict[str, Any]) -> None:
         "mola",
         "moelpr",
     ]:
-        callbacks.append(SaveAdapterCheckpointCallback())
+        adapter_checkpoint_callback = SaveAdapterCheckpointCallback()
+        callbacks.append(adapter_checkpoint_callback)
+        if jit_checkpoint_callback is not None:
+            jit_checkpoint_callback.set_adapter_checkpoint_callback(adapter_checkpoint_callback)
         callbacks.append(PruneFullCheckpointWeightsCallback())
         if os.environ.get("LLAMAFACTORY_ADAPTER_MILESTONE_STEPS"):
             callbacks.append(SaveAdapterMilestoneCallback())
