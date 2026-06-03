@@ -72,7 +72,7 @@ def forward_flat(layer, x: torch.Tensor, *args: Any, language_ids: Optional[torc
                         selection=head_assign.squeeze(-1),
                         probs=route_weight,
                         language_ids=language_ids,
-                        expect_targets=use_head_guidance and layer.language_list is not None,
+                        expect_targets=use_head_guidance and language_ids is not None and layer.language_list is not None,
                     )
                     record_hydralora_metrics(metrics, weight=metrics_weight)
 
@@ -150,7 +150,7 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
                     selection=topi[:, :, 0],
                     probs=router_probs,
                     language_ids=language_ids,
-                    expect_targets=use_expert_guidance and layer.language_list is not None,
+                    expect_targets=use_expert_guidance and language_ids is not None and layer.language_list is not None,
                 )
                 record_hydralora_metrics(metrics, weight=metrics_weight)
 
@@ -173,30 +173,8 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
             if not B_list:
                 continue
 
-            route_weight_flat = None
             lora_route = layer.lora_route[name] if name in layer.lora_route else None
             use_head_router = lora_route is not None and len(B_list) > 1
-            if use_head_router:
-                route_dtype = lora_route.weight.dtype
-                route_logits = lora_route(x.to(route_dtype)).to(x.dtype)
-                head_targets: Optional[torch.Tensor] = None
-                use_head_guidance = layer.language_guidance_scope == "all"
-                if use_head_guidance and language_ids is not None:
-                    head_targets = layer._language_head_targets(language_ids, name)
-                    if (
-                        head_targets is not None
-                        and expert_targets is not None
-                        and torch.is_tensor(expert_targets)
-                    ):
-                        mismatch = expert_targets != int(e)
-                        if mismatch.any():
-                            head_targets = head_targets.clone()
-                            head_targets[mismatch] = LANGUAGE_PAD_ID
-                    layer._cache_router_state(route_logits, language_ids, f"hydra_head_{name}", head_targets)
-                route_logits = layer._apply_language_bias_heads(route_logits, head_targets)
-                route_weight = layer._head_router_weights(route_logits)
-                route_weight = layer._enforce_language_heads(route_weight, head_targets)
-                route_weight_flat = route_weight.view(-1, route_weight.size(-1))
 
             mask = topi_flat == e
             if not mask.any():
@@ -209,10 +187,43 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
             scale = layer.scaling[name]
             a_dot_x = A(drop(x_sel.to(A.weight.dtype)))
 
-            if route_weight_flat is None or len(B_list) == 1:
+            if not use_head_router or len(B_list) == 1:
                 out = sum(B(a_dot_x) for B in B_list)
             else:
-                route_sel = route_weight_flat[token_idx].to(a_dot_x.dtype)
+                # Memory note: HEXP-0012 OOMed while computing every expert head
+                # router over the full [batch, seq] tensor before masking. For
+                # sparse expert routing, only tokens assigned to this expert use
+                # this head router, so compute logits for selected tokens only.
+                route_dtype = lora_route.weight.dtype
+                route_logits_sel = lora_route(x_sel.to(route_dtype)).to(x.dtype)  # [N_selected, num_heads]
+                head_targets_sel: Optional[torch.Tensor] = None
+                language_ids_sel: Optional[torch.Tensor] = None
+                use_head_guidance = layer.language_guidance_scope == "all"
+                if use_head_guidance and language_ids is not None:
+                    batch_idx = torch.div(token_idx, seq_len, rounding_mode="floor")
+                    language_ids_sel = language_ids[batch_idx]
+                    head_targets = layer._language_head_targets(language_ids, name)
+                    if head_targets is not None and torch.is_tensor(head_targets):
+                        head_targets_sel = head_targets[batch_idx]
+                        if expert_targets is not None and torch.is_tensor(expert_targets):
+                            expert_targets_sel = expert_targets[batch_idx]
+                            mismatch = expert_targets_sel != int(e)
+                            if mismatch.any():
+                                head_targets_sel = head_targets_sel.clone()
+                                head_targets_sel[mismatch] = LANGUAGE_PAD_ID
+                        # Cache selected-token head-router state for LPR. This
+                        # deliberately changes the cache scope from full-batch
+                        # to routed-token logits to avoid reintroducing the OOM.
+                        layer._cache_router_state(
+                            route_logits_sel.unsqueeze(1),
+                            language_ids_sel,
+                            f"hydra_head_{name}",
+                            head_targets_sel,
+                        )
+                route_logits = layer._apply_language_bias_heads(route_logits_sel.unsqueeze(1), head_targets_sel).squeeze(1)
+                route_weight = layer._head_router_weights(route_logits)
+                route_weight = layer._enforce_language_heads(route_weight.unsqueeze(1), head_targets_sel).squeeze(1)
+                route_sel = route_weight.to(a_dot_x.dtype)
                 out = 0
                 for i, B in enumerate(B_list):
                     out = out + B(a_dot_x) * route_sel[:, i].unsqueeze(-1)

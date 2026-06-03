@@ -21,9 +21,11 @@ import torch
 from peft import (
     AdaMoleConfig,
     ColaConfig,
+    GradIsoConfig,
     HMoRaConfig,
     HalaConfig,
     HydraLoraConfig,
+    LangGateConfig,
     LoraConfig,
     LoraModel,
     MixLoraConfig,
@@ -34,6 +36,7 @@ from peft import (
     MolaConfig,
     OFTConfig,
     PeftModel,
+    SoftMoeConfig,
     TaskType,
     VanillaMoELoraConfig,
     get_peft_model,
@@ -83,6 +86,46 @@ def _build_language_metadata(language_map_spec: Optional[str]):
     return languages, families, language_to_family_ids, subgroup_sizes, language_to_subgroup_ids
 
 
+def _build_hydralora_head_metadata(
+    *,
+    main_language_list: Optional[list[str]],
+    head_map_spec: Optional[str],
+    head_count: int,
+) -> tuple[Optional[list[int]], Optional[list[str]]]:
+    if not head_map_spec:
+        return None, None
+    if main_language_list is None:
+        raise ValueError("`hydralora_head_map` requires `language_map` to define languages.")
+
+    head_language_list, head_family_list, head_language_to_family, _, head_language_to_subgroup_ids = (
+        _build_language_metadata(head_map_spec)
+    )
+    if not head_language_list or not head_family_list or head_language_to_family is None:
+        raise ValueError("`hydralora_head_map` must define at least one language group.")
+    if head_language_list != main_language_list:
+        missing = sorted(set(main_language_list) - set(head_language_list))
+        extra = sorted(set(head_language_list) - set(main_language_list))
+        raise ValueError(
+            "`hydralora_head_map` languages must match `language_map` languages "
+            f"(missing={missing}, extra={extra})."
+        )
+    if len(head_family_list) != head_count:
+        raise ValueError(
+            f"`hydralora_head_map` defines {len(head_family_list)} groups but flat HydraLoRA has "
+            f"lora_num={head_count} B heads."
+        )
+
+    if head_language_to_subgroup_ids is not None and any(idx >= 0 for idx in head_language_to_subgroup_ids):
+        target_ids = head_language_to_subgroup_ids
+    else:
+        target_ids = head_language_to_family
+
+    invalid = [idx for idx in target_ids if idx < 0 or idx >= head_count]
+    if invalid:
+        raise ValueError(f"`hydralora_head_map` produced invalid B-head targets: {invalid}.")
+    return target_ids, head_family_list
+
+
 def _parse_optional_int_list(value: Optional[Union[str, Sequence[int]]]) -> Optional[list[int]]:
     if value is None:
         return None
@@ -96,6 +139,51 @@ def _parse_optional_int_list(value: Optional[Union[str, Sequence[int]]]) -> Opti
     for item in items:
         parsed.append(int(item))
     return parsed
+
+
+def _resolve_trainable_token_setup(
+    finetuning_args: "FinetuningArguments",
+) -> tuple[Optional[list[str]], Optional[dict[str, list[int]]]]:
+    modules_to_save = finetuning_args.additional_target
+    token_range = getattr(finetuning_args, "trainable_token_range", None)
+    if token_range is None:
+        return modules_to_save, None
+
+    token_range = str(token_range).strip()
+    if not token_range:
+        return modules_to_save, None
+
+    sep = ":" if ":" in token_range else ","
+    parts = [part.strip() for part in token_range.split(sep) if part.strip()]
+    if len(parts) != 2:
+        raise ValueError("`trainable_token_range` must be formatted as start:end.")
+
+    start_id, end_id = (int(parts[0]), int(parts[1]))
+    if start_id < 0 or end_id <= start_id:
+        raise ValueError(f"`trainable_token_range` must be a non-empty positive range, got {token_range!r}.")
+
+    targets = getattr(finetuning_args, "trainable_token_targets", None) or ["embed_tokens"]
+    if isinstance(targets, str):
+        targets = [target.strip() for target in targets.split(",") if target.strip()]
+    else:
+        targets = [str(target).strip() for target in targets if str(target).strip()]
+    if not targets:
+        raise ValueError("`trainable_token_targets` must contain at least one target when trainable tokens are enabled.")
+
+    token_indices = list(range(start_id, end_id))
+    trainable_token_indices = {target: token_indices for target in targets}
+    if modules_to_save:
+        target_set = set(targets)
+        filtered_modules = [module for module in modules_to_save if module not in target_set]
+        if len(filtered_modules) != len(modules_to_save):
+            logger.info_rank0(
+                "Using trainable-token rows for %s; removed overlapping modules from `additional_target`.",
+                ",".join(targets),
+            )
+        modules_to_save = filtered_modules or None
+
+    logger.info_rank0("Using trainable-token rows [%s, %s) for %s.", start_id, end_id, ",".join(targets))
+    return modules_to_save, trainable_token_indices
 
 
 def _resolve_hmora_task_token_id(
@@ -354,6 +442,8 @@ def _setup_lora_tuning(
             finetuning_args.additional_target = module_names
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+
         if finetuning_args.finetuning_type == "lora":
             peft_kwargs = {
                 "r": finetuning_args.lora_rank,
@@ -362,8 +452,14 @@ def _setup_lora_tuning(
                 "lora_dropout": finetuning_args.lora_dropout,
                 "use_rslora": finetuning_args.use_rslora,
                 "use_dora": finetuning_args.use_dora,
-                "modules_to_save": finetuning_args.additional_target,
+                "modules_to_save": modules_to_save,
+                "trainable_token_indices": trainable_token_indices,
             }
+            if finetuning_args.lora_layers_to_transform is not None:
+                if finetuning_args.lora_layers_to_transform.lower() != "all":
+                    peft_kwargs["layers_to_transform"] = [
+                        int(layer_id) for layer_id in finetuning_args.lora_layers_to_transform.split(",") if layer_id.strip()
+                    ]
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
                 "r": finetuning_args.oft_rank,
@@ -538,6 +634,14 @@ def _setup_cola_tuning(
             "cola_strategy": finetuning_args.cola_strategy,
             "modules_to_save": finetuning_args.additional_target,
         }
+        hydralora_layers_to_transform = getattr(finetuning_args, "hydralora_layers_to_transform", None)
+        if hydralora_layers_to_transform is None:
+            hydralora_layers_to_transform = finetuning_args.lora_layers_to_transform
+        if hydralora_layers_to_transform is not None:
+            if str(hydralora_layers_to_transform).lower() != "all":
+                peft_kwargs["layers_to_transform"] = [
+                    int(layer_id) for layer_id in str(hydralora_layers_to_transform).split(",") if layer_id.strip()
+                ]
         language_map = load_language_map(finetuning_args.language_map)
         language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
@@ -551,8 +655,6 @@ def _setup_cola_tuning(
                     f"cola_num_experts={finetuning_args.cola_num_experts} "
                     f"but language_map defines {expected_experts} groups."
                 )
-        if expert_num_B is None and subgroup_sizes and any(size > 0 for size in subgroup_sizes):
-            expert_num_B = subgroup_sizes
         if expert_num_B is None and finetuning_args.use_cola_experts and expected_experts:
             expert_num_B = [finetuning_args.num_B] * expected_experts
         if finetuning_args.use_cola_experts and expert_num_B is not None and expected_experts:
@@ -564,6 +666,7 @@ def _setup_cola_tuning(
             if any(count <= 0 for count in expert_num_B):
                 raise ValueError("CoLA expert head config contains non-positive counts.")
             expected_heads = list(expert_num_B)
+            peft_kwargs["expert_num_B"] = expected_heads
         peft_kwargs.update(
             {
                 "language_map": language_map,
@@ -598,7 +701,8 @@ def _setup_cola_tuning(
             elif lowered == "pissa" and finetuning_args.pissa_iter != -1:
                 init_lora_weights = f"pissa_niter_{finetuning_args.pissa_iter}"
         peft_kwargs["init_lora_weights"] = init_lora_weights
-        logger.info_rank0(f"CoLA adapter initialization method: {init_lora_weights}.")
+        init_label = "default_lora" if init_lora_weights is True else init_lora_weights
+        logger.info_rank0(f"CoLA adapter initialization method: {init_label}.")
 
         cola_config = ColaConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -796,23 +900,14 @@ def _setup_hydralora_tuning(
     adapter_to_resume = None
     expected_experts: Optional[int] = None
     expected_heads: Optional[list[int]] = None
+    hydralora_head_groups: Optional[list[str]] = None
 
     if model_args.adapter_name_or_path is not None:
-        is_mergeable = True
-        if getattr(model, "quantization_method", None):
-            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
-            is_mergeable = False
-
-        if is_deepspeed_zero3_enabled():
-            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
-            is_mergeable = False
-
-        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
-            adapter_to_merge = model_args.adapter_name_or_path[:-1]
-            adapter_to_resume = model_args.adapter_name_or_path[-1]
-        else:
-            adapter_to_merge = model_args.adapter_name_or_path
-
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("HydraLoRA adapters are non-mergeable; only a single adapter_name_or_path is supported.")
+        if is_trainable and finetuning_args.create_new_adapter:
+            raise ValueError("HydraLoRA does not support create_new_adapter on top of an existing routed adapter.")
+        adapter_to_resume = model_args.adapter_name_or_path[-1]
         init_kwargs = {
             "subfolder": model_args.adapter_folder,
             "offload_folder": model_args.offload_folder,
@@ -820,16 +915,7 @@ def _setup_hydralora_tuning(
             "revision": model_args.model_revision,
             "token": model_args.hf_hub_token,
         }
-        for adapter in adapter_to_merge:
-            model: "LoraModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
-            model = model.merge_and_unload()
-
-        if len(adapter_to_merge) > 0:
-            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
-
-        if adapter_to_resume is not None:
-            model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
-
+        model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
     if is_trainable and adapter_to_resume is None:
@@ -875,6 +961,12 @@ def _setup_hydralora_tuning(
         language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
         )
+        if finetuning_args.hydralora_head_map:
+            language_to_subgroup_ids, hydralora_head_groups = _build_hydralora_head_metadata(
+                main_language_list=language_list,
+                head_map_spec=finetuning_args.hydralora_head_map,
+                head_count=finetuning_args.lora_num,
+            )
         if family_list:
             expected_experts = len(family_list)
         if finetuning_args.use_hydralora_experts and expected_experts:
@@ -922,6 +1014,15 @@ def _setup_hydralora_tuning(
             **peft_kwargs,
         )
         model = get_peft_model(model, hydra_config)
+
+    if (not finetuning_args.use_hydralora_experts) and finetuning_args.hydralora_head_map:
+        logger.info_rank0(
+            "[HYDRA HEAD MAP] flat B-head targets=%s head_router_mode=%s guidance=%s prior_weight=%s",
+            hydralora_head_groups,
+            finetuning_args.language_head_router_mode,
+            finetuning_args.language_guidance_scope,
+            finetuning_args.language_prior_weight,
+        )
 
     if finetuning_args.use_hydralora_experts:
         sample_layer = next((m for _, m in model.named_modules() if hasattr(m, "use_hydralora_experts")), None)
@@ -1040,7 +1141,14 @@ def _setup_hala_tuning(
             finetuning_args.additional_target = module_names
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
         expert_lora_nums = _parse_optional_int_list(finetuning_args.hala_expert_lora_nums)
+        layers_to_transform = None
+        if finetuning_args.hala_layers_to_transform is not None:
+            if finetuning_args.hala_layers_to_transform.lower() != "all":
+                layers_to_transform = [
+                    int(layer_id) for layer_id in finetuning_args.hala_layers_to_transform.split(",") if layer_id.strip()
+                ]
         peft_kwargs = {
             "r": finetuning_args.lora_rank,
             "target_modules": target_modules,
@@ -1054,8 +1162,18 @@ def _setup_hala_tuning(
             "head_top_k": finetuning_args.hala_head_top_k,
             "hydralora_debug": finetuning_args.hala_debug,
             "hala_execution_mode": finetuning_args.hala_execution_mode,
-            "modules_to_save": finetuning_args.additional_target,
+            "hala_shared_residual": finetuning_args.hala_shared_residual,
+            "hala_shared_expert_head_residual": finetuning_args.hala_shared_expert_head_residual,
+            "hala_gated_shared_capacity": finetuning_args.hala_gated_shared_capacity,
+            "hala_gated_shared_init_bias": finetuning_args.hala_gated_shared_init_bias,
+            "hala_balance_loss_coef": finetuning_args.hala_balance_loss_coef,
+            "hala_balance_loss_kind": finetuning_args.hala_balance_loss_kind,
+            "hala_balance_target": finetuning_args.hala_balance_target,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
         }
+        if layers_to_transform is not None:
+            peft_kwargs["layers_to_transform"] = layers_to_transform
         language_map = load_language_map(finetuning_args.language_map)
         language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
@@ -1113,10 +1231,14 @@ def _setup_hala_tuning(
                 count = int(sample_layer.lora_num.get(key, 0) or 0)
             actual_heads.append(count)
         logger.info_rank0(
-            "[HALA SETUP] mode=%s experts=%s heads_per_expert=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
+            "[HALA SETUP] mode=%s shared_residual=%s shared_expert_head=%s gated_shared_capacity=%s experts=%s heads_per_expert=%s layers=%s router_mode=%s head_router_mode=%s guidance=%s top_k=%s head_top_k=%s",
             finetuning_args.hala_execution_mode,
+            finetuning_args.hala_shared_residual,
+            finetuning_args.hala_shared_expert_head_residual,
+            finetuning_args.hala_gated_shared_capacity,
             actual_experts,
             actual_heads,
+            finetuning_args.hala_layers_to_transform or "all",
             finetuning_args.language_router_mode,
             finetuning_args.language_head_router_mode,
             finetuning_args.language_guidance_scope,
@@ -2001,6 +2123,168 @@ def _setup_moelpr_tuning(
     return model
 
 
+def _setup_soft_moe_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: Soft MoE LoRA")
+
+    if is_trainable:
+        target_modules = finetuning_args.lora_target if not (len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all") else None
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+        num_experts = finetuning_args.soft_moe_num_experts
+        if family_list and len(family_list) != num_experts:
+            raise ValueError(f"soft_moe_num_experts={num_experts} but language_map defines {len(family_list)} groups.")
+
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "lora_num": 1,
+            "use_hydralora_experts": True,
+            "num_experts": num_experts,
+            "top_k": 1,
+            "soft_moe_temperature": finetuning_args.soft_moe_temperature,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
+            "language_map": language_map,
+            "language_list": language_list,
+            "family_list": family_list,
+            "language_to_family_ids": language_to_family,
+            "language_to_subgroup_ids": language_to_subgroup_ids,
+            "language_column": finetuning_args.language_column,
+            "language_router_mode": finetuning_args.language_router_mode,
+            "language_guidance_scope": "all",
+            "language_prior_weight": finetuning_args.language_prior_weight,
+            "track_router_metrics": finetuning_args.track_router_metrics,
+            "language_bias_value": finetuning_args.language_bias_value,
+        }
+        soft_moe_config = SoftMoeConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+        model = get_peft_model(model, soft_moe_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _setup_grad_iso_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: Gradient-Isolated LoRA")
+
+    if is_trainable:
+        target_modules = finetuning_args.lora_target if not (len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all") else None
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+        num_partitions = finetuning_args.grad_iso_num_partitions
+        if family_list and len(family_list) != num_partitions:
+            raise ValueError(f"grad_iso_num_partitions={num_partitions} but language_map defines {len(family_list)} groups.")
+
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "use_hydralora_experts": False,
+            "grad_iso_num_partitions": num_partitions,
+            "grad_iso_inference_mode": finetuning_args.grad_iso_inference_mode,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
+            "language_map": language_map,
+            "language_list": language_list,
+            "family_list": family_list,
+            "language_to_family_ids": language_to_family,
+            "language_column": finetuning_args.language_column,
+            "language_guidance_scope": "all",
+            "track_router_metrics": finetuning_args.track_router_metrics,
+        }
+        grad_iso_config = GradIsoConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+        model = get_peft_model(model, grad_iso_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _setup_lang_gate_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: Language-Gated LoRA")
+
+    if is_trainable:
+        target_modules = finetuning_args.lora_target if not (len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all") else None
+        if target_modules is not None:
+            target_modules = patch_target_modules(model, finetuning_args, target_modules)
+
+        language_map = load_language_map(finetuning_args.language_map)
+        language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
+            finetuning_args.language_map
+        )
+
+        modules_to_save, trainable_token_indices = _resolve_trainable_token_setup(finetuning_args)
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "use_hydralora_experts": False,
+            "lang_gate_type": finetuning_args.lang_gate_type,
+            "lang_gate_init": finetuning_args.lang_gate_init,
+            "modules_to_save": modules_to_save,
+            "trainable_token_indices": trainable_token_indices,
+            "language_map": language_map,
+            "language_list": language_list,
+            "family_list": family_list,
+            "language_to_family_ids": language_to_family,
+            "language_column": finetuning_args.language_column,
+            "language_guidance_scope": "all",
+            "track_router_metrics": finetuning_args.track_router_metrics,
+        }
+        lang_gate_config = LangGateConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+        model = get_peft_model(model, lang_gate_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
+
 def init_adapter(
     config: "PretrainedConfig",
     model: "PreTrainedModel",
@@ -2089,6 +2373,18 @@ def init_adapter(
         )
     elif finetuning_args.finetuning_type == "moelpr":
         model = _setup_moelpr_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "soft_moe":
+        model = _setup_soft_moe_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "grad_iso":
+        model = _setup_grad_iso_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "lang_gate":
+        model = _setup_lang_gate_tuning(
             config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
         )
     else:

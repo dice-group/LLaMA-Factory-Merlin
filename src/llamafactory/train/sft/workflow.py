@@ -26,7 +26,7 @@ from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
-from ..callbacks import SaveAdapterCheckpointCallback, _safe_serialization_enabled
+from ..callbacks import SaveAdapterCheckpointCallback, _safe_serialization_enabled, prune_full_checkpoint_weights
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
 
@@ -260,6 +260,8 @@ def run_sft(
                 logger.info_rank0("Saved final adapter checkpoint directly; skipping generic save_model.")
             else:
                 trainer.save_model()
+                if trainer.is_world_process_zero():
+                    prune_full_checkpoint_weights(training_args.output_dir)
         if signal_checkpoint_stop:
             logger.warning_rank0(
                 "Skipping post-train modelcard work after signal-triggered checkpoint save; "

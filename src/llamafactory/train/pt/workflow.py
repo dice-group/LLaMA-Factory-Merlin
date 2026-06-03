@@ -18,6 +18,7 @@
 import math
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from transformers import DataCollatorForLanguageModeling
 
 from ...data import get_dataset, get_template_and_fix_tokenizer
@@ -33,6 +34,40 @@ if TYPE_CHECKING:
     from ...hparams import DataArguments, FinetuningArguments, ModelArguments
 
 
+class DataCollatorForLanguageModelingWithMetadata:
+    r"""Preserve routing metadata when CPT uses tokenized datasets."""
+
+    def __init__(self, tokenizer):
+        self.base_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    def __call__(self, features):
+        language_ids = []
+        task_ids = []
+        have_language_ids = False
+        have_task_ids = False
+        clean_features = []
+
+        for feature in features:
+            feature = dict(feature)
+            lang_raw = feature.pop("language_ids", None)
+            if lang_raw is not None:
+                have_language_ids = True
+            language_ids.append(lang_raw if lang_raw is not None else -100)
+
+            task_raw = feature.pop("task_ids", None)
+            if task_raw is not None:
+                have_task_ids = True
+            task_ids.append(task_raw if task_raw is not None else -100)
+            clean_features.append(feature)
+
+        batch = self.base_collator(clean_features)
+        if have_language_ids:
+            batch["language_ids"] = torch.tensor(language_ids, dtype=torch.long)
+        if have_task_ids:
+            batch["task_ids"] = torch.tensor(task_ids, dtype=torch.long)
+        return batch
+
+
 def run_pt(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -45,7 +80,7 @@ def run_pt(
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="pt", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    data_collator = DataCollatorForLanguageModelingWithMetadata(tokenizer=tokenizer)
 
     # Initialize our Trainer
     trainer = CustomTrainer(

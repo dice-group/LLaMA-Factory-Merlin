@@ -103,6 +103,27 @@ class TrainingArguments(RayArguments, BaseTrainingArguments):
             )
         },
     )
+    save_safetensors: bool = field(
+        default=False,
+        metadata={"help": "Save trainer checkpoints with safetensors when supported."},
+    )
+    timed_checkpoint_seconds: int = field(
+        default=0,
+        metadata={"help": "Save one non-stopping checkpoint after this many elapsed training seconds (0 disables)."},
+    )
+    timed_checkpoint_schedule_seconds: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Comma-separated elapsed training seconds for recurring non-stopping checkpoints "
+                "(for example: 72000,144000,288000). Overrides timed_checkpoint_seconds when set."
+            )
+        },
+    )
+    timed_checkpoint_label: str = field(
+        default="compute_cut",
+        metadata={"help": "Label written to checkpoint metadata for the timed non-stopping checkpoint."},
+    )
 
     jit_checkpoint_adapter_only: bool = field(
         default=True,

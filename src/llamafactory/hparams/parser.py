@@ -183,6 +183,7 @@ def _verify_model_args(
 
     if (
         finetuning_args.finetuning_type in {"cola", "hydralora", "hala"}
+        and finetuning_args.stage != "pt"
         and float(getattr(finetuning_args, "language_prior_weight", 0.0) or 0.0) > 0.0
         and not model_args.disable_gradient_checkpointing
         and model_args.use_reentrant_gc
@@ -463,9 +464,11 @@ def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
     if (
         training_args.parallel_mode == ParallelMode.DISTRIBUTED
         and training_args.ddp_find_unused_parameters is None
-        and finetuning_args.finetuning_type == "lora"
+        and finetuning_args.finetuning_type in {"lora", "hala"}
     ):
-        logger.info_rank0("Set `ddp_find_unused_parameters` to False in DDP training since LoRA is enabled.")
+        logger.info_rank0(
+            f"Set `ddp_find_unused_parameters` to False in DDP training since {finetuning_args.finetuning_type.upper()} is enabled."
+        )
         training_args.ddp_find_unused_parameters = False
 
     if finetuning_args.stage in ["rm", "ppo"] and finetuning_args.finetuning_type in ["full", "freeze"]:

@@ -96,6 +96,9 @@ class PeftType(str, enum.Enum):
     TRAINABLE_TOKENS = "TRAINABLE_TOKENS"
     SHIRA = "SHIRA"
     C3A = "C3A"
+    SOFT_MOE = "SOFT_MOE"
+    GRAD_ISO = "GRAD_ISO"
+    LANG_GATE = "LANG_GATE"
 
 
 class TaskType(str, enum.Enum):

@@ -151,6 +151,15 @@ class HydraLoraConfig(PeftConfig):
             "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
         },
     )
+    trainable_token_indices: Optional[Union[list[int], dict[str, list[int]]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional token ids to selectively fine-tune with PEFT TrainableTokens wrappers instead of "
+                "training full embedding matrices."
+            )
+        },
+    )
     init_lora_weights: bool | Literal["gaussian", "olora", "pissa", "pissa_niter_[number of iters]", "loftq"] = field(
         default=True,
         metadata={

@@ -31,9 +31,11 @@ from .callbacks import (
     LogCallback,
     JitCheckpointCallback,
     PissaConvertCallback,
+    PruneFullCheckpointWeightsCallback,
     ReporterCallback,
     SaveAdapterCheckpointCallback,
     SaveAdapterMilestoneCallback,
+    TimedCheckpointCallback,
 )
 from .trainer_utils import get_ray_trainer, get_swanlab_callback
 
@@ -62,6 +64,11 @@ def _training_function(config: dict[str, Any]) -> None:
             adapter_only=bool(getattr(training_args, "jit_checkpoint_adapter_only", True))
         )
         callbacks.append(jit_checkpoint_callback)
+    if (
+        int(getattr(training_args, "timed_checkpoint_seconds", 0) or 0) > 0
+        or str(getattr(training_args, "timed_checkpoint_schedule_seconds", "") or "").strip()
+    ):
+        callbacks.append(TimedCheckpointCallback())
     if finetuning_args.pissa_convert:
         callbacks.append(PissaConvertCallback())
 
@@ -86,6 +93,7 @@ def _training_function(config: dict[str, Any]) -> None:
         callbacks.append(adapter_checkpoint_callback)
         if jit_checkpoint_callback is not None:
             jit_checkpoint_callback.set_adapter_checkpoint_callback(adapter_checkpoint_callback)
+        callbacks.append(PruneFullCheckpointWeightsCallback())
         if os.environ.get("LLAMAFACTORY_ADAPTER_MILESTONE_STEPS"):
             callbacks.append(SaveAdapterMilestoneCallback())
 

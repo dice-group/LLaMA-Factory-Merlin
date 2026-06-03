@@ -66,6 +66,24 @@ class LoraArguments:
             )
         },
     )
+    trainable_token_range: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional compact token id range for PEFT trainable-token tuning, formatted as start:end. "
+                "This fine-tunes only those rows instead of full embedding matrices."
+            )
+        },
+    )
+    trainable_token_targets: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Embedding/output module names to wrap with trainable-token tuning. "
+                "Use commas to separate multiple modules, e.g. embed_tokens,lm_head."
+            )
+        },
+    )
     lora_alpha: Optional[int] = field(
         default=None,
         metadata={"help": "The scale factor for LoRA fine-tuning (default: lora_rank * 2)."},
@@ -85,6 +103,15 @@ class LoraArguments:
                 "Name(s) of target modules to apply LoRA. "
                 "Use commas to separate multiple modules. "
                 "Use `all` to specify all the linear modules."
+            )
+        },
+    )
+    lora_layers_to_transform: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated transformer layer indices to apply plain LoRA to. "
+                "Use `all` or leave unset to transform all matching layers."
             )
         },
     )
@@ -462,7 +489,7 @@ class FinetuningArguments(
         metadata={"help": "Which stage will be performed in training."},
     )
     finetuning_type: Literal[
-        "lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"
+        "lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr", "soft_moe", "grad_iso", "lang_gate"
     ] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
@@ -511,6 +538,15 @@ class FinetuningArguments(
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},
+    )
+    use_language_loss_weights: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply per-example `language_loss_weight` values to supervised SFT tokens. "
+                "Default-disabled; requires the batch/data collator to provide language_loss_weight."
+            )
+        },
     )
     early_stopping_steps: Optional[int] = field(
         default=None,
@@ -592,6 +628,19 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HydraLoRA expert when MoE is enabled."},
     )
+    hydralora_head_map: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional language grouping JSON used only for flat HydraLoRA B-head LPR targets. "
+                "Supported with `use_hydralora_experts=False`."
+            )
+        },
+    )
+    hydralora_layers_to_transform: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated decoder layer ids to apply HydraLoRA adapters to (use 'all' for every layer)."},
+    )
     hala_num_experts: int = field(
         default=1,
         metadata={"help": "Number of experts per HALA layer."},
@@ -601,23 +650,60 @@ class FinetuningArguments(
         metadata={"help": "Top-k experts selected per token in HALA."},
     )
     hala_head_top_k: Optional[int] = field(
-        default=None,
-        metadata={"help": "Top-k heads selected per expert in HALA (None or <=0 keeps dense head mixing)."},
+        default=1,
+        metadata={"help": "Top-k heads selected per expert in HALA. Use 1 for sparse heads or 0 for dense heads."},
     )
     hala_debug: bool = field(default=False, metadata={"help": "Enable verbose HALA debugging output."})
+    hala_shared_residual: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable a shared LoRA residual branch in HALA before the routed expert residual."
+        },
+    )
+    hala_shared_expert_head_residual: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable one always-on shared B head per selected HALA expert, reusing that expert's A projection."
+        },
+    )
+    hala_gated_shared_capacity: bool = field(
+        default=False,
+        metadata={"help": "Enable the default-disabled HALA gated shared-capacity branch."},
+    )
+    hala_gated_shared_init_bias: float = field(
+        default=-4.0,
+        metadata={"help": "Initial bias for the HALA gated shared-capacity scalar gate."},
+    )
+    hala_balance_loss_coef: float = field(
+        default=0.0,
+        metadata={"help": "Weight for the HALA router load-balance auxiliary loss (0 disables)."},
+    )
+    hala_balance_loss_kind: Literal["none", "uniform_importance", "target_distribution_importance"] = field(
+        default="none",
+        metadata={
+            "help": (
+                "HALA balance objective kind. 'uniform_importance' balances mean expert probabilities against "
+                "a uniform prior; 'target_distribution_importance' matches the batch language-target distribution."
+            )
+        },
+    )
+    hala_balance_target: Literal["expert"] = field(
+        default="expert",
+        metadata={"help": "HALA balance target. The initial implementation supports expert router balance only."},
+    )
     hala_expert_lora_nums: Optional[str] = field(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HALA expert."},
     )
+    hala_layers_to_transform: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated decoder layer ids to apply HALA adapters to (use 'all' for every layer)."},
+    )
     hala_execution_mode: Literal[
-        "dense_expert_dense_head",
-        "sparse_expert_dense_head",
-        "packed_sparse_expert_dense_head",
         "grouped_sparse_expert_dense_head",
-        "packed_dense_lowrank",
     ] = field(
-        default="dense_expert_dense_head",
-        metadata={"help": "HALA execution mode."},
+        default="grouped_sparse_expert_dense_head",
+        metadata={"help": "HALA execution mode. The exploration branch only supports sparse expert plus sparse head."},
     )
     mola_num_experts: int = field(default=4, metadata={"help": "Number of experts used by MoLA."})
     mola_top_k: int = field(default=2, metadata={"help": "Top-k experts routed to for each token in MoLA."})
@@ -688,6 +774,33 @@ class FinetuningArguments(
     adamole_debug_mode: bool = field(
         default=False,
         metadata={"help": "Enable verbose AdaMoLE routing diagnostics."},
+    )
+    # --- Soft MoE LoRA ---
+    soft_moe_num_experts: int = field(
+        default=3,
+        metadata={"help": "Number of experts for Soft MoE LoRA."},
+    )
+    soft_moe_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Softmax temperature for Soft MoE expert mixing (higher = more uniform)."},
+    )
+    # --- Gradient-Isolated LoRA ---
+    grad_iso_num_partitions: int = field(
+        default=3,
+        metadata={"help": "Number of gradient-isolated LoRA partitions (one per language)."},
+    )
+    grad_iso_inference_mode: str = field(
+        default="mean",
+        metadata={"help": "Partition combination at inference: 'mean' or 'weighted'."},
+    )
+    # --- Language-Gated LoRA ---
+    lang_gate_type: str = field(
+        default="sigmoid",
+        metadata={"help": "Gate activation: 'sigmoid' (independent dims) or 'softmax' (competitive)."},
+    )
+    lang_gate_init: str = field(
+        default="ones",
+        metadata={"help": "Gate initialization: 'ones' (start shared) or 'identity' (start separated)."},
     )
     mixlora_num_experts: int = field(
         default=8,
@@ -1014,6 +1127,9 @@ class FinetuningArguments(
         self.freeze_extra_modules: Optional[list[str]] = split_arg(self.freeze_extra_modules)
         self.lora_alpha: int = self.lora_alpha or self.lora_rank * 2
         self.lora_target: list[str] = split_arg(self.lora_target)
+        if isinstance(self.lora_layers_to_transform, str):
+            self.lora_layers_to_transform = self.lora_layers_to_transform.strip() or None
+        self.trainable_token_targets: Optional[list[str]] = split_arg(self.trainable_token_targets)
         self.oft_target: list[str] = split_arg(self.oft_target)
         self.additional_target: Optional[list[str]] = split_arg(self.additional_target)
         self.galore_target: list[str] = split_arg(self.galore_target)
@@ -1029,8 +1145,12 @@ class FinetuningArguments(
             self.cola_expert_num_B = self.cola_expert_num_B.strip() or None
         if isinstance(self.hydralora_expert_lora_nums, str):
             self.hydralora_expert_lora_nums = self.hydralora_expert_lora_nums.strip() or None
+        if isinstance(self.hydralora_head_map, str):
+            self.hydralora_head_map = self.hydralora_head_map.strip() or None
         if isinstance(self.hala_expert_lora_nums, str):
             self.hala_expert_lora_nums = self.hala_expert_lora_nums.strip() or None
+        if isinstance(self.hala_layers_to_transform, str):
+            self.hala_layers_to_transform = self.hala_layers_to_transform.strip() or None
         self.track_router_metrics = parse_optional_bool(self.track_router_metrics)
         self.mixlora_moe_target_modules: Optional[list[str]] = split_arg(self.mixlora_moe_target_modules)
         if isinstance(self.mixlora_act_fn, str):
@@ -1044,7 +1164,7 @@ class FinetuningArguments(
         if self.cola_strategy == "random":
             self.cola_strategy = "random_ab"
 
-        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr"]
+        supported_ft = ["lora", "oft", "freeze", "full", "cola", "hydralora", "hala", "adamole", "mixlora", "moelora", "vanilla_moelora", "mtllora", "movlora", "hmora", "mola", "moelpr", "soft_moe", "grad_iso", "lang_gate"]
         assert self.finetuning_type in supported_ft, "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
@@ -1156,25 +1276,38 @@ class FinetuningArguments(
             if self.hmora_eta_b != 1.0 and self.loraplus_lr_ratio is not None:
                 raise ValueError("`hmora_eta_b` cannot be combined with `loraplus_lr_ratio`.")
 
+        if self.finetuning_type == "hydralora":
+            if self.hydralora_head_map and self.use_hydralora_experts:
+                raise ValueError("`hydralora_head_map` is only supported with `use_hydralora_experts=False`.")
+            if self.hydralora_head_map and self.lora_num <= 1:
+                raise ValueError("`hydralora_head_map` requires `lora_num > 1`.")
+            if self.hydralora_head_map and self.language_prior_weight <= 0 and self.language_router_mode != "hard":
+                raise ValueError("`hydralora_head_map` requires `language_prior_weight > 0` unless hard routing is used.")
+
         if self.finetuning_type == "hala":
             if self.hala_num_experts <= 0:
                 raise ValueError("`hala_num_experts` must be positive.")
-            if self.hala_top_k <= 0 or self.hala_top_k > self.hala_num_experts:
-                raise ValueError("`hala_top_k` must be in range [1, hala_num_experts].")
-            if self.hala_head_top_k is not None and self.hala_head_top_k <= 0:
-                self.hala_head_top_k = None
-            if self.hala_execution_mode not in {
-                "dense_expert_dense_head",
-                "sparse_expert_dense_head",
-                "packed_sparse_expert_dense_head",
-                "grouped_sparse_expert_dense_head",
-                "packed_dense_lowrank",
-            }:
+            if self.hala_gated_shared_capacity and self.hala_gated_shared_init_bias > 0:
+                raise ValueError("`hala_gated_shared_init_bias` should be non-positive for conservative gated starts.")
+            if self.hala_balance_loss_coef < 0:
+                raise ValueError("`hala_balance_loss_coef` must be non-negative.")
+            if self.hala_balance_loss_coef > 0 and self.hala_balance_loss_kind == "none":
+                raise ValueError("`hala_balance_loss_kind` must not be 'none' when `hala_balance_loss_coef > 0`.")
+            if self.hala_balance_loss_kind != "none" and self.hala_balance_target != "expert":
+                raise ValueError("The initial HALA balance objective only supports `hala_balance_target=expert`.")
+            if self.hala_top_k not in (1, 2):
+                raise ValueError("This HALA exploration branch supports expert `hala_top_k=1` or `hala_top_k=2`.")
+            if self.hala_head_top_k not in (0, 1):
+                raise ValueError("This HALA exploration branch supports `hala_head_top_k=1` or `hala_head_top_k=0`.")
+            if self.hala_execution_mode != "grouped_sparse_expert_dense_head":
                 raise ValueError(
-                    "`hala_execution_mode` must be one of 'dense_expert_dense_head', "
-                    "'sparse_expert_dense_head', 'packed_sparse_expert_dense_head', "
-                    "'grouped_sparse_expert_dense_head', or 'packed_dense_lowrank'."
+                    "This HALA exploration branch only supports "
+                    "`hala_execution_mode=grouped_sparse_expert_dense_head`."
                 )
+            if self.language_guidance_scope not in {"all", "expert_only"}:
+                raise ValueError("HALA requires `language_guidance_scope` to be 'all' or 'expert_only'.")
+            if self.language_prior_weight <= 0 and self.language_router_mode != "hard":
+                raise ValueError("HALA requires `language_prior_weight > 0` unless `language_router_mode=hard`.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
