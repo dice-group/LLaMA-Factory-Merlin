@@ -628,6 +628,15 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Optional comma-separated list overriding `lora_num` per HydraLoRA expert when MoE is enabled."},
     )
+    hydralora_head_map: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional language grouping JSON used only for flat HydraLoRA B-head LPR targets. "
+                "Supported with `use_hydralora_experts=False`."
+            )
+        },
+    )
     hydralora_layers_to_transform: Optional[str] = field(
         default=None,
         metadata={"help": "Comma-separated decoder layer ids to apply HydraLoRA adapters to (use 'all' for every layer)."},
@@ -1136,6 +1145,8 @@ class FinetuningArguments(
             self.cola_expert_num_B = self.cola_expert_num_B.strip() or None
         if isinstance(self.hydralora_expert_lora_nums, str):
             self.hydralora_expert_lora_nums = self.hydralora_expert_lora_nums.strip() or None
+        if isinstance(self.hydralora_head_map, str):
+            self.hydralora_head_map = self.hydralora_head_map.strip() or None
         if isinstance(self.hala_expert_lora_nums, str):
             self.hala_expert_lora_nums = self.hala_expert_lora_nums.strip() or None
         if isinstance(self.hala_layers_to_transform, str):
@@ -1264,6 +1275,14 @@ class FinetuningArguments(
                 raise ValueError("`hmora_eta_b` must be positive.")
             if self.hmora_eta_b != 1.0 and self.loraplus_lr_ratio is not None:
                 raise ValueError("`hmora_eta_b` cannot be combined with `loraplus_lr_ratio`.")
+
+        if self.finetuning_type == "hydralora":
+            if self.hydralora_head_map and self.use_hydralora_experts:
+                raise ValueError("`hydralora_head_map` is only supported with `use_hydralora_experts=False`.")
+            if self.hydralora_head_map and self.lora_num <= 1:
+                raise ValueError("`hydralora_head_map` requires `lora_num > 1`.")
+            if self.hydralora_head_map and self.language_prior_weight <= 0 and self.language_router_mode != "hard":
+                raise ValueError("`hydralora_head_map` requires `language_prior_weight > 0` unless hard routing is used.")
 
         if self.finetuning_type == "hala":
             if self.hala_num_experts <= 0:

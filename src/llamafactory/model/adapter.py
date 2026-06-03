@@ -86,6 +86,46 @@ def _build_language_metadata(language_map_spec: Optional[str]):
     return languages, families, language_to_family_ids, subgroup_sizes, language_to_subgroup_ids
 
 
+def _build_hydralora_head_metadata(
+    *,
+    main_language_list: Optional[list[str]],
+    head_map_spec: Optional[str],
+    head_count: int,
+) -> tuple[Optional[list[int]], Optional[list[str]]]:
+    if not head_map_spec:
+        return None, None
+    if main_language_list is None:
+        raise ValueError("`hydralora_head_map` requires `language_map` to define languages.")
+
+    head_language_list, head_family_list, head_language_to_family, _, head_language_to_subgroup_ids = (
+        _build_language_metadata(head_map_spec)
+    )
+    if not head_language_list or not head_family_list or head_language_to_family is None:
+        raise ValueError("`hydralora_head_map` must define at least one language group.")
+    if head_language_list != main_language_list:
+        missing = sorted(set(main_language_list) - set(head_language_list))
+        extra = sorted(set(head_language_list) - set(main_language_list))
+        raise ValueError(
+            "`hydralora_head_map` languages must match `language_map` languages "
+            f"(missing={missing}, extra={extra})."
+        )
+    if len(head_family_list) != head_count:
+        raise ValueError(
+            f"`hydralora_head_map` defines {len(head_family_list)} groups but flat HydraLoRA has "
+            f"lora_num={head_count} B heads."
+        )
+
+    if head_language_to_subgroup_ids is not None and any(idx >= 0 for idx in head_language_to_subgroup_ids):
+        target_ids = head_language_to_subgroup_ids
+    else:
+        target_ids = head_language_to_family
+
+    invalid = [idx for idx in target_ids if idx < 0 or idx >= head_count]
+    if invalid:
+        raise ValueError(f"`hydralora_head_map` produced invalid B-head targets: {invalid}.")
+    return target_ids, head_family_list
+
+
 def _parse_optional_int_list(value: Optional[Union[str, Sequence[int]]]) -> Optional[list[int]]:
     if value is None:
         return None
@@ -860,6 +900,7 @@ def _setup_hydralora_tuning(
     adapter_to_resume = None
     expected_experts: Optional[int] = None
     expected_heads: Optional[list[int]] = None
+    hydralora_head_groups: Optional[list[str]] = None
 
     if model_args.adapter_name_or_path is not None:
         if len(model_args.adapter_name_or_path) > 1:
@@ -920,6 +961,12 @@ def _setup_hydralora_tuning(
         language_list, family_list, language_to_family, subgroup_sizes, language_to_subgroup_ids = _build_language_metadata(
             finetuning_args.language_map
         )
+        if finetuning_args.hydralora_head_map:
+            language_to_subgroup_ids, hydralora_head_groups = _build_hydralora_head_metadata(
+                main_language_list=language_list,
+                head_map_spec=finetuning_args.hydralora_head_map,
+                head_count=finetuning_args.lora_num,
+            )
         if family_list:
             expected_experts = len(family_list)
         if finetuning_args.use_hydralora_experts and expected_experts:
@@ -967,6 +1014,15 @@ def _setup_hydralora_tuning(
             **peft_kwargs,
         )
         model = get_peft_model(model, hydra_config)
+
+    if (not finetuning_args.use_hydralora_experts) and finetuning_args.hydralora_head_map:
+        logger.info_rank0(
+            "[HYDRA HEAD MAP] flat B-head targets=%s head_router_mode=%s guidance=%s prior_weight=%s",
+            hydralora_head_groups,
+            finetuning_args.language_head_router_mode,
+            finetuning_args.language_guidance_scope,
+            finetuning_args.language_prior_weight,
+        )
 
     if finetuning_args.use_hydralora_experts:
         sample_layer = next((m for _, m in model.named_modules() if hasattr(m, "use_hydralora_experts")), None)
