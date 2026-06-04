@@ -105,8 +105,13 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
         layer._cache_router_state(logits, language_ids, "hydra_expert", expert_targets)
     logits = layer._apply_language_bias_experts(logits, expert_targets)
 
-    topv, topi = torch.topk(logits, layer.top_k, dim=-1)
-    weights = torch.softmax(topv.to(torch.float32), dim=-1).to(x.dtype)
+    if layer.top_k == 1:
+        topi = torch.argmax(logits, dim=-1, keepdim=True)
+        router_probs = torch.softmax(logits.to(torch.float32), dim=-1).to(x.dtype)
+        weights = router_probs.gather(-1, topi)
+    else:
+        topv, topi = torch.topk(logits, layer.top_k, dim=-1)
+        weights = torch.softmax(topv.to(torch.float32), dim=-1).to(x.dtype)
     topi, weights = layer._enforce_language_experts(topi, weights, expert_targets)
 
     if layer._should_debug_routing():

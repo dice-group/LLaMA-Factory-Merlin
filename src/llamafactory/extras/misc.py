@@ -126,6 +126,12 @@ def check_dependencies() -> None:
 
 def calculate_tps(dataset: list[dict[str, Any]], metrics: dict[str, float], stage: Literal["sft", "rm"]) -> float:
     r"""Calculate effective tokens per second."""
+    input_tokens_seen = metrics.get("num_input_tokens_seen")
+    train_runtime = metrics.get("train_runtime")
+    if input_tokens_seen is not None and train_runtime:
+        result = float(input_tokens_seen) / float(train_runtime)
+        return result / dist.get_world_size() if dist.is_initialized() else result
+
     effective_token_num = 0
     for data in dataset:
         if stage == "sft":
