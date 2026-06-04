@@ -202,10 +202,13 @@ class HydraLoraModel(BaseTuner):
             # Hydra hierarchical MoE settings
             "use_hydralora_experts": lora_config.use_hydralora_experts,
             "hydralora_num_experts": lora_config.num_experts,
+            "hydralora_num_shared_experts": getattr(lora_config, "num_shared_experts", 0),
+            "hydralora_num_total_experts": getattr(lora_config, "num_total_experts", None),
             "hydralora_top_k": lora_config.top_k,
             "hydralora_head_top_k": getattr(lora_config, "head_top_k", None),
             "hydralora_debug": getattr(lora_config, "hydralora_debug", False),
             "hydralora_expert_lora_nums": lora_config.expert_lora_nums,
+            "hydralora_shared_expert_lora_nums": getattr(lora_config, "shared_expert_lora_nums", None),
             "language_list": lora_config.language_list,
             "family_list": lora_config.family_list,
             "language_to_family_ids": lora_config.language_to_family_ids,

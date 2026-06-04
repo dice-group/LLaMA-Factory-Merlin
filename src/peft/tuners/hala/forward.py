@@ -303,6 +303,12 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
     result = layer.base_layer(x, *args, **kwargs)
     torch_result_dtype = result.dtype
 
+    for shared_idx in range(int(getattr(layer, "num_shared_experts", 0) or 0)):
+        shared_name = f"shared_expert_{shared_idx}"
+        if shared_name not in layer.lora_A:
+            continue
+        result = result + layer._adapter_delta(x, shared_name, language_ids=None).to(result.dtype)
+
     router_dtype = getattr(layer.router.weight, "dtype", torch.float32)
     logits = layer.router(x.to(router_dtype)).to(x.dtype)
 

@@ -46,6 +46,8 @@ LANGUAGE_PAD_ID = -1
 class HydraLayerConfig:
     use_hydralora_experts: bool = False
     hydralora_num_experts: int = 1
+    hydralora_num_shared_experts: int = 0
+    hydralora_num_total_experts: Optional[int] = None
     hydralora_top_k: int = 1
     hydralora_head_top_k: Optional[int] = None
     hydralora_debug: bool = False
@@ -62,6 +64,7 @@ class HydraLayerConfig:
     language_prior_weight: float = 0.0
     track_router_metrics: Optional[bool] = None
     hydralora_expert_lora_nums: Optional[list[int]] = None
+    hydralora_shared_expert_lora_nums: Optional[list[int]] = None
 
     @classmethod
     def from_kwargs(cls, kwargs: dict[str, Any]) -> tuple["HydraLayerConfig", dict[str, Any]]:
@@ -116,6 +119,7 @@ class HydraLoraLayer(BaseTunerLayer):
         setattr(self, "_active_adapters", [])
         layer_cfg, kwargs = HydraLayerConfig.from_kwargs(kwargs)
         expert_lora_nums_override = layer_cfg.hydralora_expert_lora_nums
+        shared_expert_lora_nums_override = layer_cfg.hydralora_shared_expert_lora_nums
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -152,7 +156,10 @@ class HydraLoraLayer(BaseTunerLayer):
         # hierarchical design addition
         self.use_hydralora_experts = layer_cfg.use_hydralora_experts
         self.num_experts = layer_cfg.hydralora_num_experts
+        self.num_shared_experts = max(0, int(layer_cfg.hydralora_num_shared_experts or 0))
+        self.num_total_experts = int(layer_cfg.hydralora_num_total_experts or (self.num_experts + self.num_shared_experts))
         self.top_k = layer_cfg.hydralora_top_k
+        self.total_top_k = self.top_k + self.num_shared_experts
         self.head_top_k = layer_cfg.hydralora_head_top_k
         self.hydralora_debug = layer_cfg.hydralora_debug
         self.language_list = layer_cfg.language_list
@@ -194,8 +201,10 @@ class HydraLoraLayer(BaseTunerLayer):
                 self.num_experts = len(self.family_list)
             elif self.language_list:
                 self.num_experts = len(self.language_list)
+            self.num_total_experts = max(self.num_total_experts, self.num_experts + self.num_shared_experts)
             if self.top_k > self.num_experts:
                 self.top_k = self.num_experts
+            self.total_top_k = self.top_k + self.num_shared_experts
             self.router = nn.Linear(self.in_features, self.num_experts, bias=False)
             self._move_router_to_device_of_base_layer()
             if self.hydralora_debug:
@@ -205,6 +214,7 @@ class HydraLoraLayer(BaseTunerLayer):
                 )
         self._missing_language_warning_emitted: set[str] = set()
         self._expert_lora_nums = self._normalize_expert_counts(expert_lora_nums_override)
+        self._shared_expert_lora_nums = self._normalize_shared_expert_counts(shared_expert_lora_nums_override)
         self._debug_forward_calls = 0
 
     def _should_debug_routing(self) -> bool:
@@ -265,7 +275,14 @@ class HydraLoraLayer(BaseTunerLayer):
             return
         if not getattr(self, "use_hydralora_experts", False):
             return
-        debug(f"[HYDRA DEBUG] Setup(parent='{parent}'): experts={self.num_experts}, top_k={self.top_k}")
+        debug(
+            f"[HYDRA DEBUG] Setup(parent='{parent}'): routed_experts={self.num_experts}, "
+            f"shared_experts={self.num_shared_experts}, routed_top_k={self.top_k}, total_top_k={self.total_top_k}"
+        )
+        for s in range(self.num_shared_experts):
+            name = f"shared_expert_{s}"
+            head_cnt = int(self.lora_num.get(name, 0) or 0)
+            debug(f"[HYDRA DEBUG]   {name}: lora_num={head_cnt}, always_active=True")
         for e in range(self.num_experts):
             name = f"expert_{e}"
             head_cnt = int(self.lora_num.get(name, 0) or 0)
@@ -290,6 +307,27 @@ class HydraLoraLayer(BaseTunerLayer):
         if self.use_hydralora_experts and adapter_name == getattr(self, "_active_adapter", adapter_name):
             self._active_adapters = []
             adapter_children: list[str] = []
+
+            for s in range(self.num_shared_experts):
+                name = f"shared_expert_{s}"
+                adapter_children.append(name)
+                self._hydra_expert_parent[name] = adapter_name
+
+                shared_lora_num = self._shared_expert_lora_nums[s] if self._shared_expert_lora_nums else 1
+                self.r[name] = r
+                self.lora_alpha[name] = lora_alpha
+                self.lora_num[name] = shared_lora_num
+                self.lora_dropout[name] = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
+                self.lora_A[name] = nn.Linear(self.in_features, r, bias=False)
+                self.lora_B[name] = nn.ModuleList(
+                    [nn.Linear(r, self.out_features, bias=False) for _ in range(shared_lora_num)]
+                )
+                self.scaling[name] = lora_alpha / r
+
+                self.reset_lora_parameters(name, init_lora_weights)
+
+                self._move_adapter_to_device_of_base_layer(name)
+                self._active_adapters.append(name)
 
             for e in range(self.num_experts):
                 name = f"expert_{e}"
@@ -318,8 +356,9 @@ class HydraLoraLayer(BaseTunerLayer):
 
             if self.hydralora_debug:
                 debug(
-                    f"[HYDRA DEBUG] Created {self.num_experts} HydraLoRA experts for parent '{adapter_name}' "
-                    f"(r={r}, lora_num={lora_num}, top_k={self.top_k})"
+                    f"[HYDRA DEBUG] Created {self.num_experts} routed and {self.num_shared_experts} shared "
+                    f"HydraLoRA experts for parent '{adapter_name}' "
+                    f"(r={r}, lora_num={lora_num}, routed_top_k={self.top_k}, total_top_k={self.total_top_k})"
                 )
                 self._debug_print_hydra_setup(adapter_name)
 
@@ -403,7 +442,8 @@ class HydraLoraLayer(BaseTunerLayer):
             for layer in self.lora_B[adapter_name]:
                 nn.init.zeros_(layer.weight)
 
-            nn.init.kaiming_uniform_(self.lora_route[adapter_name].weight, a=math.sqrt(5))
+            if adapter_name in self.lora_route:
+                nn.init.kaiming_uniform_(self.lora_route[adapter_name].weight, a=math.sqrt(5))
         if adapter_name in self.lora_embedding_A.keys():
             # Initialize A to zeros and B the same way as the default for nn.Embedding, see:
             # https://github.com/microsoft/LoRA/blob/4c0333854cb905966f8cc4e9a74068c1e507c7b7/loralib/layers.py#L59-L60
@@ -462,6 +502,22 @@ class HydraLoraLayer(BaseTunerLayer):
             raise ValueError(f"hydralora_expert_lora_nums must provide {self.num_experts} entries, got {len(values)}.")
         if any(v <= 0 for v in values):
             raise ValueError("hydralora_expert_lora_nums entries must be positive integers.")
+        return values
+
+    def _normalize_shared_expert_counts(self, counts: Optional[list[int]]) -> Optional[list[int]]:
+        if not self.use_hydralora_experts or self.num_shared_experts <= 0:
+            return None
+        if counts is None:
+            return [1] * self.num_shared_experts
+        values = list(counts)
+        if not values:
+            return [1] * self.num_shared_experts
+        if len(values) != self.num_shared_experts:
+            raise ValueError(
+                f"hydralora_shared_expert_lora_nums must provide {self.num_shared_experts} entries, got {len(values)}."
+            )
+        if any(v <= 0 for v in values):
+            raise ValueError("hydralora_shared_expert_lora_nums entries must be positive integers.")
         return values
 
     def _language_head_targets(

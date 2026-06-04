@@ -117,6 +117,18 @@ class HydraLoraConfig(PeftConfig):
         default=4,
         metadata={"help": "Number of HydraLoRA experts per adapted layer."},
     )
+    num_shared_experts: int = field(
+        default=0,
+        metadata={"help": "Number of always-active shared experts per adapted layer."},
+    )
+    num_total_experts: Optional[int] = field(
+        default=None,
+        metadata={"help": "Total logical experts, including shared experts, for reporting."},
+    )
+    shared_expert_lora_nums: Optional[List[int]] = field(
+        default=None,
+        metadata={"help": "Optional per-shared-expert B-head counts."},
+    )
     top_k: int = field(
         default=2,
         metadata={"help": "Number of experts selected per token (top-k router gating)."},
