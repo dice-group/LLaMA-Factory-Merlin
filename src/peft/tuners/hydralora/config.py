@@ -129,6 +129,14 @@ class HydraLoraConfig(PeftConfig):
         default=None,
         metadata={"help": "Optional per-shared-expert B-head counts."},
     )
+    joint_expert_head_router: bool = field(
+        default=False,
+        metadata={"help": "Use one router over expert-head pairs instead of separate expert and head routers."},
+    )
+    joint_router_num_heads: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of heads per expert represented by the joint expert-head router."},
+    )
     top_k: int = field(
         default=2,
         metadata={"help": "Number of experts selected per token (top-k router gating)."},

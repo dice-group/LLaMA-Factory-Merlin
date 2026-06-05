@@ -24,6 +24,7 @@ class HalaLoraLayer(HydraLoraLayer):
         "packed_sparse_expert_dense_head",
         "grouped_sparse_expert_dense_head",
         "packed_dense_lowrank",
+        "joint_expert_head_top1",
     }
 
     def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, hala_execution_mode: str = "dense_expert_dense_head", **kwargs) -> None:

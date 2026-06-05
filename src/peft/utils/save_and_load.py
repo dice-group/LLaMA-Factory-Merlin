@@ -143,7 +143,7 @@ def get_peft_model_state_dict(
             # CoLA/Hydra expert routers live under `*.router.*` and are not prefixed with "lora_".
             # Include them explicitly so adapter checkpoints contain expert routing weights.
             for key, val in state_dict.items():
-                if ".router." in key:
+                if ".router." in key or ".joint_router." in key:
                     to_return[key] = val
         if config.peft_type == PeftType.ADALORA:
             rank_pattern = config.rank_pattern

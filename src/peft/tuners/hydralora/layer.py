@@ -48,6 +48,8 @@ class HydraLayerConfig:
     hydralora_num_experts: int = 1
     hydralora_num_shared_experts: int = 0
     hydralora_num_total_experts: Optional[int] = None
+    hydralora_joint_expert_head_router: bool = False
+    hydralora_joint_router_num_heads: Optional[int] = None
     hydralora_top_k: int = 1
     hydralora_head_top_k: Optional[int] = None
     hydralora_debug: bool = False
@@ -103,6 +105,7 @@ class HydraLoraLayer(BaseTunerLayer):
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
         self.lora_route = nn.ModuleDict({})
+        self.joint_router = None
 
         # Hierarchical / MoE bookkeeping
         self._hydra_expert_parent: dict[str, str] = {}
@@ -158,6 +161,8 @@ class HydraLoraLayer(BaseTunerLayer):
         self.num_experts = layer_cfg.hydralora_num_experts
         self.num_shared_experts = max(0, int(layer_cfg.hydralora_num_shared_experts or 0))
         self.num_total_experts = int(layer_cfg.hydralora_num_total_experts or (self.num_experts + self.num_shared_experts))
+        self.joint_expert_head_router = bool(layer_cfg.hydralora_joint_expert_head_router)
+        self.joint_router_num_heads = int(layer_cfg.hydralora_joint_router_num_heads or 0)
         self.top_k = layer_cfg.hydralora_top_k
         self.total_top_k = self.top_k + self.num_shared_experts
         self.head_top_k = layer_cfg.hydralora_head_top_k
@@ -205,13 +210,16 @@ class HydraLoraLayer(BaseTunerLayer):
             if self.top_k > self.num_experts:
                 self.top_k = self.num_experts
             self.total_top_k = self.top_k + self.num_shared_experts
-            self.router = nn.Linear(self.in_features, self.num_experts, bias=False)
-            self._move_router_to_device_of_base_layer()
-            if self.hydralora_debug:
-                debug(
-                    f"[HYDRA DEBUG] Initialized router in {self.__class__.__name__} "
-                    f"(in={self.in_features}, experts={self.num_experts}, top_k={self.top_k})"
-                )
+            if self.joint_expert_head_router:
+                self.router = None
+            else:
+                self.router = nn.Linear(self.in_features, self.num_experts, bias=False)
+                self._move_router_to_device_of_base_layer()
+                if self.hydralora_debug:
+                    debug(
+                        f"[HYDRA DEBUG] Initialized router in {self.__class__.__name__} "
+                        f"(in={self.in_features}, experts={self.num_experts}, top_k={self.top_k})"
+                    )
         self._missing_language_warning_emitted: set[str] = set()
         self._expert_lora_nums = self._normalize_expert_counts(expert_lora_nums_override)
         self._shared_expert_lora_nums = self._normalize_shared_expert_counts(shared_expert_lora_nums_override)
@@ -344,13 +352,23 @@ class HydraLoraLayer(BaseTunerLayer):
                 self.lora_B[name] = nn.ModuleList(
                     [nn.Linear(r, self.out_features, bias=False) for _ in range(expert_lora_num)]
                 )
-                self.lora_route[name] = nn.Linear(self.in_features, expert_lora_num, bias=False)
+                if not self.joint_expert_head_router:
+                    self.lora_route[name] = nn.Linear(self.in_features, expert_lora_num, bias=False)
                 self.scaling[name] = lora_alpha / r
 
                 self.reset_lora_parameters(name, init_lora_weights)
 
                 self._move_adapter_to_device_of_base_layer(name)
                 self._active_adapters.append(name)
+
+            if self.joint_expert_head_router:
+                joint_heads = int(self.joint_router_num_heads or lora_num)
+                if self._expert_lora_nums and any(int(v) != joint_heads for v in self._expert_lora_nums):
+                    raise ValueError("joint_expert_head_router requires equal lora_num for every expert.")
+                self.joint_router_num_heads = joint_heads
+                self.joint_router = nn.Linear(self.in_features, self.num_experts * joint_heads, bias=False)
+                nn.init.normal_(self.joint_router.weight, mean=0.0, std=0.02)
+                self.joint_router.to(device=self.get_base_layer().weight.device, dtype=self.get_base_layer().weight.dtype)
 
             self._hydra_parent_children[adapter_name] = adapter_children
 
@@ -419,9 +437,16 @@ class HydraLoraLayer(BaseTunerLayer):
                     any_hydra_parent_active = True
 
         # Router grads only when Hydra hierarchy is actually in use
-        if self.use_hydralora_experts and hasattr(self, "router"):
-            self._move_router_to_device_of_base_layer()
-            self.router.requires_grad_(any_hydra_parent_active)
+        if self.use_hydralora_experts:
+            if getattr(self, "router", None) is not None:
+                self._move_router_to_device_of_base_layer()
+                self.router.requires_grad_(any_hydra_parent_active)
+            if getattr(self, "joint_router", None) is not None:
+                base_layer = self.get_base_layer()
+                weight = getattr(base_layer, "weight", None)
+                if weight is not None:
+                    self.joint_router.to(weight.device, dtype=weight.dtype)
+                self.joint_router.requires_grad_(any_hydra_parent_active)
 
         # Defer to BaseTunerLayer for actual bookkeeping
         super().set_adapter(expanded)

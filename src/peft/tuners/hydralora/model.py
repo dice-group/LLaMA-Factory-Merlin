@@ -204,6 +204,8 @@ class HydraLoraModel(BaseTuner):
             "hydralora_num_experts": lora_config.num_experts,
             "hydralora_num_shared_experts": getattr(lora_config, "num_shared_experts", 0),
             "hydralora_num_total_experts": getattr(lora_config, "num_total_experts", None),
+            "hydralora_joint_expert_head_router": getattr(lora_config, "joint_expert_head_router", False),
+            "hydralora_joint_router_num_heads": getattr(lora_config, "joint_router_num_heads", None),
             "hydralora_top_k": lora_config.top_k,
             "hydralora_head_top_k": getattr(lora_config, "head_top_k", None),
             "hydralora_debug": getattr(lora_config, "hydralora_debug", False),

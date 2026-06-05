@@ -303,6 +303,62 @@ def forward_expert(layer, x: torch.Tensor, *args: Any, language_ids: Optional[to
     result = layer.base_layer(x, *args, **kwargs)
     torch_result_dtype = result.dtype
 
+    if bool(getattr(layer, "joint_expert_head_router", False)):
+        joint_router = getattr(layer, "joint_router", None)
+        if joint_router is None:
+            raise RuntimeError("HALA joint expert-head routing requires layer.joint_router.")
+        heads_per_expert = int(getattr(layer, "joint_router_num_heads", 0) or 0)
+        if heads_per_expert <= 0:
+            heads_per_expert = int(layer.lora_num.get("expert_0", 0) or 0)
+        if heads_per_expert <= 0:
+            raise RuntimeError("HALA joint expert-head routing requires at least one head per expert.")
+
+        router_dtype = getattr(joint_router.weight, "dtype", torch.float32)
+        joint_logits = joint_router(x.to(router_dtype)).to(x.dtype).reshape(
+            x.shape[0],
+            x.shape[1],
+            layer.num_experts,
+            heads_per_expert,
+        )
+        pair_ids = joint_logits.to(torch.float32).reshape(x.shape[0], x.shape[1], layer.num_experts * heads_per_expert).argmax(dim=-1)
+        expert_ids = torch.div(pair_ids, heads_per_expert, rounding_mode="floor")
+        head_ids = pair_ids.remainder(heads_per_expert)
+
+        a_weights = []
+        b_weights = []
+        for expert_idx in range(layer.num_experts):
+            name = f"expert_{expert_idx}"
+            if name not in layer.lora_A:
+                raise RuntimeError(f"HALA joint expert-head routing missing {name} A weight.")
+            b_list = layer.lora_B[name]
+            if len(b_list) != heads_per_expert:
+                raise RuntimeError(
+                    f"HALA joint expert-head routing expected {heads_per_expert} B heads for {name}, got {len(b_list)}."
+                )
+            a_weights.append(layer.lora_A[name].weight)
+            b_weights.append(torch.stack([b.weight for b in b_list], dim=1))
+        a_weight = torch.stack(a_weights, dim=0)
+        b_weight = torch.stack(b_weights, dim=0)
+        rank = int(a_weight.shape[1])
+        x_cast = x.to(a_weight.dtype)
+        h_all = torch.nn.functional.linear(x_cast, a_weight.reshape(layer.num_experts * rank, a_weight.shape[2])).reshape(
+            x.shape[0],
+            x.shape[1],
+            layer.num_experts,
+            rank,
+        )
+        expert_mask = torch.nn.functional.one_hot(expert_ids, num_classes=layer.num_experts).to(dtype=h_all.dtype)
+        head_mask = torch.nn.functional.one_hot(head_ids, num_classes=heads_per_expert).to(dtype=h_all.dtype)
+        z_masked = (h_all.unsqueeze(3) * expert_mask[:, :, :, None, None] * head_mask[:, :, None, :, None]).reshape(
+            x.shape[0],
+            x.shape[1],
+            layer.num_experts * heads_per_expert * rank,
+        )
+        b_flat = b_weight.permute(1, 0, 2, 3).reshape(result.shape[-1], layer.num_experts * heads_per_expert * rank)
+        scaling = layer.scaling.get("expert_0", 1.0)
+        result = result + torch.nn.functional.linear(z_masked.to(b_flat.dtype), b_flat).to(result.dtype) * scaling
+        return result.to(torch_result_dtype)
+
     for shared_idx in range(int(getattr(layer, "num_shared_experts", 0) or 0)):
         shared_name = f"shared_expert_{shared_idx}"
         if shared_name not in layer.lora_A:
