@@ -1387,7 +1387,12 @@ def _setup_moelora_tuning(
     adapter_to_resume = None
 
     if model_args.adapter_name_or_path is not None:
-        is_mergeable = True
+        # MoE-LoRA deltas are selected dynamically by the language/task router.
+        # LinearMoELoraLayer.merge() is intentionally unavailable, so treating
+        # the adapter as mergeable silently drops it during evaluation.
+        is_mergeable = False
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("MoE-LoRA adapters are non-mergeable; only one adapter can be loaded.")
         if getattr(model, "quantization_method", None):
             assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
             is_mergeable = False
@@ -1851,7 +1856,12 @@ def _setup_mola_tuning(
     adapter_to_resume = None
 
     if model_args.adapter_name_or_path is not None:
-        is_mergeable = True
+        # MoLA uses input-dependent top-k expert routing and has no valid static
+        # merge operation. Loading through merge_and_unload() discards its
+        # adapter layers because LinearMolaLayer.merge() is a no-op.
+        is_mergeable = False
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("MoLA adapters are non-mergeable; only one adapter can be loaded.")
         if getattr(model, "quantization_method", None):
             assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
             is_mergeable = False
