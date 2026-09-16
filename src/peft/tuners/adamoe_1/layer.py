@@ -352,6 +352,10 @@ class LinearMolaLayer(nn.Module, MolaLayer):
         previous_dtype = x.dtype
         result = self.base_layer(x, *args, **kwargs)
 
+        # Honor PEFT's disable_adapter() context; enabled training is unchanged.
+        if self.disable_adapters:
+            return result.to(x.device, dtype=previous_dtype)
+
         for active_adapter in self.active_adapters:
             if active_adapter not in self.lora_A.keys():
                 continue

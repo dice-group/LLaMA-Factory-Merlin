@@ -1387,7 +1387,10 @@ def _setup_moelora_tuning(
     adapter_to_resume = None
 
     if model_args.adapter_name_or_path is not None:
-        is_mergeable = True
+        # keep routed experts loaded; merging would drop the adapter
+        is_mergeable = False
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("MoE-LoRA adapters are non-mergeable; only one adapter can be loaded.")
         if getattr(model, "quantization_method", None):
             assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
             is_mergeable = False
@@ -1851,7 +1854,10 @@ def _setup_mola_tuning(
     adapter_to_resume = None
 
     if model_args.adapter_name_or_path is not None:
-        is_mergeable = True
+        # keep routed experts loaded; merging would drop the adapter
+        is_mergeable = False
+        if len(model_args.adapter_name_or_path) > 1:
+            raise ValueError("MoLA adapters are non-mergeable; only one adapter can be loaded.")
         if getattr(model, "quantization_method", None):
             assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
             is_mergeable = False
